@@ -54,6 +54,7 @@ struct ContentView: View {
                     PencilCanvasView(
                         controller: canvasController,
                         pencilOnly: pencilOnly,
+                        isDark: colorScheme == .dark,
                         onDrawingChanged: handleDrawingChanged
                     )
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -128,11 +129,13 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    HStack(spacing: 10) {
-                        Text("InkTeX")
-                            .font(.headline.weight(.bold))
-                        modelStatusChip
-                    }
+                    Text("InkTeX")
+                        .font(.headline.weight(.bold))
+                        .fixedSize()
+                }
+
+                ToolbarItem(placement: .topBarLeading) {
+                    modelStatusChip
                 }
 
                 ToolbarItem(placement: .principal) {
@@ -193,19 +196,16 @@ struct ContentView: View {
         Button {
             showModelSheet = true
         } label: {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 8, height: 8)
+            HStack(spacing: 5) {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 7))
+                    .foregroundStyle(statusColor)
                 Text(statusLabel)
-                    .font(.caption.weight(.medium))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(Capsule())
+            .fixedSize()
         }
-        .buttonStyle(.plain)
     }
 
     private var statusColor: Color {

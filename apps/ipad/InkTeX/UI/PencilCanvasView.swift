@@ -70,6 +70,7 @@ public final class PencilCanvasController: ObservableObject {
 public struct PencilCanvasView: UIViewRepresentable {
     @ObservedObject var controller: PencilCanvasController
     var pencilOnly: Bool
+    var isDark: Bool
     var onDrawingChanged: ([RawStroke]) -> Void
 
     public func makeCoordinator() -> Coordinator {
@@ -80,8 +81,11 @@ public struct PencilCanvasView: UIViewRepresentable {
         let canvas = PKCanvasView()
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
+        canvas.overrideUserInterfaceStyle = isDark ? .dark : .light
         canvas.drawingPolicy = pencilOnly ? .pencilOnly : .anyInput
-        canvas.tool = PKInkingTool(.pen, color: .label, width: 3.5)
+        // Always pass Light Mode .black: PencilKit automatically inverts it to white in Dark Mode.
+        // Passing .label (white in Dark Mode) caused PencilKit to double-invert it back to black!
+        canvas.tool = PKInkingTool(.pen, color: .black, width: 3.5)
         canvas.delegate = context.coordinator
         canvas.alwaysBounceVertical = false
         canvas.alwaysBounceHorizontal = false
@@ -90,6 +94,10 @@ public struct PencilCanvasView: UIViewRepresentable {
     }
 
     public func updateUIView(_ uiView: PKCanvasView, context: Context) {
+        let targetStyle: UIUserInterfaceStyle = isDark ? .dark : .light
+        if uiView.overrideUserInterfaceStyle != targetStyle {
+            uiView.overrideUserInterfaceStyle = targetStyle
+        }
         uiView.drawingPolicy = pencilOnly ? .pencilOnly : .anyInput
         context.coordinator.onDrawingChanged = onDrawingChanged
     }
