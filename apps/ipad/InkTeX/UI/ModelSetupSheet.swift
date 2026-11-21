@@ -21,6 +21,7 @@ struct ModelSetupSheet: View {
                         }
                         LabeledContent("Vocab", value: "\(bundle.manifest.vocabSize) tokens")
                         LabeledContent("Quantization", value: bundle.manifest.quantization ?? "fp32")
+                        LabeledContent("R2L Reranker", value: engine.hasR2LScorer ? "Active (3-layer)" : "Not in bundle")
                         LabeledContent("Source", value: bundle.sourceDescription)
                     } else {
                         VStack(alignment: .leading, spacing: 6) {
@@ -33,6 +34,29 @@ struct ModelSetupSheet: View {
                         }
                         .padding(.vertical, 4)
                     }
+                }
+
+                Section("Beam Search & R2L Reranking") {
+                    Picker("Beam Width", selection: $engine.beamWidth) {
+                        Text("2").tag(2)
+                        Text("4 (Recommended)").tag(4)
+                        Text("6").tag(6)
+                    }
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("R2L Weight (λ)")
+                            Spacer()
+                            Text(String(format: "%.2f", engine.r2lWeight))
+                                .font(.callout.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $engine.r2lWeight, in: 0.0...1.5, step: 0.05)
+                    }
+
+                    Text("Combined candidate score = avg_logP(L2R) + λ · avg_logP(R2L). Higher λ gives the right-to-left decoder more say on nested structure and end-of-equation tokens.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Runtime Acceleration") {
@@ -81,10 +105,20 @@ struct ModelSetupSheet: View {
                     }
                 }
 
-                Section("Expected Files Inside model-bundle/") {
+                Section("Bundle Files") {
                     ForEach(ModelBundleLocator.requiredFiles, id: \.self) { file in
                         Text(file)
                             .font(.system(.caption, design: .monospaced))
+                    }
+                    ForEach(ModelBundleLocator.optionalFiles, id: \.self) { file in
+                        HStack {
+                            Text(file)
+                                .font(.system(.caption, design: .monospaced))
+                            Spacer()
+                            Text("optional (R2L)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }

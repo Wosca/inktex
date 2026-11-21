@@ -7,6 +7,7 @@ struct ContentView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     @State private var modality: ModalityMode = .bimodal
+    @State private var decodingMode: DecodingMode = .beamR2L
     @State private var pencilOnly: Bool = false
     @State private var autoRecognize: Bool = true
     @State private var showInspector: Bool = false
@@ -154,17 +155,36 @@ struct ContentView: View {
 
     private var canvasActionBar: some View {
         HStack(spacing: 10) {
+            Picker("Decoding", selection: $decodingMode) {
+                Text("Greedy").tag(DecodingMode.greedy)
+                Text("Beam \(engine.beamWidth)").tag(DecodingMode.beam)
+                Text(engine.hasR2LScorer ? "Beam+R2L" : "Beam+R2L*").tag(DecodingMode.beamR2L)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 245)
+            .controlSize(.small)
+            .onChange(of: decodingMode) { _, _ in
+                let strokes = canvasController.extractRawStrokes()
+                if !strokes.isEmpty {
+                    triggerRecognition(strokes, immediate: true)
+                }
+            }
+
             if let result = latestResult {
-                Label(
-                    String(format: "%.0f%% conf · %.0f ms · %d tok", result.overallConfidence * 100, result.totalMs, result.decodedTokens.count),
-                    systemImage: "sparkles"
-                )
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
-            } else {
-                Text(pencilOnly ? "Pencil Only" : "Pencil + Touch")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text(String(format: "%.0f%% · %.0f ms", result.overallConfidence * 100, result.totalMs))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    if result.r2lChangedWinner {
+                        Text("R2L Pick")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.purple.opacity(0.22))
+                            .foregroundStyle(.purple)
+                            .clipShape(Capsule())
+                    }
+                }
             }
 
             Spacer()
@@ -350,7 +370,11 @@ struct ContentView: View {
                 .frame(width: 230)
                 .controlSize(.small)
 
-                Text(String(format: "Enc %.0fms · Dec %.0fms", result.encodeMs, result.decodeMs))
+                Text(
+                    result.r2lUsed
+                        ? String(format: "Enc %.0f · Dec %.0f · R2L %.0fms", result.encodeMs, result.decodeMs, result.r2lMs)
+                        : String(format: "Enc %.0f · Dec %.0fms", result.encodeMs, result.decodeMs)
+                )
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -391,6 +415,36 @@ struct ContentView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 5))
                     }
                 }
+            }
+            // Top beams table when Beam Search / R2L Reranking is active
+            if result.beams.count > 1 {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(result.r2lUsed ? "Top Beams (L2R + R2L Reranked)" : "Top Beams (L2R)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(result.beams.prefix(4)) { beam in
+                        HStack(spacing: 8) {
+                            Text(beam.isWinner ? "★" : "•")
+                                .font(.caption2)
+                                .foregroundStyle(beam.wasPromotedByR2L ? .purple : (beam.isWinner ? .accentColor : .secondary))
+                            Text(beam.latex)
+                                .font(.system(.caption2, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer(minLength: 6)
+                            if let r2l = beam.r2lScore {
+                                Text(String(format: "L2R %.2f · R2L %.2f", beam.l2rScore, r2l))
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text(String(format: "L2R %.2f", beam.l2rScore))
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .padding(.top, 2)
             }
         }
         .padding(12)
@@ -498,6 +552,7 @@ struct ContentView: View {
         debounceTask?.cancel()
         guard engine.status == .ready else { return }
         let selectedModality = modality
+        let selectedDecoding = decodingMode
 
         debounceTask = Task {
             if !immediate {
@@ -507,7 +562,8 @@ struct ContentView: View {
             do {
                 let result = try await engine.recognize(
                     strokes: strokes,
-                    modality: selectedModality
+                    modality: selectedModality,
+                    decodingMode: selectedDecoding
                 )
                 if !Task.isCancelled && myGen == requestGeneration {
                     latestResult = result

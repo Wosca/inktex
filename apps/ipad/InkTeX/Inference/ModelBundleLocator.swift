@@ -9,6 +9,10 @@ public struct LocatedModelBundle: Sendable {
     public var strokeEncoderURL: URL { directory.appendingPathComponent("stroke_encoder.onnx") }
     public var memoryProjURL: URL { directory.appendingPathComponent("memory_proj.onnx") }
     public var decoderStepURL: URL { directory.appendingPathComponent("decoder_step.onnx") }
+    public var r2lScorerURL: URL? {
+        let url = directory.appendingPathComponent("r2l_scorer.onnx")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
 }
 
 public enum ModelBundleLocator {
@@ -18,6 +22,9 @@ public enum ModelBundleLocator {
         "stroke_encoder.onnx",
         "memory_proj.onnx",
         "decoder_step.onnx",
+    ]
+    public static let optionalFiles = [
+        "r2l_scorer.onnx",
     ]
 
     public static var documentsBundleDirectory: URL {
@@ -94,6 +101,13 @@ public enum ModelBundleLocator {
             let srcFile = validated.directory.appendingPathComponent(filename)
             let dstFile = dest.appendingPathComponent(filename)
             try fm.copyItem(at: srcFile, to: dstFile)
+        }
+        for filename in optionalFiles {
+            let srcFile = validated.directory.appendingPathComponent(filename)
+            if fm.fileExists(atPath: srcFile.path) {
+                let dstFile = dest.appendingPathComponent(filename)
+                try fm.copyItem(at: srcFile, to: dstFile)
+            }
         }
 
         guard let installed = validateBundle(at: dest, sourceDescription: "Imported (Files / AirDrop)") else {

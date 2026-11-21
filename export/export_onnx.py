@@ -207,6 +207,93 @@ class DecoderStepExport(nn.Module):
         return logits, torch.stack(new_ks, dim=0), torch.stack(new_vs, dim=0), coverage, new_prev_weights
 
 
+class R2LScorerExport(nn.Module):
+    """Batched teacher-forced right-to-left (R2L) beam reranker.
+
+    Inputs:
+        r2l_tokens:       int64 [B, T]  -> [BOS, y_L, ..., y_1, EOS, PAD...]
+        r2l_padding_mask: uint8 [B, T]  -> 0 = valid, 1 = padded
+        memory:           float32 [1, M, D] (broadcast to [B, M, D] inside the graph)
+        memory_mask:      uint8 [1, M]  -> 0 = valid, 1 = padded
+
+    Outputs:
+        seq_log_prob:     float32 [B]   -> sum of target token log-probabilities
+        avg_log_prob:     float32 [B]   -> length-normalized mean log-probability
+    """
+
+    def __init__(self, model: BimodalMathModel):
+        super().__init__()
+        if model.r2l_decoder is None:
+            raise ValueError("Model has no r2l_decoder")
+        self.decoder = model.r2l_decoder
+        num_heads = self.decoder.transformer.layers[0].self_attn.num_heads
+        self.register_buffer("alibi_slopes", alibi_slopes(num_heads), persistent=False)
+
+    def _mha(
+        self,
+        attention: nn.MultiheadAttention,
+        query: torch.Tensor,
+        key_src: torch.Tensor,
+        val_src: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        q = _project_qkv(attention, query, 0)
+        k = _project_qkv(attention, key_src, 1)
+        v = _project_qkv(attention, val_src, 2)
+        score = (q @ k.transpose(-1, -2)) / math.sqrt(q.shape[-1]) + bias
+        weights = score.softmax(-1)
+        attended = (weights @ v).transpose(1, 2).reshape(query.shape[0], query.shape[1], -1)
+        return attention.out_proj(attended)
+
+    def forward(
+        self,
+        r2l_tokens: torch.Tensor,
+        r2l_padding_mask_u8: torch.Tensor,
+        memory: torch.Tensor,
+        memory_mask_u8: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch = r2l_tokens.shape[0]
+        inp = r2l_tokens[:, :-1]
+        tgt = r2l_tokens[:, 1:]
+        inp_pad = r2l_padding_mask_u8[:, :-1].ne(0)
+        tgt_valid = r2l_padding_mask_u8[:, 1:].eq(0)
+
+        length = inp.shape[1]
+        values = self.decoder.token_embedding(inp)
+
+        # Causal ALiBi self-attention bias [B, H, L, L]
+        positions = torch.arange(length, device=values.device)
+        dist = (positions[:, None] - positions[None, :]).abs().to(values.dtype)
+        causal = positions[None, :] > positions[:, None]
+        self_bias = -self.alibi_slopes.to(values.dtype)[:, None, None] * dist[None, :, :]
+        self_bias = self_bias.masked_fill(causal[None, :, :], NEG_MASK_VALUE)
+        self_bias = self_bias.unsqueeze(0).expand(batch, -1, -1, -1)
+        # Mask padded keys (never mask position 0 to keep softmax finite on dummy rows)
+        key_pad_bias = torch.zeros_like(inp_pad, dtype=values.dtype).masked_fill(inp_pad, NEG_MASK_VALUE)
+        self_bias = self_bias + key_pad_bias[:, None, None, :]
+
+        mem = memory.expand(batch, -1, -1)
+        mem_pad = memory_mask_u8.ne(0)
+        mem_bias = torch.zeros_like(mem_pad, dtype=values.dtype).masked_fill(mem_pad, NEG_MASK_VALUE)[:, None, None, :]
+        mem_bias = mem_bias.expand(batch, -1, -1, -1)
+
+        for layer in self.decoder.transformer.layers:
+            q = layer.norm1(values)
+            values = values + self._mha(layer.self_attn, q, q, q, self_bias)
+            q = layer.norm2(values)
+            values = values + self._mha(layer.multihead_attn, q, mem, mem, mem_bias)
+            q = layer.norm3(values)
+            values = values + layer.linear2(layer.activation(layer.linear1(q)))
+
+        logits = self.decoder.output(self.decoder.transformer.norm(values))
+        log_probs = F.log_softmax(logits, dim=-1)
+        token_lp = log_probs.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+        valid_f = tgt_valid.to(logits.dtype)
+        seq_log_prob = (token_lp * valid_f).sum(dim=-1)
+        avg_log_prob = seq_log_prob / valid_f.sum(dim=-1).clamp_min(1.0)
+        return seq_log_prob, avg_log_prob
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as f:
@@ -293,6 +380,7 @@ def export_bundle(
     stroke_path = output_dir / "stroke_encoder.onnx"
     memproj_path = output_dir / "memory_proj.onnx"
     decoder_path = output_dir / "decoder_step.onnx"
+    r2l_path = output_dir / "r2l_scorer.onnx"
 
     print("Exporting vision_encoder.onnx ...")
     torch.onnx.export(
@@ -351,22 +439,53 @@ def export_bundle(
         external_data=False,
     )
 
+    has_r2l = model.r2l_decoder is not None
+    if has_r2l:
+        print("Exporting r2l_scorer.onnx ...")
+        beam_dim = torch.export.Dim("beam_batch", min=1, max=16)
+        r2l_len_dim = torch.export.Dim("r2l_len", min=2, max=cfg.max_tokens)
+        dummy_r2l_tokens = torch.tensor([[tokenizer.bos_id, 6, 7, tokenizer.eos_id],
+                                         [tokenizer.bos_id, 6, tokenizer.eos_id, tokenizer.pad_id]], dtype=torch.long)
+        dummy_r2l_mask = torch.tensor([[0, 0, 0, 0], [0, 0, 0, 1]], dtype=torch.uint8)
+        torch.onnx.export(
+            R2LScorerExport(model).eval(),
+            (dummy_r2l_tokens, dummy_r2l_mask, dummy_memory, dummy_memory_mask),
+            r2l_path,
+            input_names=["r2l_tokens", "r2l_padding_mask", "memory", "memory_mask"],
+            output_names=["seq_log_prob", "avg_log_prob"],
+            dynamic_shapes=(
+                {0: beam_dim, 1: r2l_len_dim},
+                {0: beam_dim, 1: r2l_len_dim},
+                {1: mem_dim},
+                {1: mem_dim},
+            ),
+            dynamo=True,
+            external_data=False,
+        )
+
     if quantize == "int8":
-        print("Applying dynamic INT8 weight quantization to decoder_step.onnx, memory_proj.onnx, and stroke_encoder.onnx ...")
-        for p in (stroke_path, memproj_path, decoder_path):
+        quant_targets = [stroke_path, memproj_path, decoder_path]
+        if has_r2l:
+            quant_targets.append(r2l_path)
+        print("Applying dynamic INT8 weight quantization to transformer graphs ...")
+        for p in quant_targets:
             _quantize_int8(p)
         print("Keeping vision_encoder.onnx in FP32 for CoreML EP / ConvNeXt compatibility.")
     elif quantize != "none":
         raise ValueError(f"Unsupported --quantize mode: {quantize}")
 
-    files_meta = {}
-    total_bytes = 0
-    for key, p in (
+    file_entries = [
         ("vision_encoder", vision_path),
         ("stroke_encoder", stroke_path),
         ("memory_proj", memproj_path),
         ("decoder_step", decoder_path),
-    ):
+    ]
+    if has_r2l:
+        file_entries.append(("r2l_scorer", r2l_path))
+
+    files_meta = {}
+    total_bytes = 0
+    for key, p in file_entries:
         size = p.stat().st_size
         total_bytes += size
         files_meta[key] = {
@@ -386,6 +505,8 @@ def export_bundle(
         "saved_at": payload.get("saved_at"),
         "metrics": payload.get("metrics"),
         "quantization": quantize,
+        "has_r2l": has_r2l,
+        "r2l_decoder_layers": cfg.r2l_decoder_layers if has_r2l else 0,
         "d_model": cfg.d_model,
         "decoder_layers": num_layers,
         "attention_heads": num_heads,

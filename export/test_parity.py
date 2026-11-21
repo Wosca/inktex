@@ -188,6 +188,70 @@ def verify_parity(checkpoint_path: Path, bundle_dir: Path, tol: float = 1e-3) ->
         bundle_dir, s_la, np.array([s_w], dtype=np.int64), s_feat, s_mask, modality="bimodal", max_tokens=32,
     )
     print(f"[1-stroke edge case] latency={ms:.1f}ms | ONNX='{ort_tex}' ({len(ort_toks)} tokens)")
+
+    # Verify R2L scorer parity if present
+    r2l_path = bundle_dir / "r2l_scorer.onnx"
+    if r2l_path.is_file() and model.r2l_decoder is not None:
+        r2l_sess = ort.InferenceSession(str(r2l_path), providers=["CPUExecutionProvider"])
+        with torch.inference_mode():
+            mem, mem_mask, _ = model.encode_bimodal(
+                images=torch.from_numpy(images),
+                image_widths=torch.from_numpy(image_widths),
+                stroke_features=torch.from_numpy(features),
+                stroke_padding_mask=torch.zeros((1, features.shape[1]), dtype=torch.bool),
+                has_strokes=torch.tensor([True]),
+                modality_mode="bimodal",
+            )
+            # Candidate 1: true decode ({x^{2}}+1), Candidate 2: distractor (x+2)
+            cand1 = [t for t in pt_tokens if t != tokenizer.eos_id]
+            cand2 = [tokenizer.token_to_id[t] for t in ("x", "+", "2")]
+            r2l_seqs = [
+                [tokenizer.bos_id, *reversed(cand1), tokenizer.eos_id],
+                [tokenizer.bos_id, *reversed(cand2), tokenizer.eos_id],
+            ]
+            max_len = max(len(s) for s in r2l_seqs)
+            tok_mat = np.full((2, max_len), tokenizer.pad_id, dtype=np.int64)
+            pad_mat = np.ones((2, max_len), dtype=np.uint8)
+            for row, seq in enumerate(r2l_seqs):
+                tok_mat[row, : len(seq)] = seq
+                pad_mat[row, : len(seq)] = 0
+
+            # PyTorch reference
+            pt_inp = torch.from_numpy(tok_mat[:, :-1])
+            pt_tgt = torch.from_numpy(tok_mat[:, 1:])
+            pt_inp_mask = torch.from_numpy(pad_mat[:, :-1] != 0)
+            pt_tgt_valid = torch.from_numpy(pad_mat[:, 1:] == 0).float()
+            pt_logits = model.r2l_decoder(
+                pt_inp,
+                mem.expand(2, -1, -1),
+                mem_mask.expand(2, -1),
+                pt_inp_mask,
+            )
+            pt_lp = torch.nn.functional.log_softmax(pt_logits, dim=-1).gather(-1, pt_tgt.unsqueeze(-1)).squeeze(-1)
+            pt_seq_lp = (pt_lp * pt_tgt_valid).sum(-1).numpy()
+            pt_avg_lp = (pt_seq_lp / pt_tgt_valid.sum(-1).clamp_min(1.0).numpy())
+
+        t0 = time.perf_counter()
+        ort_seq_lp, ort_avg_lp = r2l_sess.run(
+            None,
+            {
+                "r2l_tokens": tok_mat,
+                "r2l_padding_mask": pad_mat,
+                "memory": mem.numpy(),
+                "memory_mask": mem_mask.to(torch.uint8).numpy(),
+            },
+        )
+        r2l_ms = (time.perf_counter() - t0) * 1000.0
+        r2l_diff = float(np.max(np.abs(pt_avg_lp - ort_avg_lp)))
+        print(
+            f"[r2l    ] max_avg_lp_diff={r2l_diff:.6g} | latency={r2l_ms:.1f}ms | "
+            f"true_avg_lp={ort_avg_lp[0]:.4f} vs distractor_avg_lp={ort_avg_lp[1]:.4f}"
+        )
+        if r2l_diff > tol:
+            raise AssertionError(f"r2l_scorer avg_log_prob diff {r2l_diff:.6g} exceeds tolerance {tol}")
+        if not (ort_avg_lp[0] > ort_avg_lp[1]):
+            raise AssertionError("R2L scorer did not rank true candidate above distractor!")
+
     print("ALL PARITY CHECKS PASSED!")
 
 

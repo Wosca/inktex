@@ -46,6 +46,32 @@ public enum ModalityMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+public enum DecodingMode: String, CaseIterable, Identifiable, Sendable {
+    case greedy
+    case beam
+    case beamR2L
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .greedy: return "Greedy"
+        case .beam: return "Beam"
+        case .beamR2L: return "Beam + R2L"
+        }
+    }
+}
+
+public struct BeamCandidate: Sendable, Identifiable {
+    public let id: Int
+    public let latex: String
+    public let l2rScore: Double
+    public let r2lScore: Double?
+    public let combinedScore: Double
+    public let isWinner: Bool
+    public let wasPromotedByR2L: Bool
+}
+
 public enum StripColorMode: String, CaseIterable, Identifiable, Sendable {
     case strokeOrder
     case confidence
@@ -212,6 +238,8 @@ public struct ModelManifest: Codable, Sendable {
     public let stage: Int?
     public let epoch: Int?
     public let quantization: String?
+    public let hasR2L: Bool?
+    public let r2lDecoderLayers: Int?
     public let dModel: Int
     public let decoderLayers: Int
     public let attentionHeads: Int
@@ -236,6 +264,8 @@ public struct ModelManifest: Codable, Sendable {
         case stage
         case epoch
         case quantization
+        case hasR2L = "has_r2l"
+        case r2lDecoderLayers = "r2l_decoder_layers"
         case dModel = "d_model"
         case decoderLayers = "decoder_layers"
         case attentionHeads = "attention_heads"
@@ -262,6 +292,7 @@ public struct RecognitionResult: Sendable {
     public let totalMs: Double
     public let encodeMs: Double
     public let decodeMs: Double
+    public let r2lMs: Double
     public let strokeCount: Int
     public let pointCount: Int
     public let stripHeight: Int
@@ -271,6 +302,10 @@ public struct RecognitionResult: Sendable {
     public let stripLumBytes: [UInt8]
     public let stripOrderBytes: [UInt8]
     public let modality: ModalityMode
+    public let decodingMode: DecodingMode
+    public let r2lUsed: Bool
+    public let r2lChangedWinner: Bool
+    public let beams: [BeamCandidate]
     public let truncated: Bool
 
     public var tokens: [String] { decodedTokens.map(\.text) }
