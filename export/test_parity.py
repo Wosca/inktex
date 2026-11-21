@@ -111,8 +111,9 @@ def run_onnx_greedy(
             },
         )
         if first_logits is None:
-            first_logits = logits
-        next_id = int(np.argmax(logits[0]))
+            first_logits = logits[:, 0, :] if logits.ndim == 3 else logits
+        step_logits = logits[0, -1] if logits.ndim == 3 else logits[0]
+        next_id = int(np.argmax(step_logits))
         generated.append(next_id)
         if next_id == manifest["eos_id"]:
             break
@@ -251,6 +252,123 @@ def verify_parity(checkpoint_path: Path, bundle_dir: Path, tol: float = 1e-3) ->
             raise AssertionError(f"r2l_scorer avg_log_prob diff {r2l_diff:.6g} exceeds tolerance {tol}")
         if not (ort_avg_lp[0] > ort_avg_lp[1]):
             raise AssertionError("R2L scorer did not rank true candidate above distractor!")
+
+    # Verify parallel prefix-verification AND batched B=4 decoder parity!
+    manifest = json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("supports_prefix_verify"):
+        proj_sess = ort.InferenceSession(str(bundle_dir / "memory_proj.onnx"), providers=["CPUExecutionProvider"])
+        dec_sess = ort.InferenceSession(str(bundle_dir / "decoder_step.onnx"), providers=["CPUExecutionProvider"])
+        with torch.inference_mode():
+            mem, mem_mask, _ = model.encode_bimodal(
+                images=torch.from_numpy(images),
+                image_widths=torch.from_numpy(image_widths),
+                stroke_features=torch.from_numpy(features),
+                stroke_padding_mask=torch.zeros((1, features.shape[1]), dtype=torch.bool),
+                has_strokes=torch.tensor([True]),
+                modality_mode="bimodal",
+            )
+            full_tokens = model.decode_greedy(
+                images=torch.from_numpy(images),
+                image_widths=torch.from_numpy(image_widths),
+                stroke_features=torch.from_numpy(features),
+                stroke_padding_mask=torch.zeros((1, features.shape[1]), dtype=torch.bool),
+                has_strokes=torch.tensor([True]),
+                max_tokens=64,
+                cached=True,
+            )[0].tolist()
+            if tokenizer.eos_id in full_tokens:
+                full_tokens = full_tokens[: full_tokens.index(tokenizer.eos_id) + 1]
+
+        mk, mv = proj_sess.run(None, {"memory": mem.numpy()})
+        mem_mask_u8 = mem_mask.to(torch.uint8).numpy()
+        L = manifest["decoder_layers"]
+        H = manifest["attention_heads"]
+        D = manifest["head_dim"]
+        M = mem.shape[1]
+
+        # Test prefix verification with a partial prefix (first 5 tokens) + a corrupted suffix (diverging at index 4)
+        body = [t for t in full_tokens if t != tokenizer.eos_id]
+        for label, prev_guess in (
+            ("exact-prefix", body[:-2]),
+            ("mid-diverge", body[:3] + [tokenizer.token_to_id["9"], tokenizer.token_to_id["8"]]),
+        ):
+            t0 = time.perf_counter()
+            inp = np.array([[tokenizer.bos_id, *prev_guess]], dtype=np.int64)
+            past_k = np.zeros((L, 1, H, 1, D), dtype=np.float32)
+            past_v = np.zeros((L, 1, H, 1, D), dtype=np.float32)
+            cov = np.zeros((1, H, 1, M), dtype=np.float32)
+            prev_w = np.zeros((1, H, 1, M), dtype=np.float32)
+
+            logits, new_k, new_v, new_cov, new_w = dec_sess.run(
+                None,
+                {
+                    "token": inp, "past_k": past_k, "past_v": past_v,
+                    "mk": mk, "mv": mv, "memory_mask": mem_mask_u8,
+                    "coverage": cov, "prev_weights": prev_w,
+                },
+            )
+            verified = []
+            diverge_i = None
+            for i in range(inp.shape[1]):
+                pred = int(np.argmax(logits[0, i]))
+                verified.append(pred)
+                if pred == tokenizer.eos_id:
+                    diverge_i = None
+                    break
+                if i < len(prev_guess) and pred == prev_guess[i]:
+                    continue
+                diverge_i = i
+                break
+
+            steps = 0
+            if diverge_i is not None:
+                # Slice KV-cache, coverage, and prev_weights at diverge_i
+                past_k = new_k[:, :, :, : diverge_i + 2, :]
+                past_v = new_v[:, :, :, : diverge_i + 2, :]
+                cov = new_cov[:, :, diverge_i : diverge_i + 1, :]
+                prev_w = new_w[:, :, diverge_i : diverge_i + 1, :]
+                cur_tok = np.array([[verified[-1]]], dtype=np.int64)
+                while len(verified) < 64:
+                    steps += 1
+                    st_logits, past_k, past_v, cov, prev_w = dec_sess.run(
+                        None,
+                        {
+                            "token": cur_tok, "past_k": past_k, "past_v": past_v,
+                            "mk": mk, "mv": mv, "memory_mask": mem_mask_u8,
+                            "coverage": cov, "prev_weights": prev_w,
+                        },
+                    )
+                    nxt = int(np.argmax(st_logits[0, 0]))
+                    verified.append(nxt)
+                    if nxt == tokenizer.eos_id:
+                        break
+                    cur_tok = np.array([[nxt]], dtype=np.int64)
+
+            ms = (time.perf_counter() - t0) * 1000.0
+            print(f"[prefix {label:12s}] verified={len(verified)-steps}/{len(verified)} tok in 1 pass, {steps} tail steps ({ms:.1f}ms) -> '{tokenizer.decode(verified)}'")
+            if verified != full_tokens:
+                raise AssertionError(f"Prefix verify ({label}) mismatch: got {verified} vs expected {full_tokens}")
+
+        # Verify batched B=4 decoding matches B=1 identically
+        b_tok = np.full((4, 1), tokenizer.bos_id, dtype=np.int64)
+        b_k = np.zeros((L, 4, H, 1, D), dtype=np.float32)
+        b_v = np.zeros((L, 4, H, 1, D), dtype=np.float32)
+        b_cov = np.zeros((4, H, 1, M), dtype=np.float32)
+        b_w = np.zeros((4, H, 1, M), dtype=np.float32)
+        b_logits, _, _, _, _ = dec_sess.run(
+            None,
+            {"token": b_tok, "past_k": b_k, "past_v": b_v, "mk": mk, "mv": mv,
+             "memory_mask": mem_mask_u8, "coverage": b_cov, "prev_weights": b_w},
+        )
+        s_logits, _, _, _, _ = dec_sess.run(
+            None,
+            {"token": b_tok[:1], "past_k": b_k[:, :1], "past_v": b_v[:, :1], "mk": mk, "mv": mv,
+             "memory_mask": mem_mask_u8, "coverage": b_cov[:1], "prev_weights": b_w[:1]},
+        )
+        b_diff = float(np.max(np.abs(b_logits - s_logits)))
+        print(f"[batch4 ] max_diff_vs_b1={b_diff:.6g}")
+        if b_diff > tol:
+            raise AssertionError(f"Batched B=4 diff {b_diff:.6g} exceeds tolerance {tol}")
 
     print("ALL PARITY CHECKS PASSED!")
 

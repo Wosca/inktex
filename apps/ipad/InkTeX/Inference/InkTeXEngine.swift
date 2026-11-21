@@ -13,13 +13,58 @@ public final class InkTeXEngine: ObservableObject {
     @Published public private(set) var status: Status = .loading
     @Published public private(set) var loadedBundle: LocatedModelBundle?
     @Published public private(set) var hasR2LScorer: Bool = false
+    @Published public private(set) var supportsV2FastDecode: Bool = false
     @Published public private(set) var isRecognizing: Bool = false
     @Published public var useCoreMLForVision: Bool = true
+    @Published public var liveTwoPhase: Bool = true
     @Published public var beamWidth: Int = 4
     @Published public var r2lWeight: Double = 0.5
 
     private let workerQueue = DispatchQueue(label: "com.wosca.inktex.inference", qos: .userInitiated)
     private var runtime: LoadedRuntime?
+
+    private final class EncodedMemoryCache {
+        let fingerprint: UInt64
+        let modality: ModalityMode
+        let strip: StripRasterizer.Output
+        let strokeCount: Int
+        let pointCount: Int
+        let strokeMemLen: Int
+        let visionMemLen: Int
+        let totalMemLen: Int
+        let memTensor: ORTValue
+        let memMaskVal: ORTValue
+        let mkVal: ORTValue
+        let mvVal: ORTValue
+
+        init(
+            fingerprint: UInt64,
+            modality: ModalityMode,
+            strip: StripRasterizer.Output,
+            strokeCount: Int,
+            pointCount: Int,
+            strokeMemLen: Int,
+            visionMemLen: Int,
+            totalMemLen: Int,
+            memTensor: ORTValue,
+            memMaskVal: ORTValue,
+            mkVal: ORTValue,
+            mvVal: ORTValue
+        ) {
+            self.fingerprint = fingerprint
+            self.modality = modality
+            self.strip = strip
+            self.strokeCount = strokeCount
+            self.pointCount = pointCount
+            self.strokeMemLen = strokeMemLen
+            self.visionMemLen = visionMemLen
+            self.totalMemLen = totalMemLen
+            self.memTensor = memTensor
+            self.memMaskVal = memMaskVal
+            self.mkVal = mkVal
+            self.mvVal = mvVal
+        }
+    }
 
     private final class LoadedRuntime {
         let env: ORTEnv
@@ -30,10 +75,16 @@ public final class InkTeXEngine: ObservableObject {
         let memoryProjSession: ORTSession
         let decoderStepSession: ORTSession
         let r2lScorerSession: ORTSession?
+        let isV2Decoder: Bool
+
+        // Incremental caches (accessed strictly on workerQueue)
+        var lastPrefixBodyIds: [Int] = []
+        var lastEncoded: EncodedMemoryCache? = nil
 
         init(bundle: LocatedModelBundle, useCoreMLForVision: Bool) throws {
             self.bundle = bundle
             self.tokenizer = LatexTokenizer(manifest: bundle.manifest)
+            self.isV2Decoder = (bundle.manifest.supportsPrefixVerify == true) || (bundle.manifest.supportsBatchedDecoder == true)
             self.env = try ORTEnv(loggingLevel: .warning)
 
             let visionOpts = try Self.makeOptions(useCoreML: useCoreMLForVision, threads: 4)
@@ -63,7 +114,30 @@ public final class InkTeXEngine: ObservableObject {
         }
     }
 
-    private struct BeamHypothesis {
+    private struct BatchedBeam {
+        var bodyIds: [Int]
+        var decodedTokens: [DecodedToken]
+        var sumLogProb: Double
+        var stepCount: Int
+        var isFinished: Bool
+        var lastTokenId: Int64
+        // Per-beam state buffers for batched stacking ([L * H * T * D], [H * M])
+        var kvLen: Int
+        var kData: [Float]
+        var vData: [Float]
+        var coverageData: [Float]
+        var prevWeightsData: [Float]
+
+        var rankingScore: Double {
+            sumLogProb / pow(Double(max(1, stepCount)), 0.7)
+        }
+
+        var avgLogProb: Double {
+            sumLogProb / Double(max(1, stepCount))
+        }
+    }
+
+    private struct LegacyBeam {
         var bodyIds: [Int]
         var decodedTokens: [DecodedToken]
         var sumLogProb: Double
@@ -88,6 +162,14 @@ public final class InkTeXEngine: ObservableObject {
         reloadModel()
     }
 
+    public func clearCaches() {
+        let rt = runtime
+        workerQueue.async {
+            rt?.lastPrefixBodyIds = []
+            rt?.lastEncoded = nil
+        }
+    }
+
     public func reloadModel() {
         status = .loading
         let useCoreML = useCoreMLForVision
@@ -98,6 +180,7 @@ public final class InkTeXEngine: ObservableObject {
                     self.runtime = nil
                     self.loadedBundle = nil
                     self.hasR2LScorer = false
+                    self.supportsV2FastDecode = false
                     self.status = .missingModel
                 }
                 return
@@ -105,10 +188,12 @@ public final class InkTeXEngine: ObservableObject {
             do {
                 let loaded = try LoadedRuntime(bundle: bundle, useCoreMLForVision: useCoreML)
                 let hasR2L = loaded.r2lScorerSession != nil
+                let isV2 = loaded.isV2Decoder
                 Task { @MainActor in
                     self.runtime = loaded
                     self.loadedBundle = bundle
                     self.hasR2LScorer = hasR2L
+                    self.supportsV2FastDecode = isV2
                     self.status = .ready
                 }
             } catch {
@@ -116,6 +201,7 @@ public final class InkTeXEngine: ObservableObject {
                     self.runtime = nil
                     self.loadedBundle = bundle
                     self.hasR2LScorer = false
+                    self.supportsV2FastDecode = false
                     self.status = .failed(error.localizedDescription)
                 }
             }
@@ -161,6 +247,8 @@ public final class InkTeXEngine: ObservableObject {
         }
     }
 
+    // MARK: - Core Inference Pipeline
+
     private static func runInference(
         runtime: LoadedRuntime,
         strokes: [RawStroke],
@@ -173,10 +261,230 @@ public final class InkTeXEngine: ObservableObject {
         let totalStart = CFAbsoluteTimeGetCurrent()
         let manifest = runtime.bundle.manifest
 
+        // 1. Encode canvas (or reuse exact cached memory between Phase 1 Greedy & Phase 2 Beam+R2L!)
+        let fp = fingerprintStrokes(strokes)
+        let encoded: EncodedMemoryCache
+        let encodeMs: Double
+        let encoderCacheHit: Bool
+
+        if let cached = runtime.lastEncoded, cached.fingerprint == fp, cached.modality == modality {
+            encoded = cached
+            encodeMs = 0
+            encoderCacheHit = true
+        } else {
+            let encodeStart = CFAbsoluteTimeGetCurrent()
+            encoded = try encodeCanvas(runtime: runtime, strokes: strokes, modality: modality, fingerprint: fp)
+            encodeMs = (CFAbsoluteTimeGetCurrent() - encodeStart) * 1000.0
+            runtime.lastEncoded = encoded
+            encoderCacheHit = false
+        }
+
+        // 2. Decode (Prefix-Verified Greedy, Batched Beam Search, or v1 fallback)
+        let decodeStart = CFAbsoluteTimeGetCurrent()
+        let tokenLimit = min(maxTokens, manifest.maxTokens - 1)
+        let specialSet: Set<Int> = [manifest.padId, manifest.bosId, manifest.eosId, manifest.unkId]
+
+        struct CandidateSeq {
+            var bodyIds: [Int]
+            var decodedTokens: [DecodedToken]
+            var avgLogProb: Double
+            var rankingScore: Double
+            var isFinished: Bool
+        }
+
+        var candidates: [CandidateSeq] = []
+        var prefixVerifiedCount = 0
+
+        if decodingMode == .greedy {
+            if runtime.isV2Decoder && !runtime.lastPrefixBodyIds.isEmpty {
+                let (bodyIds, toks, avgLP, finished, verified) = try decodePrefixVerifiedGreedy(
+                    runtime: runtime,
+                    encoded: encoded,
+                    prevGuess: runtime.lastPrefixBodyIds,
+                    tokenLimit: tokenLimit,
+                    specialSet: specialSet
+                )
+                prefixVerifiedCount = verified
+                candidates = [CandidateSeq(bodyIds: bodyIds, decodedTokens: toks, avgLogProb: avgLP, rankingScore: avgLP, isFinished: finished)]
+            } else {
+                let (bodyIds, toks, avgLP, finished) = try decodeSingleGreedy(
+                    runtime: runtime,
+                    encoded: encoded,
+                    tokenLimit: tokenLimit,
+                    specialSet: specialSet
+                )
+                candidates = [CandidateSeq(bodyIds: bodyIds, decodedTokens: toks, avgLogProb: avgLP, rankingScore: avgLP, isFinished: finished)]
+            }
+        } else {
+            let effectiveBeam = max(2, min(8, beamWidth))
+            if runtime.isV2Decoder {
+                let beams = try decodeBatchedBeam(
+                    runtime: runtime,
+                    encoded: encoded,
+                    beamWidth: effectiveBeam,
+                    tokenLimit: tokenLimit,
+                    specialSet: specialSet
+                )
+                candidates = beams.map {
+                    CandidateSeq(bodyIds: $0.bodyIds, decodedTokens: $0.decodedTokens, avgLogProb: $0.avgLogProb, rankingScore: $0.rankingScore, isFinished: $0.isFinished)
+                }
+            } else {
+                let beams = try decodeLegacyBeam(
+                    runtime: runtime,
+                    encoded: encoded,
+                    beamWidth: effectiveBeam,
+                    tokenLimit: tokenLimit,
+                    specialSet: specialSet
+                )
+                candidates = beams.map {
+                    CandidateSeq(bodyIds: $0.bodyIds, decodedTokens: $0.decodedTokens, avgLogProb: $0.avgLogProb, rankingScore: $0.rankingScore, isFinished: $0.isFinished)
+                }
+            }
+        }
+
+        // Deduplicate by decoded LaTeX keeping best L2R score
+        candidates.sort { $0.rankingScore > $1.rankingScore }
+        var uniqueCandidates: [CandidateSeq] = []
+        var seenLatex: Set<String> = []
+        for c in candidates {
+            let tex = LatexTokenizer.detokenize(c.decodedTokens.map(\.text))
+            if seenLatex.insert(tex).inserted {
+                uniqueCandidates.append(c)
+            }
+        }
+        if uniqueCandidates.isEmpty, let first = candidates.first {
+            uniqueCandidates = [first]
+        }
+        let decodeMs = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000.0
+
+        // 3. Optional R2L Bidirectional Reranking (1 batched pass)
+        var r2lMs: Double = 0
+        var r2lScores: [Double]? = nil
+        var r2lUsed = false
+
+        if decodingMode == .beamR2L, let r2lSession = runtime.r2lScorerSession, !uniqueCandidates.isEmpty {
+            let r2lStart = CFAbsoluteTimeGetCurrent()
+            let r2lSeqs: [[Int64]] = uniqueCandidates.map { c in
+                var seq: [Int64] = [Int64(manifest.bosId)]
+                seq.reserveCapacity(c.bodyIds.count + 2)
+                for id in c.bodyIds.reversed() {
+                    seq.append(Int64(id))
+                }
+                seq.append(Int64(manifest.eosId))
+                return seq
+            }
+            let maxLen = max(2, r2lSeqs.map(\.count).max() ?? 2)
+            let batchCount = r2lSeqs.count
+            var tokFlat = [Int64](repeating: Int64(manifest.padId), count: batchCount * maxLen)
+            var padFlat = [UInt8](repeating: 1, count: batchCount * maxLen)
+            for (row, seq) in r2lSeqs.enumerated() {
+                let base = row * maxLen
+                for (col, id) in seq.enumerated() {
+                    tokFlat[base + col] = id
+                    padFlat[base + col] = 0
+                }
+            }
+            let tokTensor = try makeInt64Tensor(tokFlat, shape: [batchCount, maxLen])
+            let padTensor = try makeUInt8Tensor(padFlat, shape: [batchCount, maxLen])
+            let r2lOut = try r2lSession.run(
+                withInputs: [
+                    "r2l_tokens": tokTensor,
+                    "r2l_padding_mask": padTensor,
+                    "memory": encoded.memTensor,
+                    "memory_mask": encoded.memMaskVal,
+                ],
+                outputNames: ["seq_log_prob", "avg_log_prob"],
+                runOptions: nil
+            )
+            if let avgVal = r2lOut["avg_log_prob"] {
+                r2lScores = try extractFloats(avgVal).map { Double($0) }
+                r2lUsed = true
+            }
+            r2lMs = (CFAbsoluteTimeGetCurrent() - r2lStart) * 1000.0
+        }
+
+        // 4. Rank & pick winner
+        var indexedScores: [(index: Int, l2r: Double, r2l: Double?, combined: Double)] = uniqueCandidates.enumerated().map { idx, c in
+            let l2r = c.avgLogProb
+            let r2l = r2lScores?[idx]
+            let combined = r2l != nil ? (l2r + r2lWeight * r2l!) : l2r
+            return (idx, l2r, r2l, combined)
+        }
+        indexedScores.sort { $0.combined > $1.combined }
+
+        let winnerIdx = indexedScores.first?.index ?? 0
+        let r2lChangedWinner = r2lUsed && (winnerIdx != 0)
+        let winner = uniqueCandidates[winnerIdx]
+
+        // Save winning tokens for next stroke's parallel prefix verification!
+        runtime.lastPrefixBodyIds = winner.bodyIds
+
+        let beamSummaries: [BeamCandidate] = indexedScores.enumerated().map { rank, item in
+            let c = uniqueCandidates[item.index]
+            let tex = LatexTokenizer.detokenize(c.decodedTokens.map(\.text))
+            return BeamCandidate(
+                id: rank,
+                latex: tex,
+                l2rScore: item.l2r,
+                r2lScore: item.r2l,
+                combinedScore: item.combined,
+                isWinner: rank == 0,
+                wasPromotedByR2L: rank == 0 && r2lChangedWinner
+            )
+        }
+
+        let totalMs = (CFAbsoluteTimeGetCurrent() - totalStart) * 1000.0
+        let latex = LatexTokenizer.detokenize(winner.decodedTokens.map(\.text))
+        let overallConf: Float
+        if winner.decodedTokens.isEmpty {
+            overallConf = 0
+        } else {
+            let meanLog = winner.decodedTokens.reduce(0.0) { $0 + log(Double(max($1.confidence, 1e-6))) } / Double(winner.decodedTokens.count)
+            overallConf = Float(exp(meanLog))
+        }
+
+        let gridH = encoded.visionMemLen > 0 ? max(1, encoded.strip.height / 16) : 0
+        let gridW = gridH > 0 ? (encoded.visionMemLen / gridH) : 0
+
+        return RecognitionResult(
+            latex: latex,
+            decodedTokens: winner.decodedTokens,
+            overallConfidence: overallConf,
+            totalMs: totalMs,
+            encodeMs: encodeMs,
+            decodeMs: decodeMs,
+            r2lMs: r2lMs,
+            strokeCount: encoded.strokeCount,
+            pointCount: encoded.pointCount,
+            stripHeight: encoded.strip.height,
+            stripWidth: encoded.strip.width,
+            visionGridW: gridW,
+            visionGridH: gridH,
+            stripLumBytes: encoded.strip.lumBytes,
+            stripOrderBytes: encoded.strip.orderBytes,
+            modality: modality,
+            decodingMode: decodingMode,
+            r2lUsed: r2lUsed,
+            r2lChangedWinner: r2lChangedWinner,
+            prefixVerifiedCount: prefixVerifiedCount,
+            encoderCacheHit: encoderCacheHit,
+            beams: beamSummaries,
+            truncated: !winner.isFinished
+        )
+    }
+
+    // MARK: - Canvas Encoding
+
+    private static func encodeCanvas(
+        runtime: LoadedRuntime,
+        strokes: [RawStroke],
+        modality: ModalityMode,
+        fingerprint: UInt64
+    ) throws -> EncodedMemoryCache {
+        let manifest = runtime.bundle.manifest
         let strip = StripRasterizer.render(strokes: strokes, config: manifest.vision)
         let strokeInput = StrokePreprocessor.preprocess(strokes: strokes, config: manifest.preprocessing)
 
-        let encodeStart = CFAbsoluteTimeGetCurrent()
         var strokeMemFloats: [Float]? = nil
         var strokeMaskBytes: [UInt8]? = nil
         var strokeMemLen = 0
@@ -244,6 +552,7 @@ public final class InkTeXEngine: ObservableObject {
         }
 
         let memTensor = try makeFloatTensor(combinedMem, shape: [1, totalMemLen, manifest.dModel])
+        let memMaskVal = try makeUInt8Tensor(combinedMask, shape: [1, totalMemLen])
         let projOut = try runtime.memoryProjSession.run(
             withInputs: ["memory": memTensor],
             outputNames: ["mk", "mv"],
@@ -252,318 +561,669 @@ public final class InkTeXEngine: ObservableObject {
         guard let mkVal = projOut["mk"], let mvVal = projOut["mv"] else {
             throw inferenceError("Missing outputs from memory_proj.onnx")
         }
-        let encodeMs = (CFAbsoluteTimeGetCurrent() - encodeStart) * 1000.0
 
-        // KV-cached L2R decode (Greedy when effectiveBeam == 1, Beam Search when > 1)
-        let decodeStart = CFAbsoluteTimeGetCurrent()
-        let numLayers = manifest.decoderLayers
-        let numHeads = manifest.attentionHeads
-        let headDim = manifest.headDim
-        let memMaskVal = try makeUInt8Tensor(combinedMask, shape: [1, totalMemLen])
+        return EncodedMemoryCache(
+            fingerprint: fingerprint,
+            modality: modality,
+            strip: strip,
+            strokeCount: strokeInput?.strokeCount ?? strokes.count,
+            pointCount: strokeInput?.pointCount ?? 0,
+            strokeMemLen: strokeMemLen,
+            visionMemLen: visionMemLen,
+            totalMemLen: totalMemLen,
+            memTensor: memTensor,
+            memMaskVal: memMaskVal,
+            mkVal: mkVal,
+            mvVal: mvVal
+        )
+    }
 
-        let initKVCount = numLayers * 1 * numHeads * 1 * headDim
-        let initK = try makeFloatTensor([Float](repeating: 0, count: initKVCount), shape: [numLayers, 1, numHeads, 1, headDim])
-        let initV = try makeFloatTensor([Float](repeating: 0, count: initKVCount), shape: [numLayers, 1, numHeads, 1, headDim])
-        let covCount = 1 * numHeads * 1 * totalMemLen
-        let initCov = try makeFloatTensor([Float](repeating: 0, count: covCount), shape: [1, numHeads, 1, totalMemLen])
-        let initPrev = try makeFloatTensor([Float](repeating: 0, count: covCount), shape: [1, numHeads, 1, totalMemLen])
+    // MARK: - 1. Prefix-Verified Parallel Greedy Decoding (100% Exact Parity!)
 
-        let effectiveBeam = decodingMode == .greedy ? 1 : max(2, min(8, beamWidth))
-        let tokenLimit = min(maxTokens, manifest.maxTokens - 1)
-        let specialSet: Set<Int> = [manifest.padId, manifest.bosId, manifest.eosId, manifest.unkId]
+    private static func decodePrefixVerifiedGreedy(
+        runtime: LoadedRuntime,
+        encoded: EncodedMemoryCache,
+        prevGuess: [Int],
+        tokenLimit: Int,
+        specialSet: Set<Int>
+    ) throws -> (bodyIds: [Int], tokens: [DecodedToken], avgLogProb: Double, isFinished: Bool, verifiedCount: Int) {
+        let manifest = runtime.bundle.manifest
+        let L = manifest.decoderLayers
+        let H = manifest.attentionHeads
+        let D = manifest.headDim
+        let M = encoded.totalMemLen
+        let V = manifest.vocabSize
 
-        func runDecoderStep(
-            tokenId: Int64,
-            pastK: ORTValue,
-            pastV: ORTValue,
-            coverage: ORTValue,
-            prevWeights: ORTValue
-        ) throws -> (logits: [Float], nextK: ORTValue, nextV: ORTValue, nextCov: ORTValue, nextPrev: ORTValue) {
-            let tokenVal = try makeInt64Tensor([tokenId], shape: [1, 1])
+        let cappedGuess = Array(prevGuess.prefix(max(1, tokenLimit - 1)))
+        let S = cappedGuess.count + 1
+        var inputIds: [Int64] = [Int64(manifest.bosId)]
+        inputIds.reserveCapacity(S)
+        for id in cappedGuess { inputIds.append(Int64(id)) }
+
+        let initK = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * 1 * D), shape: [L, 1, H, 1, D])
+        let initV = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * 1 * D), shape: [L, 1, H, 1, D])
+        let initCov = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        let initPrev = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+
+        let out = try runtime.decoderStepSession.run(
+            withInputs: [
+                "token": try makeInt64Tensor(inputIds, shape: [1, S]),
+                "past_k": initK,
+                "past_v": initV,
+                "mk": encoded.mkVal,
+                "mv": encoded.mvVal,
+                "memory_mask": encoded.memMaskVal,
+                "coverage": initCov,
+                "prev_weights": initPrev,
+            ],
+            outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
+            runOptions: nil
+        )
+        guard let logitsVal = out["logits"],
+              let newKVal = out["new_k"],
+              let newVVal = out["new_v"],
+              let newCovVal = out["new_coverage"],
+              let newPrevVal = out["new_prev_weights"] else {
+            throw inferenceError("Missing outputs from decoder_step.onnx during prefix verification")
+        }
+
+        let allLogits = try extractFloats(logitsVal)   // [1, S, V]
+        let allPrevW = try extractFloats(newPrevVal)   // [1, H, S, M]
+
+        var bodyIds: [Int] = []
+        var decodedTokens: [DecodedToken] = []
+        var sumLogProb: Double = 0
+        var stepCount = 0
+        var divergeIndex: Int? = nil
+        var hitEOS = false
+        var lastPredictedId: Int = manifest.bosId
+
+        for i in 0..<S {
+            let sliceStart = i * V
+            let choice = argmaxLogSoftmax(allLogits, offset: sliceStart, count: V)
+            sumLogProb += choice.logProb
+            stepCount += 1
+            lastPredictedId = choice.id
+
+            if choice.id == manifest.eosId {
+                hitEOS = true
+                divergeIndex = nil
+                break
+            }
+
+            if !specialSet.contains(choice.id) {
+                let attn = encoded.visionMemLen > 0
+                    ? extractVisionAttentionAtStep(allPrevW, numHeads: H, stepLen: S, stepIdx: i, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
+                    : nil
+                bodyIds.append(choice.id)
+                decodedTokens.append(makeToken(stepIdx: i, tokenId: choice.id, prob: choice.prob, visionAttn: attn, manifest: manifest))
+            }
+
+            if i < cappedGuess.count && choice.id == cappedGuess[i] {
+                continue
+            } else {
+                divergeIndex = i
+                break
+            }
+        }
+
+        let verifiedCount = max(0, stepCount - 1)
+
+        // If we haven't hit EOS yet, slice KV-cache + coverage at divergeIndex and decode only the tail!
+        if !hitEOS, let divI = divergeIndex, stepCount < tokenLimit {
+            let fullK = try extractFloats(newKVal)     // [L, 1, H, 1 + S, D]
+            let fullV = try extractFloats(newVVal)     // [L, 1, H, 1 + S, D]
+            let fullCov = try extractFloats(newCovVal) // [1, H, S, M]
+
+            let fullT = 1 + S
+            let keepT = divI + 2 // dummy(0) + BOS(1) + verified tokens(2 ..< divI+2)
+            var slicedK = [Float](repeating: 0, count: L * H * keepT * D)
+            var slicedV = [Float](repeating: 0, count: L * H * keepT * D)
+            let copyFloats = keepT * D
+
+            for l in 0..<L {
+                for h in 0..<H {
+                    let srcBase = ((l * H + h) * fullT) * D
+                    let dstBase = ((l * H + h) * keepT) * D
+                    for j in 0..<copyFloats {
+                        slicedK[dstBase + j] = fullK[srcBase + j]
+                        slicedV[dstBase + j] = fullV[srcBase + j]
+                    }
+                }
+            }
+
+            var slicedCov = [Float](repeating: 0, count: H * M)
+            var slicedPrev = [Float](repeating: 0, count: H * M)
+            for h in 0..<H {
+                let srcBase = (h * S + divI) * M
+                let dstBase = h * M
+                for m in 0..<M {
+                    slicedCov[dstBase + m] = fullCov[srcBase + m]
+                    slicedPrev[dstBase + m] = allPrevW[srcBase + m]
+                }
+            }
+
+            var pastK = try makeFloatTensor(slicedK, shape: [L, 1, H, keepT, D])
+            var pastV = try makeFloatTensor(slicedV, shape: [L, 1, H, keepT, D])
+            var coverage = try makeFloatTensor(slicedCov, shape: [1, H, 1, M])
+            var prevWeights = try makeFloatTensor(slicedPrev, shape: [1, H, 1, M])
+            var curTok = Int64(lastPredictedId)
+
+            while stepCount < tokenLimit {
+                let stepOut = try runtime.decoderStepSession.run(
+                    withInputs: [
+                        "token": try makeInt64Tensor([curTok], shape: [1, 1]),
+                        "past_k": pastK,
+                        "past_v": pastV,
+                        "mk": encoded.mkVal,
+                        "mv": encoded.mvVal,
+                        "memory_mask": encoded.memMaskVal,
+                        "coverage": coverage,
+                        "prev_weights": prevWeights,
+                    ],
+                    outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
+                    runOptions: nil
+                )
+                guard let lVal = stepOut["logits"],
+                      let nk = stepOut["new_k"],
+                      let nv = stepOut["new_v"],
+                      let nc = stepOut["new_coverage"],
+                      let np = stepOut["new_prev_weights"] else {
+                    throw inferenceError("Missing outputs from decoder_step.onnx")
+                }
+                let logits = try extractFloats(lVal)
+                let choice = argmaxLogSoftmax(logits, offset: 0, count: V)
+                sumLogProb += choice.logProb
+                let idx = stepCount
+                stepCount += 1
+
+                if choice.id == manifest.eosId {
+                    hitEOS = true
+                    break
+                }
+                if !specialSet.contains(choice.id) {
+                    let attn = encoded.visionMemLen > 0
+                        ? averageVisionAttention(weights: try extractFloats(np), numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
+                        : nil
+                    bodyIds.append(choice.id)
+                    decodedTokens.append(makeToken(stepIdx: idx, tokenId: choice.id, prob: choice.prob, visionAttn: attn, manifest: manifest))
+                }
+                curTok = Int64(choice.id)
+                pastK = nk
+                pastV = nv
+                coverage = nc
+                prevWeights = np
+            }
+        }
+
+        let avgLP = sumLogProb / Double(max(1, stepCount))
+        return (bodyIds, decodedTokens, avgLP, hitEOS, verifiedCount)
+    }
+
+    // MARK: - 2. Standard Single-Step Greedy (first stroke or v1 bundle)
+
+    private static func decodeSingleGreedy(
+        runtime: LoadedRuntime,
+        encoded: EncodedMemoryCache,
+        tokenLimit: Int,
+        specialSet: Set<Int>
+    ) throws -> (bodyIds: [Int], tokens: [DecodedToken], avgLogProb: Double, isFinished: Bool) {
+        let manifest = runtime.bundle.manifest
+        let L = manifest.decoderLayers
+        let H = manifest.attentionHeads
+        let D = manifest.headDim
+        let M = encoded.totalMemLen
+        let V = manifest.vocabSize
+
+        var pastK = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * 1 * D), shape: [L, 1, H, 1, D])
+        var pastV = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * 1 * D), shape: [L, 1, H, 1, D])
+        var coverage = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        var prevWeights = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+
+        var curTok = Int64(manifest.bosId)
+        var bodyIds: [Int] = []
+        var decodedTokens: [DecodedToken] = []
+        var sumLogProb: Double = 0
+        var stepCount = 0
+        var hitEOS = false
+
+        for stepIdx in 0..<tokenLimit {
             let out = try runtime.decoderStepSession.run(
                 withInputs: [
-                    "token": tokenVal,
+                    "token": try makeInt64Tensor([curTok], shape: [1, 1]),
                     "past_k": pastK,
                     "past_v": pastV,
-                    "mk": mkVal,
-                    "mv": mvVal,
-                    "memory_mask": memMaskVal,
+                    "mk": encoded.mkVal,
+                    "mv": encoded.mvVal,
+                    "memory_mask": encoded.memMaskVal,
                     "coverage": coverage,
                     "prev_weights": prevWeights,
                 ],
                 outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
                 runOptions: nil
             )
-            guard let logitsVal = out["logits"],
+            guard let lVal = out["logits"],
                   let nk = out["new_k"],
                   let nv = out["new_v"],
                   let nc = out["new_coverage"],
                   let np = out["new_prev_weights"] else {
                 throw inferenceError("Missing outputs from decoder_step.onnx")
             }
-            return (try extractFloats(logitsVal), nk, nv, nc, np)
+            let logits = try extractFloats(lVal)
+            let choice = argmaxLogSoftmax(logits, offset: 0, count: V)
+            sumLogProb += choice.logProb
+            stepCount += 1
+
+            if choice.id == manifest.eosId {
+                hitEOS = true
+                break
+            }
+            if !specialSet.contains(choice.id) {
+                let attn = encoded.visionMemLen > 0
+                    ? averageVisionAttention(weights: try extractFloats(np), numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
+                    : nil
+                bodyIds.append(choice.id)
+                decodedTokens.append(makeToken(stepIdx: stepIdx, tokenId: choice.id, prob: choice.prob, visionAttn: attn, manifest: manifest))
+            }
+            curTok = Int64(choice.id)
+            pastK = nk
+            pastV = nv
+            coverage = nc
+            prevWeights = np
         }
 
-        func makeDecodedToken(stepIdx: Int, tokenId: Int, prob: Float, visionAttn: [Float]?) -> DecodedToken? {
-            guard !specialSet.contains(tokenId) else { return nil }
-            let text = (tokenId >= 0 && tokenId < manifest.tokens.count) ? manifest.tokens[tokenId] : "<UNK>"
-            return DecodedToken(
-                id: stepIdx,
-                tokenId: tokenId,
-                text: text,
-                confidence: prob,
-                category: TokenCategory.classify(text),
-                visionAttention: visionAttn
-            )
-        }
+        return (bodyIds, decodedTokens, sumLogProb / Double(max(1, stepCount)), hitEOS)
+    }
 
-        // Step 0: single pass from BOS
-        let step0 = try runDecoderStep(
-            tokenId: Int64(manifest.bosId),
-            pastK: initK,
-            pastV: initV,
-            coverage: initCov,
-            prevWeights: initPrev
+    // MARK: - 3. Batched Beam Search (All active beams in 1 ONNX call per step!)
+
+    private static func decodeBatchedBeam(
+        runtime: LoadedRuntime,
+        encoded: EncodedMemoryCache,
+        beamWidth: Int,
+        tokenLimit: Int,
+        specialSet: Set<Int>
+    ) throws -> [BatchedBeam] {
+        let manifest = runtime.bundle.manifest
+        let L = manifest.decoderLayers
+        let H = manifest.attentionHeads
+        let D = manifest.headDim
+        let M = encoded.totalMemLen
+        let V = manifest.vocabSize
+
+        // Step 0: batch=1 from BOS
+        let initK = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * 1 * D), shape: [L, 1, H, 1, D])
+        let initV = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * 1 * D), shape: [L, 1, H, 1, D])
+        let initCov = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        let initPrev = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+
+        let out0 = try runtime.decoderStepSession.run(
+            withInputs: [
+                "token": try makeInt64Tensor([Int64(manifest.bosId)], shape: [1, 1]),
+                "past_k": initK,
+                "past_v": initV,
+                "mk": encoded.mkVal,
+                "mv": encoded.mvVal,
+                "memory_mask": encoded.memMaskVal,
+                "coverage": initCov,
+                "prev_weights": initPrev,
+            ],
+            outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
+            runOptions: nil
         )
-        let step0Attn: [Float]? = visionMemLen > 0
-            ? averageVisionAttention(
-                weights: try extractFloats(step0.nextPrev),
-                numHeads: numHeads,
-                totalMemLen: totalMemLen,
-                visionOffset: strokeMemLen,
-                visionLen: visionMemLen
-            )
+        guard let l0Val = out0["logits"],
+              let k0Val = out0["new_k"],
+              let v0Val = out0["new_v"],
+              let c0Val = out0["new_coverage"],
+              let p0Val = out0["new_prev_weights"] else {
+            throw inferenceError("Missing outputs from decoder_step.onnx")
+        }
+
+        let logits0 = try extractFloats(l0Val)
+        let k0 = try extractFloats(k0Val) // [L, 1, H, 2, D]
+        let v0 = try extractFloats(v0Val)
+        let c0 = try extractFloats(c0Val) // [1, H, 1, M]
+        let p0 = try extractFloats(p0Val)
+        let attn0 = encoded.visionMemLen > 0
+            ? averageVisionAttention(weights: p0, numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
             : nil
 
-        let firstChoices = topKLogSoftmax(step0.logits, k: effectiveBeam)
-        var beams: [BeamHypothesis] = firstChoices.map { choice in
-            let finished = (choice.id == manifest.eosId)
+        let choices0 = topKLogSoftmax(logits0, offset: 0, count: V, k: beamWidth)
+        var beams: [BatchedBeam] = choices0.map { ch in
+            let fin = (ch.id == manifest.eosId)
             var body: [Int] = []
             var toks: [DecodedToken] = []
-            if !finished, let dt = makeDecodedToken(stepIdx: 0, tokenId: choice.id, prob: choice.prob, visionAttn: step0Attn) {
-                body.append(choice.id)
-                toks.append(dt)
+            if !fin && !specialSet.contains(ch.id) {
+                body.append(ch.id)
+                toks.append(makeToken(stepIdx: 0, tokenId: ch.id, prob: ch.prob, visionAttn: attn0, manifest: manifest))
             }
-            return BeamHypothesis(
+            return BatchedBeam(
                 bodyIds: body,
                 decodedTokens: toks,
-                sumLogProb: choice.logProb,
+                sumLogProb: ch.logProb,
                 stepCount: 1,
-                isFinished: finished,
-                lastTokenId: Int64(choice.id),
-                pastK: step0.nextK,
-                pastV: step0.nextV,
-                coverage: step0.nextCov,
-                prevWeights: step0.nextPrev
+                isFinished: fin,
+                lastTokenId: Int64(ch.id),
+                kvLen: 2,
+                kData: k0,
+                vData: v0,
+                coverageData: c0,
+                prevWeightsData: p0
             )
         }
 
-        // Steps 1 ..< tokenLimit
+        // Steps 1 ..< tokenLimit: stack all unfinished beams into 1 batched ONNX call!
         if tokenLimit > 1 {
             for stepIdx in 1..<tokenLimit {
-                if beams.allSatisfy(\.isFinished) { break }
-                var nextPool: [BeamHypothesis] = []
-                nextPool.reserveCapacity(effectiveBeam * effectiveBeam)
+                let active = beams.filter { !$0.isFinished }
+                if active.isEmpty { break }
 
-                for beam in beams {
-                    if beam.isFinished {
-                        nextPool.append(beam)
+                let B = active.count
+                let T = active[0].kvLen
+                let perLayerBeamKV = H * T * D
+
+                var tokBatch = [Int64](repeating: 0, count: B)
+                var kBatch = [Float](repeating: 0, count: L * B * perLayerBeamKV)
+                var vBatch = [Float](repeating: 0, count: L * B * perLayerBeamKV)
+                var covBatch = [Float](repeating: 0, count: B * H * M)
+                var prevBatch = [Float](repeating: 0, count: B * H * M)
+
+                for (b, beam) in active.enumerated() {
+                    tokBatch[b] = beam.lastTokenId
+                    for l in 0..<L {
+                        let srcOff = l * perLayerBeamKV
+                        let dstOff = (l * B + b) * perLayerBeamKV
+                        for j in 0..<perLayerBeamKV {
+                            kBatch[dstOff + j] = beam.kData[srcOff + j]
+                            vBatch[dstOff + j] = beam.vData[srcOff + j]
+                        }
+                    }
+                    let covOff = b * H * M
+                    for j in 0..<(H * M) {
+                        covBatch[covOff + j] = beam.coverageData[j]
+                        prevBatch[covOff + j] = beam.prevWeightsData[j]
+                    }
+                }
+
+                let stepOut = try runtime.decoderStepSession.run(
+                    withInputs: [
+                        "token": try makeInt64Tensor(tokBatch, shape: [B, 1]),
+                        "past_k": try makeFloatTensor(kBatch, shape: [L, B, H, T, D]),
+                        "past_v": try makeFloatTensor(vBatch, shape: [L, B, H, T, D]),
+                        "mk": encoded.mkVal,
+                        "mv": encoded.mvVal,
+                        "memory_mask": encoded.memMaskVal,
+                        "coverage": try makeFloatTensor(covBatch, shape: [B, H, 1, M]),
+                        "prev_weights": try makeFloatTensor(prevBatch, shape: [B, H, 1, M]),
+                    ],
+                    outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
+                    runOptions: nil
+                )
+                guard let lVal = stepOut["logits"],
+                      let nkVal = stepOut["new_k"],
+                      let nvVal = stepOut["new_v"],
+                      let ncVal = stepOut["new_coverage"],
+                      let npVal = stepOut["new_prev_weights"] else {
+                    throw inferenceError("Missing outputs from batched decoder_step.onnx")
+                }
+
+                let allLogits = try extractFloats(lVal)   // [B, 1, V]
+                let allK = try extractFloats(nkVal)       // [L, B, H, T+1, D]
+                let allV = try extractFloats(nvVal)
+                let allCov = try extractFloats(ncVal)     // [B, H, 1, M]
+                let allPrev = try extractFloats(npVal)    // [B, H, 1, M]
+
+                let nextT = T + 1
+                let nextPerLayerBeamKV = H * nextT * D
+
+                // First rank candidates without copying KV buffers for pruned beams!
+                struct PendingCandidate {
+                    let isAlreadyFinished: Bool
+                    let existingFinishedBeam: BatchedBeam?
+                    let activeBeamIdx: Int
+                    let tokenId: Int
+                    let prob: Float
+                    let sumLogProb: Double
+                    let stepCount: Int
+                    var rankingScore: Double { sumLogProb / pow(Double(max(1, stepCount)), 0.7) }
+                }
+
+                var pending: [PendingCandidate] = []
+                pending.reserveCapacity(beamWidth * beamWidth + beamWidth)
+                for b in beams where b.isFinished {
+                    pending.append(PendingCandidate(
+                        isAlreadyFinished: true, existingFinishedBeam: b, activeBeamIdx: -1,
+                        tokenId: manifest.eosId, prob: 1, sumLogProb: b.sumLogProb, stepCount: b.stepCount
+                    ))
+                }
+                for (bIdx, beam) in active.enumerated() {
+                    let choices = topKLogSoftmax(allLogits, offset: bIdx * V, count: V, k: beamWidth)
+                    for ch in choices {
+                        pending.append(PendingCandidate(
+                            isAlreadyFinished: false, existingFinishedBeam: nil, activeBeamIdx: bIdx,
+                            tokenId: ch.id, prob: ch.prob, sumLogProb: beam.sumLogProb + ch.logProb, stepCount: beam.stepCount + 1
+                        ))
+                    }
+                }
+                pending.sort { $0.rankingScore > $1.rankingScore }
+                let survivors = pending.prefix(beamWidth)
+
+                // Materialize KV buffers only for surviving active beams (at most beamWidth copies)
+                var extractedK: [Int: [Float]] = [:]
+                var extractedV: [Int: [Float]] = [:]
+                var extractedCov: [Int: [Float]] = [:]
+                var extractedPrev: [Int: [Float]] = [:]
+                var extractedAttn: [Int: [Float]?] = [:]
+
+                var nextBeams: [BatchedBeam] = []
+                nextBeams.reserveCapacity(beamWidth)
+
+                for item in survivors {
+                    if item.isAlreadyFinished, let fin = item.existingFinishedBeam {
+                        nextBeams.append(fin)
                         continue
                     }
-                    let step = try runDecoderStep(
-                        tokenId: beam.lastTokenId,
-                        pastK: beam.pastK,
-                        pastV: beam.pastV,
-                        coverage: beam.coverage,
-                        prevWeights: beam.prevWeights
-                    )
-                    let stepAttn: [Float]? = visionMemLen > 0
-                        ? averageVisionAttention(
-                            weights: try extractFloats(step.nextPrev),
-                            numHeads: numHeads,
-                            totalMemLen: totalMemLen,
-                            visionOffset: strokeMemLen,
-                            visionLen: visionMemLen
-                        )
-                        : nil
+                    let bIdx = item.activeBeamIdx
+                    let parent = active[bIdx]
+                    let fin = (item.tokenId == manifest.eosId)
 
-                    let choices = topKLogSoftmax(step.logits, k: effectiveBeam)
-                    for choice in choices {
-                        let finished = (choice.id == manifest.eosId)
-                        var body = beam.bodyIds
-                        var toks = beam.decodedTokens
-                        if !finished, let dt = makeDecodedToken(stepIdx: stepIdx, tokenId: choice.id, prob: choice.prob, visionAttn: stepAttn) {
-                            body.append(choice.id)
-                            toks.append(dt)
-                        }
-                        nextPool.append(
-                            BeamHypothesis(
-                                bodyIds: body,
-                                decodedTokens: toks,
-                                sumLogProb: beam.sumLogProb + choice.logProb,
-                                stepCount: beam.stepCount + 1,
-                                isFinished: finished,
-                                lastTokenId: Int64(choice.id),
-                                pastK: step.nextK,
-                                pastV: step.nextV,
-                                coverage: step.nextCov,
-                                prevWeights: step.nextPrev
-                            )
-                        )
+                    if extractedAttn[bIdx] == nil {
+                        let covOff = bIdx * H * M
+                        let prevSlice = Array(allPrev[covOff ..< (covOff + H * M)])
+                        extractedPrev[bIdx] = prevSlice
+                        extractedCov[bIdx] = Array(allCov[covOff ..< (covOff + H * M)])
+                        extractedAttn[bIdx] = encoded.visionMemLen > 0
+                            ? averageVisionAttention(weights: prevSlice, numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
+                            : nil
                     }
-                }
+                    if !fin && extractedK[bIdx] == nil {
+                        var bk = [Float](repeating: 0, count: L * nextPerLayerBeamKV)
+                        var bv = [Float](repeating: 0, count: L * nextPerLayerBeamKV)
+                        for l in 0..<L {
+                            let srcOff = (l * B + bIdx) * nextPerLayerBeamKV
+                            let dstOff = l * nextPerLayerBeamKV
+                            for j in 0..<nextPerLayerBeamKV {
+                                bk[dstOff + j] = allK[srcOff + j]
+                                bv[dstOff + j] = allV[srcOff + j]
+                            }
+                        }
+                        extractedK[bIdx] = bk
+                        extractedV[bIdx] = bv
+                    }
 
-                nextPool.sort { $0.rankingScore > $1.rankingScore }
-                beams = Array(nextPool.prefix(effectiveBeam))
+                    var body = parent.bodyIds
+                    var toks = parent.decodedTokens
+                    if !fin && !specialSet.contains(item.tokenId) {
+                        body.append(item.tokenId)
+                        toks.append(makeToken(stepIdx: stepIdx, tokenId: item.tokenId, prob: item.prob, visionAttn: extractedAttn[bIdx] ?? nil, manifest: manifest))
+                    }
+
+                    nextBeams.append(BatchedBeam(
+                        bodyIds: body,
+                        decodedTokens: toks,
+                        sumLogProb: item.sumLogProb,
+                        stepCount: item.stepCount,
+                        isFinished: fin,
+                        lastTokenId: Int64(item.tokenId),
+                        kvLen: nextT,
+                        kData: fin ? [] : (extractedK[bIdx] ?? []),
+                        vData: fin ? [] : (extractedV[bIdx] ?? []),
+                        coverageData: fin ? [] : (extractedCov[bIdx] ?? []),
+                        prevWeightsData: fin ? [] : (extractedPrev[bIdx] ?? [])
+                    ))
+                }
+                beams = nextBeams
             }
         }
+        return beams
+    }
 
-        // Deduplicate final beams by decoded LaTeX while keeping highest L2R score
-        var uniqueBeams: [BeamHypothesis] = []
-        var seenLatex: Set<String> = []
-        beams.sort { $0.rankingScore > $1.rankingScore }
-        for b in beams {
-            let tex = LatexTokenizer.detokenize(b.decodedTokens.map(\.text))
-            if seenLatex.insert(tex).inserted {
-                uniqueBeams.append(b)
-            }
-        }
-        if uniqueBeams.isEmpty, let first = beams.first {
-            uniqueBeams = [first]
-        }
-        let decodeMs = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000.0
+    // MARK: - 4. Legacy v1 Bundle Beam Search (serial fallback if user hasn't updated model-bundle yet)
 
-        // Optional R2L Bidirectional Reranking (single batched forward pass!)
-        var r2lMs: Double = 0
-        var r2lScores: [Double]? = nil
-        var r2lUsed = false
+    private static func decodeLegacyBeam(
+        runtime: LoadedRuntime,
+        encoded: EncodedMemoryCache,
+        beamWidth: Int,
+        tokenLimit: Int,
+        specialSet: Set<Int>
+    ) throws -> [LegacyBeam] {
+        let manifest = runtime.bundle.manifest
+        let L = manifest.decoderLayers
+        let H = manifest.attentionHeads
+        let D = manifest.headDim
+        let M = encoded.totalMemLen
+        let V = manifest.vocabSize
 
-        if decodingMode == .beamR2L, let r2lSession = runtime.r2lScorerSession, !uniqueBeams.isEmpty {
-            let r2lStart = CFAbsoluteTimeGetCurrent()
-            let r2lSeqs: [[Int64]] = uniqueBeams.map { b in
-                var seq: [Int64] = [Int64(manifest.bosId)]
-                seq.reserveCapacity(b.bodyIds.count + 2)
-                for id in b.bodyIds.reversed() {
-                    seq.append(Int64(id))
-                }
-                seq.append(Int64(manifest.eosId))
-                return seq
-            }
-            let maxLen = max(2, r2lSeqs.map(\.count).max() ?? 2)
-            let batchCount = r2lSeqs.count
-            var tokFlat = [Int64](repeating: Int64(manifest.padId), count: batchCount * maxLen)
-            var padFlat = [UInt8](repeating: 1, count: batchCount * maxLen)
-            for (row, seq) in r2lSeqs.enumerated() {
-                let base = row * maxLen
-                for (col, id) in seq.enumerated() {
-                    tokFlat[base + col] = id
-                    padFlat[base + col] = 0
-                }
-            }
-
-            let tokTensor = try makeInt64Tensor(tokFlat, shape: [batchCount, maxLen])
-            let padTensor = try makeUInt8Tensor(padFlat, shape: [batchCount, maxLen])
-            let r2lOut = try r2lSession.run(
+        func runStep(_ tokId: Int64, _ k: ORTValue, _ v: ORTValue, _ c: ORTValue, _ p: ORTValue) throws -> ([Float], ORTValue, ORTValue, ORTValue, ORTValue) {
+            let out = try runtime.decoderStepSession.run(
                 withInputs: [
-                    "r2l_tokens": tokTensor,
-                    "r2l_padding_mask": padTensor,
-                    "memory": memTensor,
-                    "memory_mask": memMaskVal,
+                    "token": try makeInt64Tensor([tokId], shape: [1, 1]),
+                    "past_k": k, "past_v": v, "mk": encoded.mkVal, "mv": encoded.mvVal,
+                    "memory_mask": encoded.memMaskVal, "coverage": c, "prev_weights": p,
                 ],
-                outputNames: ["seq_log_prob", "avg_log_prob"],
+                outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
                 runOptions: nil
             )
-            if let avgVal = r2lOut["avg_log_prob"] {
-                r2lScores = try extractFloats(avgVal).map { Double($0) }
-                r2lUsed = true
+            guard let lv = out["logits"], let nk = out["new_k"], let nv = out["new_v"], let nc = out["new_coverage"], let np = out["new_prev_weights"] else {
+                throw inferenceError("Missing outputs from legacy decoder_step.onnx")
             }
-            r2lMs = (CFAbsoluteTimeGetCurrent() - r2lStart) * 1000.0
+            return (try extractFloats(lv), nk, nv, nc, np)
         }
 
-        // Rank candidates and pick winner
-        let l2rTopIndex = 0
-        var indexedScores: [(index: Int, l2r: Double, r2l: Double?, combined: Double)] = uniqueBeams.enumerated().map { idx, b in
-            let l2r = b.avgLogProb
-            let r2l = r2lScores?[idx]
-            let combined = r2l != nil ? (l2r + r2lWeight * r2l!) : l2r
-            return (idx, l2r, r2l, combined)
-        }
-        indexedScores.sort { $0.combined > $1.combined }
+        let initK = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * 1 * D), shape: [L, 1, H, 1, D])
+        let initV = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * 1 * D), shape: [L, 1, H, 1, D])
+        let initCov = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        let initPrev = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
 
-        let winnerIdx = indexedScores.first?.index ?? 0
-        let r2lChangedWinner = r2lUsed && (winnerIdx != l2rTopIndex)
-        let winner = uniqueBeams[winnerIdx]
-
-        let beamSummaries: [BeamCandidate] = indexedScores.enumerated().map { rank, item in
-            let b = uniqueBeams[item.index]
-            let tex = LatexTokenizer.detokenize(b.decodedTokens.map(\.text))
-            return BeamCandidate(
-                id: rank,
-                latex: tex,
-                l2rScore: item.l2r,
-                r2lScore: item.r2l,
-                combinedScore: item.combined,
-                isWinner: rank == 0,
-                wasPromotedByR2L: rank == 0 && r2lChangedWinner
-            )
+        let (l0, k0, v0, c0, p0) = try runStep(Int64(manifest.bosId), initK, initV, initCov, initPrev)
+        let attn0 = encoded.visionMemLen > 0
+            ? averageVisionAttention(weights: try extractFloats(p0), numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
+            : nil
+        var beams: [LegacyBeam] = topKLogSoftmax(l0, offset: 0, count: V, k: beamWidth).map { ch in
+            let fin = ch.id == manifest.eosId
+            var body: [Int] = []
+            var toks: [DecodedToken] = []
+            if !fin && !specialSet.contains(ch.id) {
+                body.append(ch.id)
+                toks.append(makeToken(stepIdx: 0, tokenId: ch.id, prob: ch.prob, visionAttn: attn0, manifest: manifest))
+            }
+            return LegacyBeam(bodyIds: body, decodedTokens: toks, sumLogProb: ch.logProb, stepCount: 1, isFinished: fin, lastTokenId: Int64(ch.id), pastK: k0, pastV: v0, coverage: c0, prevWeights: p0)
         }
 
-        let totalMs = (CFAbsoluteTimeGetCurrent() - totalStart) * 1000.0
-        let latex = LatexTokenizer.detokenize(winner.decodedTokens.map(\.text))
-        let overallConf: Float
-        if winner.decodedTokens.isEmpty {
-            overallConf = 0
-        } else {
-            let meanLog = winner.decodedTokens.reduce(0.0) { $0 + log(Double(max($1.confidence, 1e-6))) } / Double(winner.decodedTokens.count)
-            overallConf = Float(exp(meanLog))
+        for stepIdx in 1..<tokenLimit {
+            if beams.allSatisfy(\.isFinished) { break }
+            var pool: [LegacyBeam] = []
+            for b in beams {
+                if b.isFinished { pool.append(b); continue }
+                let (ls, nk, nv, nc, np) = try runStep(b.lastTokenId, b.pastK, b.pastV, b.coverage, b.prevWeights)
+                let attn = encoded.visionMemLen > 0
+                    ? averageVisionAttention(weights: try extractFloats(np), numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
+                    : nil
+                for ch in topKLogSoftmax(ls, offset: 0, count: V, k: beamWidth) {
+                    let fin = ch.id == manifest.eosId
+                    var body = b.bodyIds
+                    var toks = b.decodedTokens
+                    if !fin && !specialSet.contains(ch.id) {
+                        body.append(ch.id)
+                        toks.append(makeToken(stepIdx: stepIdx, tokenId: ch.id, prob: ch.prob, visionAttn: attn, manifest: manifest))
+                    }
+                    pool.append(LegacyBeam(bodyIds: body, decodedTokens: toks, sumLogProb: b.sumLogProb + ch.logProb, stepCount: b.stepCount + 1, isFinished: fin, lastTokenId: Int64(ch.id), pastK: nk, pastV: nv, coverage: nc, prevWeights: np))
+                }
+            }
+            pool.sort { $0.rankingScore > $1.rankingScore }
+            beams = Array(pool.prefix(beamWidth))
         }
-
-        let gridH = visionMemLen > 0 ? max(1, strip.height / 16) : 0
-        let gridW = gridH > 0 ? (visionMemLen / gridH) : 0
-
-        return RecognitionResult(
-            latex: latex,
-            decodedTokens: winner.decodedTokens,
-            overallConfidence: overallConf,
-            totalMs: totalMs,
-            encodeMs: encodeMs,
-            decodeMs: decodeMs,
-            r2lMs: r2lMs,
-            strokeCount: strokeInput?.strokeCount ?? strokes.count,
-            pointCount: strokeInput?.pointCount ?? 0,
-            stripHeight: strip.height,
-            stripWidth: strip.width,
-            visionGridW: gridW,
-            visionGridH: gridH,
-            stripLumBytes: strip.lumBytes,
-            stripOrderBytes: strip.orderBytes,
-            modality: modality,
-            decodingMode: decodingMode,
-            r2lUsed: r2lUsed,
-            r2lChangedWinner: r2lChangedWinner,
-            beams: beamSummaries,
-            truncated: !winner.isFinished
-        )
+        return beams
     }
 
     // MARK: - Math & Tensor Helpers
 
-    private static func topKLogSoftmax(_ logits: [Float], k: Int) -> [(id: Int, logProb: Double, prob: Float)] {
-        guard !logits.isEmpty else { return [] }
-        var maxVal = -Float.greatestFiniteMagnitude
-        for v in logits where v > maxVal { maxVal = v }
+    private static func makeToken(stepIdx: Int, tokenId: Int, prob: Float, visionAttn: [Float]?, manifest: ModelManifest) -> DecodedToken {
+        let text = (tokenId >= 0 && tokenId < manifest.tokens.count) ? manifest.tokens[tokenId] : "<UNK>"
+        return DecodedToken(
+            id: stepIdx,
+            tokenId: tokenId,
+            text: text,
+            confidence: prob,
+            category: TokenCategory.classify(text),
+            visionAttention: visionAttn
+        )
+    }
 
+    private static func fingerprintStrokes(_ strokes: [RawStroke]) -> UInt64 {
+        var h: UInt64 = 14695981039346656037
+        let prime: UInt64 = 1099511628211
+        func mix(_ v: UInt64) {
+            h ^= v
+            h = h &* prime
+        }
+        mix(UInt64(strokes.count))
+        for s in strokes {
+            mix(UInt64(s.points.count))
+            for pt in s.points {
+                mix(pt.x.bitPattern)
+                mix(pt.y.bitPattern)
+                mix((pt.timeMs ?? -1).bitPattern)
+            }
+        }
+        return h
+    }
+
+    private static func argmaxLogSoftmax(_ logits: [Float], offset: Int, count: Int) -> (id: Int, logProb: Double, prob: Float) {
+        var bestIdx = 0
+        var bestVal = -Float.greatestFiniteMagnitude
+        for i in 0..<count {
+            let v = logits[offset + i]
+            if v > bestVal {
+                bestVal = v
+                bestIdx = i
+            }
+        }
         var sumExp: Double = 0
-        for v in logits {
-            sumExp += exp(Double(v - maxVal))
+        for i in 0..<count {
+            sumExp += exp(Double(logits[offset + i] - bestVal))
+        }
+        let logProb = -log(max(sumExp, 1e-30))
+        return (bestIdx, logProb, Float(exp(logProb)))
+    }
+
+    private static func topKLogSoftmax(_ logits: [Float], offset: Int, count: Int, k: Int) -> [(id: Int, logProb: Double, prob: Float)] {
+        guard count > 0 else { return [] }
+        var maxVal = -Float.greatestFiniteMagnitude
+        for i in 0..<count {
+            let v = logits[offset + i]
+            if v > maxVal { maxVal = v }
+        }
+        var sumExp: Double = 0
+        for i in 0..<count {
+            sumExp += exp(Double(logits[offset + i] - maxVal))
         }
         let logZ = Double(maxVal) + log(max(sumExp, 1e-30))
 
-        // Fast partial top-K selection (vocab = 907, k <= 8)
         var top: [(id: Int, val: Float)] = []
         top.reserveCapacity(k + 1)
-        for i in 0..<logits.count {
-            let v = logits[i]
+        for i in 0..<count {
+            let v = logits[offset + i]
             if top.count < k || v > top[top.count - 1].val {
                 var pos = top.count
                 while pos > 0 && v > top[pos - 1].val {
@@ -595,6 +1255,27 @@ public final class InkTeXEngine: ObservableObject {
             let base = h * totalMemLen + visionOffset
             for i in 0..<visionLen {
                 avg[i] += weights[base + i] * invHeads
+            }
+        }
+        return avg
+    }
+
+    private static func extractVisionAttentionAtStep(
+        _ allPrevW: [Float],
+        numHeads: Int,
+        stepLen: Int,
+        stepIdx: Int,
+        totalMemLen: Int,
+        visionOffset: Int,
+        visionLen: Int
+    ) -> [Float] {
+        guard allPrevW.count >= numHeads * stepLen * totalMemLen, visionLen > 0 else { return [] }
+        var avg = [Float](repeating: 0, count: visionLen)
+        let invHeads = 1.0 / Float(max(numHeads, 1))
+        for h in 0..<numHeads {
+            let base = (h * stepLen + stepIdx) * totalMemLen + visionOffset
+            for i in 0..<visionLen {
+                avg[i] += allPrevW[base + i] * invHeads
             }
         }
         return avg

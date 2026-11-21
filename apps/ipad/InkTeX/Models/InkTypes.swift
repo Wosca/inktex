@@ -239,6 +239,8 @@ public struct ModelManifest: Codable, Sendable {
     public let epoch: Int?
     public let quantization: String?
     public let hasR2L: Bool?
+    public let supportsBatchedDecoder: Bool?
+    public let supportsPrefixVerify: Bool?
     public let r2lDecoderLayers: Int?
     public let dModel: Int
     public let decoderLayers: Int
@@ -265,6 +267,8 @@ public struct ModelManifest: Codable, Sendable {
         case epoch
         case quantization
         case hasR2L = "has_r2l"
+        case supportsBatchedDecoder = "supports_batched_decoder"
+        case supportsPrefixVerify = "supports_prefix_verify"
         case r2lDecoderLayers = "r2l_decoder_layers"
         case dModel = "d_model"
         case decoderLayers = "decoder_layers"
@@ -305,6 +309,8 @@ public struct RecognitionResult: Sendable {
     public let decodingMode: DecodingMode
     public let r2lUsed: Bool
     public let r2lChangedWinner: Bool
+    public let prefixVerifiedCount: Int
+    public let encoderCacheHit: Bool
     public let beams: [BeamCandidate]
     public let truncated: Bool
 

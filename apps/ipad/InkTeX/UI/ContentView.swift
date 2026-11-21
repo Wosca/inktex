@@ -10,15 +10,16 @@ struct ContentView: View {
     @State private var decodingMode: DecodingMode = .beamR2L
     @State private var pencilOnly: Bool = false
     @State private var autoRecognize: Bool = true
-    @State private var showInspector: Bool = false
     @State private var expandPreview: Bool = false
     @State private var stripColorMode: StripColorMode = .confidence
+    @State private var showInspectorSheet: Bool = false
     @State private var showModelSheet: Bool = false
 
     @State private var latestResult: RecognitionResult?
+    @State private var isRefiningBeam: Bool = false
     @State private var errorMessage: String?
     @State private var copiedFeedback: Bool = false
-    @State private var debounceTask: Task<Void, Never>?
+    @State private var recognitionTask: Task<Void, Never>?
     @State private var requestGeneration: Int = 0
 
     var body: some View {
@@ -38,15 +39,7 @@ struct ContentView: View {
                     .padding(.top, 10)
                     .padding(.bottom, 10)
 
-                // Optional Vision Strip & Token Inspector Drawer
-                if showInspector, let result = latestResult {
-                    inspectorBar(result)
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 10)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-
-                // Main Apple Pencil Drawing Canvas (no overlaid buttons competing with PencilKit gestures)
+                // Main Apple Pencil Drawing Canvas
                 ZStack {
                     DotGridBackground()
                         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -81,7 +74,7 @@ struct ContentView: View {
                 }
                 .padding(.horizontal, 16)
 
-                // Dedicated Bottom Action Bar (instant tap delivery, zero PencilKit gesture delay)
+                // Dedicated Bottom Action Bar (instant Clear/Undo + Decoding Switcher)
                 canvasActionBar
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
@@ -89,14 +82,15 @@ struct ContentView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // Clean Settings icon only on top-left (no title/dot clutter)
                 ToolbarItem(placement: .topBarLeading) {
-                    Text("InkTeX")
-                        .font(.headline.weight(.bold))
-                        .fixedSize()
-                }
-
-                ToolbarItem(placement: .topBarLeading) {
-                    modelStatusChip
+                    Button {
+                        showModelSheet = true
+                    } label: {
+                        Image(systemName: settingsIconName)
+                            .foregroundStyle(settingsIconColor)
+                    }
+                    .help("Model & Settings")
                 }
 
                 ToolbarItem(placement: .principal) {
@@ -106,7 +100,7 @@ struct ContentView: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    .frame(width: 250)
+                    .frame(width: 240)
                     .onChange(of: modality) { _, _ in
                         let strokes = canvasController.extractRawStrokes()
                         if !strokes.isEmpty {
@@ -131,25 +125,38 @@ struct ContentView: View {
                     .help(autoRecognize ? "Auto-recognize ON" : "Manual recognize")
 
                     Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showInspector.toggle()
-                        }
+                        showInspectorSheet = true
                     } label: {
-                        Image(systemName: showInspector ? "waveform.path.ecg.rectangle.fill" : "waveform.path.ecg.rectangle")
+                        Image(systemName: "eye")
                     }
-                    .help("Toggle Vision Strip & Confidence Inspector")
-
-                    Button {
-                        showModelSheet = true
-                    } label: {
-                        Image(systemName: "cpu")
-                    }
-                    .help("Model Settings & Import")
+                    .disabled(latestResult == nil)
+                    .help("Inspect Vision Strip, Confidence & Beams")
                 }
             }
             .sheet(isPresented: $showModelSheet) {
                 ModelSetupSheet(engine: engine)
             }
+            .sheet(isPresented: $showInspectorSheet) {
+                if let result = latestResult {
+                    InspectorSheet(result: result, stripColorMode: $stripColorMode)
+                        .presentationDetents([.medium, .large])
+                }
+            }
+        }
+    }
+
+    private var settingsIconName: String {
+        switch engine.status {
+        case .missingModel, .failed: return "exclamationmark.circle"
+        default: return "gearshape"
+        }
+    }
+
+    private var settingsIconColor: Color {
+        switch engine.status {
+        case .missingModel: return .orange
+        case .failed: return .red
+        default: return .primary
         }
     }
 
@@ -175,13 +182,25 @@ struct ContentView: View {
                     Text(String(format: "%.0f%% · %.0f ms", result.overallConfidence * 100, result.totalMs))
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
-                    if result.r2lChangedWinner {
+
+                    if isRefiningBeam {
+                        ProgressView()
+                            .controlSize(.mini)
+                    } else if result.r2lChangedWinner {
                         Text("R2L Pick")
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
                             .background(Color.purple.opacity(0.22))
                             .foregroundStyle(.purple)
+                            .clipShape(Capsule())
+                    } else if result.prefixVerifiedCount > 0 {
+                        Text("\(result.prefixVerifiedCount) cached")
+                            .font(.caption2.weight(.medium))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.18))
+                            .foregroundStyle(.green)
                             .clipShape(Capsule())
                     }
                 }
@@ -231,49 +250,13 @@ struct ContentView: View {
 
     private func clearAll() {
         requestGeneration += 1
-        debounceTask?.cancel()
-        debounceTask = nil
+        recognitionTask?.cancel()
+        recognitionTask = nil
+        isRefiningBeam = false
         canvasController.clear()
+        engine.clearCaches()
         latestResult = nil
         errorMessage = nil
-    }
-
-    private var modelStatusChip: some View {
-        Button {
-            showModelSheet = true
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 7))
-                    .foregroundStyle(statusColor)
-                Text(statusLabel)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-            }
-            .fixedSize()
-        }
-    }
-
-    private var statusColor: Color {
-        switch engine.status {
-        case .ready: return .green
-        case .loading: return .orange
-        case .missingModel: return .yellow
-        case .failed: return .red
-        }
-    }
-
-    private var statusLabel: String {
-        switch engine.status {
-        case .loading: return "Loading…"
-        case .missingModel: return "Import Model"
-        case .failed: return "Load Error"
-        case .ready:
-            if let m = engine.loadedBundle?.manifest, let stage = m.stage, let epoch = m.epoch {
-                return "S\(stage) · E\(epoch)"
-            }
-            return "Ready"
-        }
     }
 
     private var previewPanel: some View {
@@ -286,7 +269,7 @@ struct ContentView: View {
                 .frame(height: expandPreview ? 240 : 124)
 
                 HStack(spacing: 6) {
-                    if engine.isRecognizing {
+                    if engine.isRecognizing && !isRefiningBeam {
                         ProgressView()
                             .controlSize(.small)
                     }
@@ -352,154 +335,6 @@ struct ContentView: View {
         )
     }
 
-    private func inspectorBar(_ result: RecognitionResult) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Text("Strip \(result.stripWidth)×\(result.stripHeight) · \(result.strokeCount) strokes · \(result.pointCount) pts")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-
-                Spacer()
-
-                Picker("Strip Color", selection: $stripColorMode) {
-                    ForEach(StripColorMode.allCases) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 230)
-                .controlSize(.small)
-
-                Text(
-                    result.r2lUsed
-                        ? String(format: "Enc %.0f · Dec %.0f · R2L %.0fms", result.encodeMs, result.decodeMs, result.r2lMs)
-                        : String(format: "Enc %.0f · Dec %.0fms", result.encodeMs, result.decodeMs)
-                )
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-
-            if let uiImg = StripRasterizer.renderVisualization(result: result, mode: stripColorMode) {
-                Image(uiImage: uiImg)
-                    .interpolation(.none)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxHeight: 74)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-            }
-
-            // Compact color legend matching selected visualization mode
-            inspectorLegend(for: stripColorMode, modality: result.modality)
-
-            // Token-by-token ribbon colored by confidence or symbol type
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 5) {
-                    ForEach(result.decodedTokens) { tok in
-                        let chipColor = tokenChipColor(tok)
-                        HStack(spacing: 4) {
-                            Text(tok.text)
-                                .font(.system(.caption2, design: .monospaced).weight(.medium))
-                            if stripColorMode == .confidence {
-                                Text("\(Int(round(tok.confidence * 100)))%")
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(chipColor.opacity(0.20))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 5)
-                                .strokeBorder(chipColor.opacity(0.55), lineWidth: 0.75)
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
-                    }
-                }
-            }
-            // Top beams table when Beam Search / R2L Reranking is active
-            if result.beams.count > 1 {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(result.r2lUsed ? "Top Beams (L2R + R2L Reranked)" : "Top Beams (L2R)")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    ForEach(result.beams.prefix(4)) { beam in
-                        HStack(spacing: 8) {
-                            Text(beam.isWinner ? "★" : "•")
-                                .font(.caption2)
-                                .foregroundStyle(beam.wasPromotedByR2L ? .purple : (beam.isWinner ? .accentColor : .secondary))
-                            Text(beam.latex)
-                                .font(.system(.caption2, design: .monospaced))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Spacer(minLength: 6)
-                            if let r2l = beam.r2lScore {
-                                Text(String(format: "L2R %.2f · R2L %.2f", beam.l2rScore, r2l))
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                Text(String(format: "L2R %.2f", beam.l2rScore))
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-                .padding(.top, 2)
-            }
-        }
-        .padding(12)
-        .background(Color(uiColor: .secondarySystemGroupedBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
-    private func tokenChipColor(_ tok: DecodedToken) -> Color {
-        switch stripColorMode {
-        case .strokeOrder:
-            return .accentColor
-        case .confidence:
-            let (r, g, b) = StripRasterizer.confidenceRGB(tok.confidence)
-            return Color(red: Double(r) / 255.0, green: Double(g) / 255.0, blue: Double(b) / 255.0)
-        case .symbolType:
-            return tok.category.color
-        }
-    }
-
-    @ViewBuilder
-    private func inspectorLegend(for mode: StripColorMode, modality: ModalityMode) -> some View {
-        HStack(spacing: 12) {
-            switch mode {
-            case .strokeOrder:
-                legendDot(color: Color(red: 40 / 255, green: 220 / 255, blue: 1), label: "First stroke")
-                legendDot(color: Color(red: 1, green: 100 / 255, blue: 215 / 255), label: "Last stroke")
-            case .confidence:
-                legendDot(color: Color(red: 52 / 255, green: 211 / 255, blue: 153 / 255), label: "High (≥90%)")
-                legendDot(color: Color(red: 250 / 255, green: 190 / 255, blue: 36 / 255), label: "Mid (~80%)")
-                legendDot(color: Color(red: 248 / 255, green: 81 / 255, blue: 73 / 255), label: "Low (<65%)")
-            case .symbolType:
-                ForEach(TokenCategory.allCases) { cat in
-                    legendDot(color: cat.color, label: cat.label)
-                }
-            }
-            if modality == .stroke && mode != .strokeOrder {
-                Spacer()
-                Text("Switch to Bimodal/Vision for spatial strip coloring")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-    }
-
-    private func legendDot(color: Color, label: String) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: "circle.fill")
-                .font(.system(size: 7))
-                .foregroundStyle(color)
-            Text(label)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-        }
-    }
-
     private var missingModelBanner: some View {
         HStack {
             Image(systemName: "tray.and.arrow.down.fill")
@@ -537,7 +372,9 @@ struct ContentView: View {
     private func handleDrawingChanged(_ strokes: [RawStroke]) {
         if strokes.isEmpty {
             requestGeneration += 1
-            debounceTask?.cancel()
+            recognitionTask?.cancel()
+            isRefiningBeam = false
+            engine.clearCaches()
             latestResult = nil
             errorMessage = nil
             return
@@ -549,29 +386,80 @@ struct ContentView: View {
     private func triggerRecognition(_ strokes: [RawStroke], immediate: Bool) {
         requestGeneration += 1
         let myGen = requestGeneration
-        debounceTask?.cancel()
+        recognitionTask?.cancel()
+        isRefiningBeam = false
         guard engine.status == .ready else { return }
+
         let selectedModality = modality
         let selectedDecoding = decodingMode
+        let useTwoPhase = !immediate && engine.liveTwoPhase && selectedDecoding != .greedy
 
-        debounceTask = Task {
+        recognitionTask = Task {
             if !immediate {
-                try? await Task.sleep(nanoseconds: 320_000_000)
+                try? await Task.sleep(nanoseconds: 240_000_000)
             }
             if Task.isCancelled || myGen != requestGeneration { return }
-            do {
-                let result = try await engine.recognize(
-                    strokes: strokes,
-                    modality: selectedModality,
-                    decodingMode: selectedDecoding
-                )
-                if !Task.isCancelled && myGen == requestGeneration {
-                    latestResult = result
-                    errorMessage = nil
+
+            if useTwoPhase {
+                // Phase 1: Instant Prefix-Verified Greedy preview (~100-180ms!)
+                do {
+                    let fastResult = try await engine.recognize(
+                        strokes: strokes,
+                        modality: selectedModality,
+                        decodingMode: .greedy
+                    )
+                    if !Task.isCancelled && myGen == requestGeneration {
+                        latestResult = fastResult
+                        errorMessage = nil
+                    }
+                } catch {
+                    if !Task.isCancelled && myGen == requestGeneration {
+                        errorMessage = error.localizedDescription
+                    }
+                    return
                 }
-            } catch {
-                if !Task.isCancelled && myGen == requestGeneration {
-                    errorMessage = error.localizedDescription
+
+                // Wait briefly for user to finish writing before running Beam + R2L polish
+                try? await Task.sleep(nanoseconds: 550_000_000)
+                if Task.isCancelled || myGen != requestGeneration { return }
+
+                // Phase 2: Batched Beam + R2L polish (reuses cached encoder memory = 0ms encode!)
+                isRefiningBeam = true
+                defer {
+                    if myGen == requestGeneration {
+                        isRefiningBeam = false
+                    }
+                }
+                do {
+                    let refined = try await engine.recognize(
+                        strokes: strokes,
+                        modality: selectedModality,
+                        decodingMode: selectedDecoding
+                    )
+                    if !Task.isCancelled && myGen == requestGeneration {
+                        latestResult = refined
+                        errorMessage = nil
+                    }
+                } catch {
+                    if !Task.isCancelled && myGen == requestGeneration {
+                        errorMessage = error.localizedDescription
+                    }
+                }
+            } else {
+                do {
+                    let result = try await engine.recognize(
+                        strokes: strokes,
+                        modality: selectedModality,
+                        decodingMode: selectedDecoding
+                    )
+                    if !Task.isCancelled && myGen == requestGeneration {
+                        latestResult = result
+                        errorMessage = nil
+                    }
+                } catch {
+                    if !Task.isCancelled && myGen == requestGeneration {
+                        errorMessage = error.localizedDescription
+                    }
                 }
             }
         }

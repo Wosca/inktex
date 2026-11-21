@@ -100,15 +100,12 @@ class MemoryProjExport(nn.Module):
 
 
 class DecoderStepExport(nn.Module):
-    """Single KV-cached autoregressive decoder step with ALiBi and visibility-gated coverage.
+    """Unified KV-cached decoder supporting BOTH:
+      1. Batched beam decoding:  tokens [B, 1], past_k/v [L, B, H, T, D]
+      2. Parallel prefix verify: tokens [1, S], past_k/v [L, 1, H, 1, D] (verifies S tokens in 1 pass!)
 
     Slot 0 of ``past_k`` / ``past_v`` is always a dummy sentinel masked with ``-1e9`` in self-attention.
-    This eliminates any ``T = 0`` empty-tensor edge case and avoids duplicating decoder weights across
-    separate init/step graphs:
-      - Step 0: pass ``token = [[bos_id]]``, ``past_k/v = zeros([L, 1, H, 1, D])``,
-        ``coverage = zeros([1, H, 1, M])``, ``prev_weights = zeros([1, H, 1, M])``.
-      - Step t >= 1: pass previous predicted token and the returned ``new_k/v``, ``new_coverage``,
-        ``new_prev_weights``.
+    ``mk``, ``mv``, and ``memory_mask`` keep batch=1 and are broadcast to ``B`` inside the graph.
     """
 
     def __init__(self, model: BimodalMathModel):
@@ -135,7 +132,7 @@ class DecoderStepExport(nn.Module):
         if bias is not None:
             score = score + bias
         weights = score.softmax(-1)
-        attended = (weights @ values).transpose(1, 2).reshape(query.shape[0], 1, -1)
+        attended = (weights @ values).transpose(1, 2).reshape(query.shape[0], query.shape[1], -1)
         return attention.out_proj(attended), weights
 
     def forward(
@@ -150,25 +147,27 @@ class DecoderStepExport(nn.Module):
         prev_weights: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         decoder = self.decoder
-        memory_mask = memory_mask_u8.ne(0)
+        batch, step_len = token.shape
+        past_len = past_k.shape[3]
+        total_len = past_len + step_len
+
+        memory_mask = memory_mask_u8.ne(0).expand(batch, -1)
         values = decoder.token_embedding(token)
 
-        if decoder.coverage:
-            visible = decoder.visible_tokens[token].to(coverage.dtype)[:, None, :, None]
-            coverage = coverage + prev_weights * visible
-
-        total_len = past_k.shape[3] + 1
-        positions = torch.arange(total_len, device=values.device, dtype=values.dtype)
-        distance = (total_len - 1) - positions
-        self_bias = -self.alibi_slopes.to(values.dtype)[None, :, None, None] * distance[None, None, None, :]
-        dummy_slot = torch.arange(total_len, device=values.device).eq(0)[None, None, None, :]
-        self_bias = self_bias.masked_fill(dummy_slot, NEG_MASK_VALUE)
+        # Causal ALiBi self-attention bias [1, H, S, T + S], masking dummy slot 0 and future keys
+        q_pos = past_len + torch.arange(step_len, device=values.device)
+        k_pos = torch.arange(total_len, device=values.device)
+        dist = (q_pos[:, None] - k_pos[None, :]).clamp_min(0).to(values.dtype)
+        self_bias = -self.alibi_slopes.to(values.dtype)[None, :, None, None] * dist[None, None, :, :]
+        invalid_key = (k_pos[None, :] > q_pos[:, None]) | k_pos[None, :].eq(0)
+        self_bias = self_bias.masked_fill(invalid_key[None, None, :, :], NEG_MASK_VALUE)
 
         mask_bias = torch.zeros_like(memory_mask, dtype=values.dtype).masked_fill(memory_mask, NEG_MASK_VALUE)[:, None, None, :]
 
         new_ks = []
         new_vs = []
-        new_prev_weights = prev_weights
+        cov_seq = coverage.expand(batch, -1, step_len, -1)
+        new_prev_weights = prev_weights.expand(batch, -1, step_len, -1)
         num_layers = len(decoder.transformer.layers)
 
         for index, layer in enumerate(decoder.transformer.layers):
@@ -184,27 +183,34 @@ class DecoderStepExport(nn.Module):
             values = values + attended
 
             q = layer.norm2(values)
+            mk_b = mk[index].expand(batch, -1, -1, -1)
+            mv_b = mv[index].expand(batch, -1, -1, -1)
             last = index == num_layers - 1
-            attended, weights = self._attend(layer.multihead_attn, q, mk[index], mv[index], mask_bias)
+            attended, weights = self._attend(layer.multihead_attn, q, mk_b, mv_b, mask_bias)
             if last:
                 weights = weights.masked_fill(memory_mask[:, None, None, :], 0.0)
                 weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-6)
                 new_prev_weights = weights
                 if decoder.coverage:
-                    coverage_bias = -F.softplus(decoder.coverage_strength) * coverage
-                    attended, _ = self._attend(layer.multihead_attn, q, mk[index], mv[index], coverage_bias + mask_bias)
+                    shifted = torch.cat((prev_weights, weights[:, :, :-1, :]), dim=2)
+                    visible = decoder.visible_tokens[token].to(coverage.dtype)[:, None, :, None]
+                    consumed = shifted * visible
+                    cov_seq = coverage + consumed.cumsum(dim=2)
+                    coverage_bias = -F.softplus(decoder.coverage_strength) * cov_seq
+                    attended, _ = self._attend(layer.multihead_attn, q, mk_b, mv_b, coverage_bias + mask_bias)
             values = values + attended
 
             q = layer.norm3(values)
             values = values + layer.linear2(layer.activation(layer.linear1(q)))
 
-        logits = decoder.output(decoder.transformer.norm(values))[:, 0, :]
+        logits = decoder.output(decoder.transformer.norm(values))  # [B, S, vocab_size]
         if decoder.coverage:
-            valid = (~memory_mask).to(values.dtype)
-            uncovered = (torch.exp(-4.0 * coverage.mean(1)) * valid[:, None, :]).sum(-1) / valid.sum(-1, keepdim=True).clamp_min(1.0)
-            logits = logits - F.softplus(decoder.eos_coverage_strength) * uncovered * self.eos_one_hot.to(logits.dtype)[None, :]
+            valid = (~memory_mask).to(values.dtype)  # [B, M]
+            # cov_seq.mean(1) -> [B, S, M]
+            uncovered = (torch.exp(-4.0 * cov_seq.mean(1)) * valid[:, None, :]).sum(-1) / valid.sum(-1, keepdim=True).clamp_min(1.0)
+            logits = logits - F.softplus(decoder.eos_coverage_strength) * uncovered[:, :, None] * self.eos_one_hot.to(logits.dtype)[None, None, :]
 
-        return logits, torch.stack(new_ks, dim=0), torch.stack(new_vs, dim=0), coverage, new_prev_weights
+        return logits, torch.stack(new_ks, dim=0), torch.stack(new_vs, dim=0), cov_seq, new_prev_weights
 
 
 class R2LScorerExport(nn.Module):
@@ -363,18 +369,20 @@ def export_bundle(
     dummy_memory = torch.zeros((1, 48, cfg.d_model), dtype=torch.float32)
     dummy_memory_mask = torch.zeros((1, 48), dtype=torch.uint8)
 
-    dummy_token = torch.tensor([[tokenizer.bos_id]], dtype=torch.long)
-    dummy_past_k = torch.zeros((num_layers, 1, num_heads, 3, head_dim), dtype=torch.float32)
-    dummy_past_v = torch.zeros((num_layers, 1, num_heads, 3, head_dim), dtype=torch.float32)
+    dummy_token = torch.tensor([[tokenizer.bos_id, 6, 7], [tokenizer.bos_id, 6, 8]], dtype=torch.long)
+    dummy_past_k = torch.zeros((num_layers, 2, num_heads, 3, head_dim), dtype=torch.float32)
+    dummy_past_v = torch.zeros((num_layers, 2, num_heads, 3, head_dim), dtype=torch.float32)
     dummy_mk = torch.zeros((num_layers, 1, num_heads, 48, head_dim), dtype=torch.float32)
     dummy_mv = torch.zeros((num_layers, 1, num_heads, 48, head_dim), dtype=torch.float32)
-    dummy_coverage = torch.zeros((1, num_heads, 1, 48), dtype=torch.float32)
-    dummy_prev_weights = torch.zeros((1, num_heads, 1, 48), dtype=torch.float32)
+    dummy_coverage = torch.zeros((2, num_heads, 1, 48), dtype=torch.float32)
+    dummy_prev_weights = torch.zeros((2, num_heads, 1, 48), dtype=torch.float32)
 
     width_dim = torch.export.Dim("strip_width", min=64, max=cfg.vision_max_width)
     points_dim = torch.export.Dim("num_points", min=2, max=cfg.max_points)
     mem_dim = torch.export.Dim("mem_len", min=2, max=cfg.max_points)
     past_dim = torch.export.Dim("past_len", min=1, max=cfg.max_tokens)
+    dec_batch_dim = torch.export.Dim("dec_batch", min=1, max=16)
+    step_len_dim = torch.export.Dim("step_len", min=1, max=cfg.max_tokens)
 
     vision_path = output_dir / "vision_encoder.onnx"
     stroke_path = output_dir / "stroke_encoder.onnx"
@@ -418,7 +426,7 @@ def export_bundle(
         external_data=False,
     )
 
-    print("Exporting decoder_step.onnx ...")
+    print("Exporting decoder_step.onnx (batched + parallel prefix-verify) ...")
     torch.onnx.export(
         DecoderStepExport(model).eval(),
         (dummy_token, dummy_past_k, dummy_past_v, dummy_mk, dummy_mv, dummy_memory_mask, dummy_coverage, dummy_prev_weights),
@@ -426,14 +434,14 @@ def export_bundle(
         input_names=["token", "past_k", "past_v", "mk", "mv", "memory_mask", "coverage", "prev_weights"],
         output_names=["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
         dynamic_shapes=(
-            {},
-            {3: past_dim},
-            {3: past_dim},
+            {0: dec_batch_dim, 1: step_len_dim},
+            {1: dec_batch_dim, 3: past_dim},
+            {1: dec_batch_dim, 3: past_dim},
             {3: mem_dim},
             {3: mem_dim},
             {1: mem_dim},
-            {3: mem_dim},
-            {3: mem_dim},
+            {0: dec_batch_dim, 3: mem_dim},
+            {0: dec_batch_dim, 3: mem_dim},
         ),
         dynamo=True,
         external_data=False,
@@ -496,7 +504,7 @@ def export_bundle(
         print(f"  {p.name}: {size / (1024 * 1024):.2f} MB")
 
     manifest = {
-        "format": "inktex-onnx-bundle-v1",
+        "format": "inktex-onnx-bundle-v2",
         "model_name": model_name,
         "preset": cfg.preset,
         "stage": payload.get("stage"),
@@ -506,6 +514,8 @@ def export_bundle(
         "metrics": payload.get("metrics"),
         "quantization": quantize,
         "has_r2l": has_r2l,
+        "supports_batched_decoder": True,
+        "supports_prefix_verify": True,
         "r2l_decoder_layers": cfg.r2l_decoder_layers if has_r2l else 0,
         "d_model": cfg.d_model,
         "decoder_layers": num_layers,
