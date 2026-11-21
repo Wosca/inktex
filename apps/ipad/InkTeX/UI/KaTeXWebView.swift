@@ -1,7 +1,8 @@
 import SwiftUI
 import WebKit
 
-/// Offline KaTeX renderer backed by bundled `Resources/katex/` (no internet required).
+/// Offline KaTeX renderer backed by bundled `Resources/katex/` with smooth vertical & horizontal scrolling
+/// so multi-line equations, matrices, and wide derivations never get clipped.
 public struct KaTeXWebView: UIViewRepresentable {
     let latex: String
     let isDark: Bool
@@ -16,7 +17,10 @@ public struct KaTeXWebView: UIViewRepresentable {
         webView.isOpaque = false
         webView.backgroundColor = .clear
         webView.scrollView.backgroundColor = .clear
-        webView.scrollView.showsVerticalScrollIndicator = false
+        webView.scrollView.isScrollEnabled = true
+        webView.scrollView.bounces = true
+        webView.scrollView.showsVerticalScrollIndicator = true
+        webView.scrollView.showsHorizontalScrollIndicator = true
         webView.navigationDelegate = context.coordinator
 
         let baseURL = Bundle.main.url(forResource: "katex", withExtension: nil)
@@ -27,31 +31,31 @@ public struct KaTeXWebView: UIViewRepresentable {
         <html>
         <head>
           <meta charset="utf-8" />
-          <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+          <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=2.0, user-scalable=yes" />
           <link rel="stylesheet" href="katex.min.css" />
           <style>
             :root { color-scheme: light dark; }
             html, body {
               margin: 0;
               padding: 0;
-              width: 100%;
-              height: 100%;
+              min-width: 100%;
+              min-height: 100%;
               background: transparent;
               display: flex;
-              align-items: center;
-              justify-content: center;
-              overflow-x: auto;
-              overflow-y: hidden;
               font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+              -webkit-overflow-scrolling: touch;
             }
             #math {
-              font-size: 28px;
-              padding: 8px 18px;
-              white-space: nowrap;
+              margin: auto;
+              font-size: 26px;
+              padding: 12px 20px;
               color: #111827;
             }
             body.dark #math {
               color: #F9FAFB;
+            }
+            #math .katex-display {
+              margin: 0.25em 0;
             }
             #placeholder {
               font-size: 16px;
@@ -75,6 +79,7 @@ public struct KaTeXWebView: UIViewRepresentable {
               const el = document.getElementById('math');
               if (!tex || !tex.trim()) {
                 el.innerHTML = '<span id="placeholder">Write a math expression below…</span>';
+                window.scrollTo(0, 0);
                 return;
               }
               if (typeof katex === 'undefined') {

@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import UIKit
 
 public struct RawStrokePoint: Sendable {
@@ -42,6 +43,109 @@ public enum ModalityMode: String, CaseIterable, Identifiable, Sendable {
         case .vision: return "Strip Only"
         case .stroke: return "Ink Only"
         }
+    }
+}
+
+public enum StripColorMode: String, CaseIterable, Identifiable, Sendable {
+    case strokeOrder
+    case confidence
+    case symbolType
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .strokeOrder: return "Order"
+        case .confidence: return "Confidence"
+        case .symbolType: return "Type"
+        }
+    }
+}
+
+public enum TokenCategory: String, CaseIterable, Identifiable, Sendable {
+    case number
+    case variable
+    case operatorSymbol
+    case structure
+    case bracket
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .number: return "Number"
+        case .variable: return "Variable"
+        case .operatorSymbol: return "Operator"
+        case .structure: return "Structure"
+        case .bracket: return "Bracket"
+        }
+    }
+
+    public var rgb: (Float, Float, Float) {
+        switch self {
+        case .number: return (56, 189, 248)        // Sky blue
+        case .variable: return (52, 211, 153)      // Emerald
+        case .operatorSymbol: return (251, 191, 36) // Amber
+        case .structure: return (192, 132, 252)    // Purple
+        case .bracket: return (148, 163, 184)      // Slate
+        }
+    }
+
+    public var color: Color {
+        let (r, g, b) = rgb
+        return Color(red: Double(r) / 255.0, green: Double(g) / 255.0, blue: Double(b) / 255.0)
+    }
+
+    public static func classify(_ token: String) -> TokenCategory {
+        if token.count == 1, let ch = token.first {
+            if ch.isNumber || ch == "." { return .number }
+            if ch.isLetter { return .variable }
+            if "+-=*/<>!:".contains(ch) { return .operatorSymbol }
+            if "{}^_&\\".contains(ch) { return .structure }
+            if "()[]|,".contains(ch) { return .bracket }
+        }
+        let greekOrVars: Set<String> = [
+            "\\alpha", "\\beta", "\\gamma", "\\delta", "\\epsilon", "\\varepsilon",
+            "\\zeta", "\\eta", "\\theta", "\\vartheta", "\\iota", "\\kappa",
+            "\\lambda", "\\mu", "\\nu", "\\xi", "\\pi", "\\rho", "\\sigma",
+            "\\tau", "\\upsilon", "\\phi", "\\varphi", "\\chi", "\\psi", "\\omega",
+            "\\Gamma", "\\Delta", "\\Theta", "\\Lambda", "\\Xi", "\\Pi", "\\Sigma",
+            "\\Upsilon", "\\Phi", "\\Psi", "\\Omega", "\\infty", "\\partial", "\\nabla",
+            "\\hbar", "\\ell", "\\prime",
+        ]
+        if greekOrVars.contains(token) { return .variable }
+
+        let operators: Set<String> = [
+            "\\cdot", "\\times", "\\div", "\\pm", "\\mp", "\\leq", "\\geq", "\\le", "\\ge",
+            "\\neq", "\\ne", "\\approx", "\\equiv", "\\sim", "\\simeq", "\\propto",
+            "\\in", "\\notin", "\\subset", "\\subseteq", "\\supset", "\\supseteq",
+            "\\cup", "\\cap", "\\rightarrow", "\\to", "\\leftarrow", "\\Rightarrow",
+            "\\Leftrightarrow", "\\leftrightarrow", "\\mapsto", "\\forall", "\\exists",
+            "\\neg", "\\land", "\\lor", "\\gt", "\\lt",
+        ]
+        if operators.contains(token) { return .operatorSymbol }
+
+        let brackets: Set<String> = [
+            "\\left", "\\right", "\\{", "\\}", "\\langle", "\\rangle", "\\lfloor", "\\rfloor",
+            "\\lceil", "\\rceil", "\\|", "\\mid",
+        ]
+        if brackets.contains(token) { return .bracket }
+
+        return .structure
+    }
+}
+
+public struct DecodedToken: Sendable, Identifiable {
+    public let id: Int
+    public let tokenId: Int
+    public let text: String
+    public let confidence: Float
+    public let category: TokenCategory
+    /// Head-averaged cross-attention over the vision grid `[W_f * H_f]` (column-major), if vision was active.
+    public let visionAttention: [Float]?
+
+    public var isVisualToken: Bool {
+        text != "{" && text != "}" && text != "^" && text != "_" && text != "&" && text != "\\\\"
     }
 }
 
@@ -153,14 +257,21 @@ public struct ModelManifest: Codable, Sendable {
 
 public struct RecognitionResult: Sendable {
     public let latex: String
-    public let tokens: [String]
+    public let decodedTokens: [DecodedToken]
+    public let overallConfidence: Float
     public let totalMs: Double
     public let encodeMs: Double
     public let decodeMs: Double
     public let strokeCount: Int
     public let pointCount: Int
+    public let stripHeight: Int
     public let stripWidth: Int
+    public let visionGridW: Int
+    public let visionGridH: Int
+    public let stripLumBytes: [UInt8]
+    public let stripOrderBytes: [UInt8]
     public let modality: ModalityMode
     public let truncated: Bool
-    public let debugStripPNGData: Data?
+
+    public var tokens: [String] { decodedTokens.map(\.text) }
 }

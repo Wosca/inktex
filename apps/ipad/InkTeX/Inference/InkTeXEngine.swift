@@ -91,8 +91,7 @@ public final class InkTeXEngine: ObservableObject {
     public func recognize(
         strokes: [RawStroke],
         modality: ModalityMode,
-        maxTokens: Int = 160,
-        includeDebugStrip: Bool = true
+        maxTokens: Int = 200
     ) async throws -> RecognitionResult {
         guard let runtime else {
             throw NSError(
@@ -111,8 +110,7 @@ public final class InkTeXEngine: ObservableObject {
                         runtime: runtime,
                         strokes: strokes,
                         modality: modality,
-                        maxTokens: maxTokens,
-                        includeDebugStrip: includeDebugStrip
+                        maxTokens: maxTokens
                     )
                     continuation.resume(returning: result)
                 } catch {
@@ -126,21 +124,13 @@ public final class InkTeXEngine: ObservableObject {
         runtime: LoadedRuntime,
         strokes: [RawStroke],
         modality: ModalityMode,
-        maxTokens: Int,
-        includeDebugStrip: Bool
+        maxTokens: Int
     ) throws -> RecognitionResult {
         let totalStart = CFAbsoluteTimeGetCurrent()
         let manifest = runtime.bundle.manifest
 
-        let strip = StripRasterizer.render(
-            strokes: strokes,
-            config: manifest.vision,
-            includeDebugImage: includeDebugStrip
-        )
-        let strokeInput = StrokePreprocessor.preprocess(
-            strokes: strokes,
-            config: manifest.preprocessing
-        )
+        let strip = StripRasterizer.render(strokes: strokes, config: manifest.vision)
+        let strokeInput = StrokePreprocessor.preprocess(strokes: strokes, config: manifest.preprocessing)
 
         let encodeStart = CFAbsoluteTimeGetCurrent()
         var strokeMemFloats: [Float]? = nil
@@ -222,7 +212,7 @@ public final class InkTeXEngine: ObservableObject {
         }
         let encodeMs = (CFAbsoluteTimeGetCurrent() - encodeStart) * 1000.0
 
-        // KV-cached autoregressive greedy decode loop (zero-copy ORTValue state handoff)
+        // KV-cached autoregressive greedy decode loop
         let decodeStart = CFAbsoluteTimeGetCurrent()
         let numLayers = manifest.decoderLayers
         let numHeads = manifest.attentionHeads
@@ -239,11 +229,13 @@ public final class InkTeXEngine: ObservableObject {
 
         let tokenLimit = min(maxTokens, manifest.maxTokens - 1)
         var currentTokenId = Int64(manifest.bosId)
-        var generatedIds: [Int] = []
-        generatedIds.reserveCapacity(64)
+        var decodedTokens: [DecodedToken] = []
+        decodedTokens.reserveCapacity(64)
         var hitEOS = false
 
-        for _ in 0..<tokenLimit {
+        let specialSet: Set<Int> = [manifest.padId, manifest.bosId, manifest.eosId, manifest.unkId]
+
+        for stepIdx in 0..<tokenLimit {
             let tokenVal = try makeInt64Tensor([currentTokenId], shape: [1, 1])
             let stepOut = try runtime.decoderStepSession.run(
                 withInputs: [
@@ -268,11 +260,35 @@ public final class InkTeXEngine: ObservableObject {
             }
 
             let logits = try extractFloats(logitsVal)
-            let nextId = argmax(logits)
-            generatedIds.append(nextId)
+            let (nextId, confidence) = argmaxWithConfidence(logits)
             if nextId == manifest.eosId {
                 hitEOS = true
                 break
+            }
+
+            if !specialSet.contains(nextId) {
+                let text = (nextId >= 0 && nextId < manifest.tokens.count) ? manifest.tokens[nextId] : "<UNK>"
+                var visionAttn: [Float]? = nil
+                if visionMemLen > 0 {
+                    let attnAll = try extractFloats(nextPrev) // [1, numHeads, 1, totalMemLen]
+                    visionAttn = averageVisionAttention(
+                        weights: attnAll,
+                        numHeads: numHeads,
+                        totalMemLen: totalMemLen,
+                        visionOffset: strokeMemLen,
+                        visionLen: visionMemLen
+                    )
+                }
+                decodedTokens.append(
+                    DecodedToken(
+                        id: stepIdx,
+                        tokenId: nextId,
+                        text: text,
+                        confidence: confidence,
+                        category: TokenCategory.classify(text),
+                        visionAttention: visionAttn
+                    )
+                )
             }
 
             currentTokenId = Int64(nextId)
@@ -285,25 +301,76 @@ public final class InkTeXEngine: ObservableObject {
         let decodeMs = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000.0
         let totalMs = (CFAbsoluteTimeGetCurrent() - totalStart) * 1000.0
 
-        let tokens = runtime.tokenizer.idsToTokens(generatedIds)
-        let latex = LatexTokenizer.detokenize(tokens)
+        let latex = LatexTokenizer.detokenize(decodedTokens.map(\.text))
+        let overallConf: Float
+        if decodedTokens.isEmpty {
+            overallConf = 0
+        } else {
+            let meanLog = decodedTokens.reduce(0.0) { $0 + log(Double(max($1.confidence, 1e-6))) } / Double(decodedTokens.count)
+            overallConf = Float(exp(meanLog))
+        }
+
+        let gridH = visionMemLen > 0 ? max(1, strip.height / 16) : 0
+        let gridW = gridH > 0 ? (visionMemLen / gridH) : 0
 
         return RecognitionResult(
             latex: latex,
-            tokens: tokens,
+            decodedTokens: decodedTokens,
+            overallConfidence: overallConf,
             totalMs: totalMs,
             encodeMs: encodeMs,
             decodeMs: decodeMs,
             strokeCount: strokeInput?.strokeCount ?? strokes.count,
             pointCount: strokeInput?.pointCount ?? 0,
+            stripHeight: strip.height,
             stripWidth: strip.width,
+            visionGridW: gridW,
+            visionGridH: gridH,
+            stripLumBytes: strip.lumBytes,
+            stripOrderBytes: strip.orderBytes,
             modality: modality,
-            truncated: !hitEOS,
-            debugStripPNGData: strip.debugPNGData
+            truncated: !hitEOS
         )
     }
 
-    // MARK: - ORTValue Helpers
+    // MARK: - Math & Tensor Helpers
+
+    private static func argmaxWithConfidence(_ logits: [Float]) -> (Int, Float) {
+        var bestIdx = 0
+        var bestVal = -Float.greatestFiniteMagnitude
+        for i in 0..<logits.count {
+            let v = logits[i]
+            if v > bestVal {
+                bestVal = v
+                bestIdx = i
+            }
+        }
+        var sumExp: Double = 0
+        for v in logits {
+            sumExp += exp(Double(v - bestVal))
+        }
+        let prob = sumExp > 0 ? Float(1.0 / sumExp) : 0
+        return (bestIdx, prob)
+    }
+
+    private static func averageVisionAttention(
+        weights: [Float],
+        numHeads: Int,
+        totalMemLen: Int,
+        visionOffset: Int,
+        visionLen: Int
+    ) -> [Float] {
+        guard weights.count >= numHeads * totalMemLen, visionLen > 0 else { return [] }
+        var avg = [Float](repeating: 0, count: visionLen)
+        let invHeads = 1.0 / Float(max(numHeads, 1))
+        for h in 0..<numHeads {
+            let base = h * totalMemLen + visionOffset
+            for i in 0..<visionLen {
+                avg[i] += weights[base + i] * invHeads
+            }
+        }
+        return avg
+    }
 
     private static func makeFloatTensor(_ values: [Float], shape: [Int]) throws -> ORTValue {
         let data = values.withUnsafeBufferPointer { buf -> NSMutableData in
@@ -336,19 +403,6 @@ public final class InkTeXEngine: ObservableObject {
     private static func extractUInt8s(_ value: ORTValue) throws -> [UInt8] {
         let data = try value.tensorData() as Data
         return Array(data)
-    }
-
-    private static func argmax(_ values: [Float]) -> Int {
-        var bestIdx = 0
-        var bestVal = -Float.greatestFiniteMagnitude
-        for i in 0..<values.count {
-            let v = values[i]
-            if v > bestVal {
-                bestVal = v
-                bestIdx = i
-            }
-        }
-        return bestIdx
     }
 
     private static func inferenceError(_ message: String) -> NSError {

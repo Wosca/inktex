@@ -1,21 +1,21 @@
 import Foundation
 import UIKit
 
-/// Exact Swift port of `export/inktex_model/raster.py` (`render_strokes_to_strip`).
-/// Produces a 2-channel [1, 2, 128, W] float32 strip (Channel 0 = anti-aliased ink, Channel 1 = stroke-order progress).
+/// Exact Swift port of `export/inktex_model/raster.py` (`render_strokes_to_strip`),
+/// plus real-time colorized strip visualization (stroke order, per-character confidence, or symbol type).
 public enum StripRasterizer {
     public struct Output: Sendable {
         public let tensor: [Float]          // NCHW planar [1, 2, height, width], values in [0, 1]
+        public let lumBytes: [UInt8]        // [height * width]
+        public let orderBytes: [UInt8]      // [height * width]
         public let height: Int
         public let width: Int
         public let usedWidth: Int
-        public let debugPNGData: Data?
     }
 
     public static func render(
         strokes: [RawStroke],
-        config: ModelManifest.VisionConfig,
-        includeDebugImage: Bool = true
+        config: ModelManifest.VisionConfig
     ) -> Output {
         let height = config.height
         let minWidth = config.minWidth
@@ -26,8 +26,15 @@ public enum StripRasterizer {
 
         let clean = strokes.map(\.points).filter { !$0.isEmpty }
         guard !clean.isEmpty else {
-            let blank = [Float](repeating: 0, count: 2 * height * minWidth)
-            return Output(tensor: blank, height: height, width: minWidth, usedWidth: max(widthMultiple, min(minWidth, 2 * padding)), debugPNGData: nil)
+            let planeSize = height * minWidth
+            return Output(
+                tensor: [Float](repeating: 0, count: 2 * planeSize),
+                lumBytes: [UInt8](repeating: 0, count: planeSize),
+                orderBytes: [UInt8](repeating: 0, count: planeSize),
+                height: height,
+                width: minWidth,
+                usedWidth: max(widthMultiple, min(minWidth, 2 * padding))
+            )
         }
 
         var minX = Double.greatestFiniteMagnitude
@@ -117,7 +124,8 @@ public enum StripRasterizer {
         // Downsample 3x3: BOX average for Channel L, MAX for Channel A
         let planeSize = height * width
         var tensor = [Float](repeating: 0, count: 2 * planeSize)
-        var debugRGBA = includeDebugImage ? [UInt8](repeating: 0, count: planeSize * 4) : []
+        var lumBytes = [UInt8](repeating: 0, count: planeSize)
+        var orderBytes = [UInt8](repeating: 0, count: planeSize)
 
         for y in 0..<height {
             let hy0 = y * ss
@@ -137,32 +145,198 @@ public enum StripRasterizer {
                 let lumByte = UInt8(min(255, (inkSum + 4) / 9))
                 let ordByte: UInt8 = lumByte > 0 ? max(orderMax, 1) : 0
                 let dst = y * width + x
+                lumBytes[dst] = lumByte
+                orderBytes[dst] = ordByte
                 tensor[dst] = Float(lumByte) / 255.0
                 tensor[planeSize + dst] = Float(ordByte) / 255.0
-
-                if includeDebugImage {
-                    let p = dst * 4
-                    if lumByte > 0 {
-                        // Cyan -> Magenta gradient by stroke order, brightness by ink luminance
-                        let t = Float(ordByte) / 255.0
-                        let alpha = Float(lumByte) / 255.0
-                        debugRGBA[p + 0] = UInt8(min(255, Int((40 + 215 * t) * alpha)))
-                        debugRGBA[p + 1] = UInt8(min(255, Int((220 - 120 * t) * alpha)))
-                        debugRGBA[p + 2] = UInt8(min(255, Int((255 - 40 * t) * alpha)))
-                        debugRGBA[p + 3] = 255
-                    } else {
-                        debugRGBA[p + 0] = 18
-                        debugRGBA[p + 1] = 20
-                        debugRGBA[p + 2] = 26
-                        debugRGBA[p + 3] = 255
-                    }
-                }
             }
         }
 
         let usedWidth = min(width, max(widthMultiple, Int(ceil(contentW + Double(2 * padding)))))
-        let pngData = includeDebugImage ? makePNG(rgba: debugRGBA, width: width, height: height) : nil
-        return Output(tensor: tensor, height: height, width: width, usedWidth: usedWidth, debugPNGData: pngData)
+        return Output(
+            tensor: tensor,
+            lumBytes: lumBytes,
+            orderBytes: orderBytes,
+            height: height,
+            width: width,
+            usedWidth: usedWidth
+        )
+    }
+
+    /// Render a colorized visualization of the vision strip in < 1ms using decoder cross-attention.
+    public static func renderVisualization(
+        result: RecognitionResult,
+        mode: StripColorMode
+    ) -> UIImage? {
+        let width = result.stripWidth
+        let height = result.stripHeight
+        let planeSize = width * height
+        guard result.stripLumBytes.count == planeSize,
+              result.stripOrderBytes.count == planeSize else {
+            return nil
+        }
+
+        let gridW = result.visionGridW
+        let gridH = result.visionGridH
+        let gridCells = gridW * gridH
+        let hasSpatialAttention = gridW > 0 && gridH > 0 && result.decodedTokens.contains { $0.visionAttention?.count == gridCells }
+
+        // Precompute per-cell RGB on the [gridW * gridH] feature grid (column-major: col * gridH + row)
+        var cellR = [Float](repeating: 180, count: max(1, gridCells))
+        var cellG = [Float](repeating: 190, count: max(1, gridCells))
+        var cellB = [Float](repeating: 210, count: max(1, gridCells))
+
+        if hasSpatialAttention && (mode == .confidence || mode == .symbolType) {
+            let visualTokens = result.decodedTokens.filter { $0.isVisualToken && $0.visionAttention?.count == gridCells }
+            let sourceTokens = visualTokens.isEmpty ? result.decodedTokens.filter { $0.visionAttention?.count == gridCells } : visualTokens
+
+            for cell in 0..<gridCells {
+                if mode == .confidence {
+                    var weightSum: Float = 0
+                    var confSum: Float = 0
+                    for tok in sourceTokens {
+                        guard let attn = tok.visionAttention else { continue }
+                        let w = attn[cell]
+                        weightSum += w
+                        confSum += w * tok.confidence
+                    }
+                    let conf = weightSum > 1e-6 ? (confSum / weightSum) : result.overallConfidence
+                    let (r, g, b) = confidenceRGB(conf)
+                    cellR[cell] = r
+                    cellG[cell] = g
+                    cellB[cell] = b
+                } else {
+                    // Dominant symbol category at this vision patch
+                    var bestWeight: Float = -1
+                    var bestCategory: TokenCategory = .structure
+                    for tok in sourceTokens {
+                        guard let attn = tok.visionAttention else { continue }
+                        let w = attn[cell]
+                        if w > bestWeight {
+                            bestWeight = w
+                            bestCategory = tok.category
+                        }
+                    }
+                    let (r, g, b) = bestCategory.rgb
+                    cellR[cell] = r
+                    cellG[cell] = g
+                    cellB[cell] = b
+                }
+            }
+        }
+
+        var rgba = [UInt8](repeating: 0, count: planeSize * 4)
+        let fallbackConfRGB = confidenceRGB(result.overallConfidence)
+
+        for y in 0..<height {
+            for x in 0..<width {
+                let idx = y * width + x
+                let lumByte = result.stripLumBytes[idx]
+                let p = idx * 4
+
+                if lumByte == 0 {
+                    rgba[p + 0] = 18
+                    rgba[p + 1] = 20
+                    rgba[p + 2] = 26
+                    rgba[p + 3] = 255
+                    continue
+                }
+
+                let alpha = Float(lumByte) / 255.0
+                let r: Float
+                let g: Float
+                let b: Float
+
+                switch mode {
+                case .strokeOrder:
+                    let t = Float(result.stripOrderBytes[idx]) / 255.0
+                    r = 40 + 215 * t
+                    g = 220 - 120 * t
+                    b = 255 - 40 * t
+
+                case .confidence:
+                    if hasSpatialAttention {
+                        (r, g, b) = sampleBilinear(
+                            x: x, y: y, width: width, height: height,
+                            gridW: gridW, gridH: gridH,
+                            cellR: cellR, cellG: cellG, cellB: cellB
+                        )
+                    } else {
+                        (r, g, b) = fallbackConfRGB
+                    }
+
+                case .symbolType:
+                    if hasSpatialAttention {
+                        (r, g, b) = sampleBilinear(
+                            x: x, y: y, width: width, height: height,
+                            gridW: gridW, gridH: gridH,
+                            cellR: cellR, cellG: cellG, cellB: cellB
+                        )
+                    } else {
+                        (r, g, b) = (180, 196, 220)
+                    }
+                }
+
+                // Blend over dark background for crisp readability
+                rgba[p + 0] = UInt8(min(255, max(0, Int(18 * (1 - alpha) + r * alpha))))
+                rgba[p + 1] = UInt8(min(255, max(0, Int(20 * (1 - alpha) + g * alpha))))
+                rgba[p + 2] = UInt8(min(255, max(0, Int(26 * (1 - alpha) + b * alpha))))
+                rgba[p + 3] = 255
+            }
+        }
+
+        return makeUIImage(rgba: rgba, width: width, height: height)
+    }
+
+    /// Confidence gradient: Red (<0.6) -> Amber (0.8) -> Emerald (1.0)
+    public static func confidenceRGB(_ conf: Float) -> (Float, Float, Float) {
+        let c = min(1.0, max(0.0, conf))
+        if c >= 0.80 {
+            let t = (c - 0.80) / 0.20
+            return (
+                250 * (1 - t) + 52 * t,
+                190 * (1 - t) + 211 * t,
+                36 * (1 - t) + 153 * t
+            )
+        } else {
+            let t = max(0.0, (c - 0.45) / 0.35)
+            return (
+                248 * (1 - t) + 250 * t,
+                81 * (1 - t) + 190 * t,
+                73 * (1 - t) + 36 * t
+            )
+        }
+    }
+
+    private static func sampleBilinear(
+        x: Int, y: Int, width: Int, height: Int,
+        gridW: Int, gridH: Int,
+        cellR: [Float], cellG: [Float], cellB: [Float]
+    ) -> (Float, Float, Float) {
+        let fx = (Float(x) + 0.5) * Float(gridW) / Float(width) - 0.5
+        let fy = (Float(y) + 0.5) * Float(gridH) / Float(height) - 0.5
+        let x0 = max(0, min(gridW - 1, Int(floor(fx))))
+        let x1 = max(0, min(gridW - 1, x0 + 1))
+        let y0 = max(0, min(gridH - 1, Int(floor(fy))))
+        let y1 = max(0, min(gridH - 1, y0 + 1))
+        let tx = max(0, min(1, fx - Float(x0)))
+        let ty = max(0, min(1, fy - Float(y0)))
+
+        // Column-major index: col * gridH + row
+        let i00 = x0 * gridH + y0
+        let i10 = x1 * gridH + y0
+        let i01 = x0 * gridH + y1
+        let i11 = x1 * gridH + y1
+
+        let w00 = (1 - tx) * (1 - ty)
+        let w10 = tx * (1 - ty)
+        let w01 = (1 - tx) * ty
+        let w11 = tx * ty
+
+        let r = w00 * cellR[i00] + w10 * cellR[i10] + w01 * cellR[i01] + w11 * cellR[i11]
+        let g = w00 * cellG[i00] + w10 * cellG[i10] + w01 * cellG[i01] + w11 * cellG[i11]
+        let b = w00 * cellB[i00] + w10 * cellB[i10] + w01 * cellB[i01] + w11 * cellB[i11]
+        return (r, g, b)
     }
 
     private static func drawDisc(
@@ -235,7 +409,7 @@ public enum StripRasterizer {
         }
     }
 
-    private static func makePNG(rgba: [UInt8], width: Int, height: Int) -> Data? {
+    private static func makeUIImage(rgba: [UInt8], width: Int, height: Int) -> UIImage? {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
         guard let provider = CGDataProvider(data: Data(rgba) as CFData),
@@ -254,6 +428,6 @@ public enum StripRasterizer {
               ) else {
             return nil
         }
-        return UIImage(cgImage: cgImage).pngData()
+        return UIImage(cgImage: cgImage)
     }
 }

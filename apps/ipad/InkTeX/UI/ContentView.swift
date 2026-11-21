@@ -10,12 +10,15 @@ struct ContentView: View {
     @State private var pencilOnly: Bool = false
     @State private var autoRecognize: Bool = true
     @State private var showInspector: Bool = false
+    @State private var expandPreview: Bool = false
+    @State private var stripColorMode: StripColorMode = .confidence
     @State private var showModelSheet: Bool = false
 
     @State private var latestResult: RecognitionResult?
     @State private var errorMessage: String?
     @State private var copiedFeedback: Bool = false
     @State private var debounceTask: Task<Void, Never>?
+    @State private var requestGeneration: Int = 0
 
     var body: some View {
         NavigationStack {
@@ -28,13 +31,13 @@ struct ContentView: View {
                     errorBanner(errorMessage)
                 }
 
-                // Rendered LaTeX Preview Card
+                // Scrollable Rendered LaTeX + Raw LaTeX Card
                 previewPanel
                     .padding(.horizontal, 16)
-                    .padding(.top, 12)
+                    .padding(.top, 10)
                     .padding(.bottom, 10)
 
-                // Optional Debug Inspector Drawer
+                // Optional Vision Strip & Token Inspector Drawer
                 if showInspector, let result = latestResult {
                     inspectorBar(result)
                         .padding(.horizontal, 16)
@@ -42,8 +45,8 @@ struct ContentView: View {
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
-                // Main Apple Pencil Drawing Canvas
-                ZStack(alignment: .bottomTrailing) {
+                // Main Apple Pencil Drawing Canvas (no overlaid buttons competing with PencilKit gestures)
+                ZStack {
                     DotGridBackground()
                         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                         .overlay(
@@ -74,56 +77,13 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .allowsHitTesting(false)
                     }
-
-                    // Floating Quick Actions
-                    HStack(spacing: 10) {
-                        if !autoRecognize {
-                            Button {
-                                triggerRecognition(canvasController.extractRawStrokes(), immediate: true)
-                            } label: {
-                                Label("Recognize", systemImage: "sparkles")
-                                    .font(.subheadline.weight(.semibold))
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(canvasController.strokeCount == 0 || engine.status != .ready)
-                        }
-
-                        Button {
-                            canvasController.undo()
-                        } label: {
-                            Image(systemName: "arrow.uturn.backward")
-                                .font(.body.weight(.medium))
-                                .frame(width: 36, height: 36)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!canvasController.canUndo)
-
-                        Button {
-                            canvasController.redo()
-                        } label: {
-                            Image(systemName: "arrow.uturn.forward")
-                                .font(.body.weight(.medium))
-                                .frame(width: 36, height: 36)
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(!canvasController.canRedo)
-
-                        Button(role: .destructive) {
-                            debounceTask?.cancel()
-                            canvasController.clear()
-                            latestResult = nil
-                            errorMessage = nil
-                        } label: {
-                            Label("Clear", systemImage: "trash")
-                                .font(.subheadline.weight(.medium))
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(canvasController.strokeCount == 0)
-                    }
-                    .padding(14)
                 }
                 .padding(.horizontal, 16)
-                .padding(.bottom, 16)
+
+                // Dedicated Bottom Action Bar (instant tap delivery, zero PencilKit gesture delay)
+                canvasActionBar
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationBarTitleDisplayMode(.inline)
@@ -145,7 +105,7 @@ struct ContentView: View {
                         }
                     }
                     .pickerStyle(.segmented)
-                    .frame(width: 260)
+                    .frame(width: 250)
                     .onChange(of: modality) { _, _ in
                         let strokes = canvasController.extractRawStrokes()
                         if !strokes.isEmpty {
@@ -176,7 +136,7 @@ struct ContentView: View {
                     } label: {
                         Image(systemName: showInspector ? "waveform.path.ecg.rectangle.fill" : "waveform.path.ecg.rectangle")
                     }
-                    .help("Toggle Vision Strip & Token Inspector")
+                    .help("Toggle Vision Strip & Confidence Inspector")
 
                     Button {
                         showModelSheet = true
@@ -190,6 +150,72 @@ struct ContentView: View {
                 ModelSetupSheet(engine: engine)
             }
         }
+    }
+
+    private var canvasActionBar: some View {
+        HStack(spacing: 10) {
+            if let result = latestResult {
+                Label(
+                    String(format: "%.0f%% conf · %.0f ms · %d tok", result.overallConfidence * 100, result.totalMs, result.decodedTokens.count),
+                    systemImage: "sparkles"
+                )
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            } else {
+                Text(pencilOnly ? "Pencil Only" : "Pencil + Touch")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if !autoRecognize {
+                Button {
+                    triggerRecognition(canvasController.extractRawStrokes(), immediate: true)
+                } label: {
+                    Label("Recognize", systemImage: "sparkles")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(canvasController.strokeCount == 0 || engine.status != .ready)
+            }
+
+            Button {
+                canvasController.undo()
+            } label: {
+                Image(systemName: "arrow.uturn.backward")
+                    .font(.body.weight(.medium))
+            }
+            .buttonStyle(.bordered)
+            .disabled(!canvasController.canUndo)
+
+            Button {
+                canvasController.redo()
+            } label: {
+                Image(systemName: "arrow.uturn.forward")
+                    .font(.body.weight(.medium))
+            }
+            .buttonStyle(.bordered)
+            .disabled(!canvasController.canRedo)
+
+            Button(role: .destructive) {
+                clearAll()
+            } label: {
+                Label("Clear", systemImage: "trash")
+                    .font(.subheadline.weight(.medium))
+            }
+            .buttonStyle(.bordered)
+            .disabled(canvasController.strokeCount == 0 && latestResult == nil)
+        }
+    }
+
+    private func clearAll() {
+        requestGeneration += 1
+        debounceTask?.cancel()
+        debounceTask = nil
+        canvasController.clear()
+        latestResult = nil
+        errorMessage = nil
     }
 
     private var modelStatusChip: some View {
@@ -237,35 +263,49 @@ struct ContentView: View {
                     latex: latestResult?.latex ?? "",
                     isDark: colorScheme == .dark
                 )
-                .frame(height: 112)
+                .frame(height: expandPreview ? 240 : 124)
 
-                if engine.isRecognizing {
-                    ProgressView()
-                        .padding(10)
+                HStack(spacing: 6) {
+                    if engine.isRecognizing {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            expandPreview.toggle()
+                        }
+                    } label: {
+                        Image(systemName: expandPreview ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                            .font(.caption.weight(.semibold))
+                            .padding(6)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(expandPreview ? "Compact Preview" : "Expand Preview for Multi-line Math")
                 }
+                .padding(6)
             }
 
             Divider()
 
-            HStack(spacing: 10) {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    Text(latestResult?.latex.isEmpty == false ? latestResult!.latex : "LaTeX output appears here")
-                        .font(.system(.callout, design: .monospaced))
-                        .foregroundStyle(latestResult?.latex.isEmpty == false ? .primary : .tertiary)
-                        .textSelection(.enabled)
-                        .lineLimit(1)
-                }
-
-                Spacer(minLength: 8)
-
-                if let result = latestResult {
-                    Text(String(format: "%.0f ms · %d tok", result.totalMs, result.tokens.count))
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.secondary.opacity(0.12))
-                        .clipShape(Capsule())
+            HStack(alignment: .center, spacing: 10) {
+                if expandPreview {
+                    ScrollView(.vertical, showsIndicators: true) {
+                        Text(latestResult?.latex.isEmpty == false ? latestResult!.latex : "LaTeX output appears here")
+                            .font(.system(.callout, design: .monospaced))
+                            .foregroundStyle(latestResult?.latex.isEmpty == false ? .primary : .tertiary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 84)
+                } else {
+                    ScrollView(.horizontal, showsIndicators: true) {
+                        Text(latestResult?.latex.isEmpty == false ? latestResult!.latex : "LaTeX output appears here")
+                            .font(.system(.callout, design: .monospaced))
+                            .foregroundStyle(latestResult?.latex.isEmpty == false ? .primary : .tertiary)
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+                    }
                 }
 
                 Button {
@@ -283,7 +323,7 @@ struct ContentView: View {
                 .disabled(latestResult?.latex.isEmpty != false)
             }
         }
-        .padding(14)
+        .padding(12)
         .background(Color(uiColor: .secondarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(
@@ -294,34 +334,61 @@ struct ContentView: View {
 
     private func inspectorBar(_ result: RecognitionResult) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Vision Strip (\(result.stripWidth)×128) · \(result.strokeCount) strokes · \(result.pointCount) pts")
+            HStack(spacing: 10) {
+                Text("Strip \(result.stripWidth)×\(result.stripHeight) · \(result.strokeCount) strokes · \(result.pointCount) pts")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
+
                 Spacer()
-                Text(String(format: "Encode %.0fms · Decode %.0fms", result.encodeMs, result.decodeMs))
-                    .font(.caption.monospacedDigit())
+
+                Picker("Strip Color", selection: $stripColorMode) {
+                    ForEach(StripColorMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 230)
+                .controlSize(.small)
+
+                Text(String(format: "Enc %.0fms · Dec %.0fms", result.encodeMs, result.decodeMs))
+                    .font(.caption2.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
 
-            if let data = result.debugStripPNGData, let uiImg = UIImage(data: data) {
+            if let uiImg = StripRasterizer.renderVisualization(result: result, mode: stripColorMode) {
                 Image(uiImage: uiImg)
                     .interpolation(.none)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(maxHeight: 68)
+                    .frame(maxHeight: 74)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
             }
 
+            // Compact color legend matching selected visualization mode
+            inspectorLegend(for: stripColorMode, modality: result.modality)
+
+            // Token-by-token ribbon colored by confidence or symbol type
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    ForEach(Array(result.tokens.enumerated()), id: \.offset) { _, tok in
-                        Text(tok)
-                            .font(.system(.caption2, design: .monospaced))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 3)
-                            .background(Color.accentColor.opacity(0.14))
-                            .clipShape(RoundedRectangle(cornerRadius: 5))
+                HStack(spacing: 5) {
+                    ForEach(result.decodedTokens) { tok in
+                        let chipColor = tokenChipColor(tok)
+                        HStack(spacing: 4) {
+                            Text(tok.text)
+                                .font(.system(.caption2, design: .monospaced).weight(.medium))
+                            if stripColorMode == .confidence {
+                                Text("\(Int(round(tok.confidence * 100)))%")
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(chipColor.opacity(0.20))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 5)
+                                .strokeBorder(chipColor.opacity(0.55), lineWidth: 0.75)
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
                     }
                 }
             }
@@ -329,6 +396,54 @@ struct ContentView: View {
         .padding(12)
         .background(Color(uiColor: .secondarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private func tokenChipColor(_ tok: DecodedToken) -> Color {
+        switch stripColorMode {
+        case .strokeOrder:
+            return .accentColor
+        case .confidence:
+            let (r, g, b) = StripRasterizer.confidenceRGB(tok.confidence)
+            return Color(red: Double(r) / 255.0, green: Double(g) / 255.0, blue: Double(b) / 255.0)
+        case .symbolType:
+            return tok.category.color
+        }
+    }
+
+    @ViewBuilder
+    private func inspectorLegend(for mode: StripColorMode, modality: ModalityMode) -> some View {
+        HStack(spacing: 12) {
+            switch mode {
+            case .strokeOrder:
+                legendDot(color: Color(red: 40 / 255, green: 220 / 255, blue: 1), label: "First stroke")
+                legendDot(color: Color(red: 1, green: 100 / 255, blue: 215 / 255), label: "Last stroke")
+            case .confidence:
+                legendDot(color: Color(red: 52 / 255, green: 211 / 255, blue: 153 / 255), label: "High (≥90%)")
+                legendDot(color: Color(red: 250 / 255, green: 190 / 255, blue: 36 / 255), label: "Mid (~80%)")
+                legendDot(color: Color(red: 248 / 255, green: 81 / 255, blue: 73 / 255), label: "Low (<65%)")
+            case .symbolType:
+                ForEach(TokenCategory.allCases) { cat in
+                    legendDot(color: cat.color, label: cat.label)
+                }
+            }
+            if modality == .stroke && mode != .strokeOrder {
+                Spacer()
+                Text("Switch to Bimodal/Vision for spatial strip coloring")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func legendDot(color: Color, label: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: "circle.fill")
+                .font(.system(size: 7))
+                .foregroundStyle(color)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var missingModelBanner: some View {
@@ -367,6 +482,7 @@ struct ContentView: View {
 
     private func handleDrawingChanged(_ strokes: [RawStroke]) {
         if strokes.isEmpty {
+            requestGeneration += 1
             debounceTask?.cancel()
             latestResult = nil
             errorMessage = nil
@@ -377,6 +493,8 @@ struct ContentView: View {
     }
 
     private func triggerRecognition(_ strokes: [RawStroke], immediate: Bool) {
+        requestGeneration += 1
+        let myGen = requestGeneration
         debounceTask?.cancel()
         guard engine.status == .ready else { return }
         let selectedModality = modality
@@ -385,19 +503,18 @@ struct ContentView: View {
             if !immediate {
                 try? await Task.sleep(nanoseconds: 320_000_000)
             }
-            if Task.isCancelled { return }
+            if Task.isCancelled || myGen != requestGeneration { return }
             do {
                 let result = try await engine.recognize(
                     strokes: strokes,
-                    modality: selectedModality,
-                    includeDebugStrip: true
+                    modality: selectedModality
                 )
-                if !Task.isCancelled {
+                if !Task.isCancelled && myGen == requestGeneration {
                     latestResult = result
                     errorMessage = nil
                 }
             } catch {
-                if !Task.isCancelled {
+                if !Task.isCancelled && myGen == requestGeneration {
                     errorMessage = error.localizedDescription
                 }
             }

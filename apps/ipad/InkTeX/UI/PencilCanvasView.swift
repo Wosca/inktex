@@ -14,7 +14,11 @@ public final class PencilCanvasController: ObservableObject {
         guard let canvasView else { return }
         canvasView.drawing = PKDrawing()
         canvasView.undoManager?.removeAllActions()
-        syncState()
+        canvasView.setNeedsDisplay()
+        // Update synchronously on main thread so UI state clears with zero delay
+        canUndo = false
+        canRedo = false
+        strokeCount = 0
     }
 
     public func undo() {
