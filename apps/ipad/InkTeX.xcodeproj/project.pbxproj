@@ -1,0 +1,362 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B10000010000000000000001 /* InkTeXApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000010000000000000001 /* InkTeXApp.swift */; };
+		B10000020000000000000002 /* InkTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000020000000000000002 /* InkTypes.swift */; };
+		B10000030000000000000003 /* StrokePreprocessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000030000000000000003 /* StrokePreprocessor.swift */; };
+		B10000040000000000000004 /* StripRasterizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000040000000000000004 /* StripRasterizer.swift */; };
+		B10000050000000000000005 /* LatexTokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000050000000000000005 /* LatexTokenizer.swift */; };
+		B10000060000000000000006 /* ModelBundleLocator.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000060000000000000006 /* ModelBundleLocator.swift */; };
+		B10000070000000000000007 /* InkTeXEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000070000000000000007 /* InkTeXEngine.swift */; };
+		B10000080000000000000008 /* PencilCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000080000000000000008 /* PencilCanvasView.swift */; };
+		B10000090000000000000009 /* KaTeXWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000090000000000000009 /* KaTeXWebView.swift */; };
+		B10000100000000000000010 /* ModelSetupSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000100000000000000010 /* ModelSetupSheet.swift */; };
+		B10000110000000000000011 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000110000000000000011 /* ContentView.swift */; };
+		B10000120000000000000012 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F10000120000000000000012 /* Assets.xcassets */; };
+		B10000130000000000000013 /* katex in Resources */ = {isa = PBXBuildFile; fileRef = F10000130000000000000013 /* katex */; };
+		B10000140000000000000014 /* onnxruntime in Frameworks */ = {isa = PBXBuildFile; productRef = P10000010000000000000001 /* onnxruntime */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A10000010000000000000001 /* InkTeX.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = InkTeX.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F10000010000000000000001 /* InkTeXApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkTeXApp.swift; sourceTree = "<group>"; };
+		F10000020000000000000002 /* InkTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkTypes.swift; sourceTree = "<group>"; };
+		F10000030000000000000003 /* StrokePreprocessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StrokePreprocessor.swift; sourceTree = "<group>"; };
+		F10000040000000000000004 /* StripRasterizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StripRasterizer.swift; sourceTree = "<group>"; };
+		F10000050000000000000005 /* LatexTokenizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LatexTokenizer.swift; sourceTree = "<group>"; };
+		F10000060000000000000006 /* ModelBundleLocator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelBundleLocator.swift; sourceTree = "<group>"; };
+		F10000070000000000000007 /* InkTeXEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkTeXEngine.swift; sourceTree = "<group>"; };
+		F10000080000000000000008 /* PencilCanvasView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PencilCanvasView.swift; sourceTree = "<group>"; };
+		F10000090000000000000009 /* KaTeXWebView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KaTeXWebView.swift; sourceTree = "<group>"; };
+		F10000100000000000000010 /* ModelSetupSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSetupSheet.swift; sourceTree = "<group>"; };
+		F10000110000000000000011 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		F10000120000000000000012 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		F10000130000000000000013 /* katex */ = {isa = PBXFileReference; lastKnownFileType = folder; path = katex; sourceTree = "<group>"; };
+		F10000140000000000000014 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		D10000010000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000140000000000000014 /* onnxruntime in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		G10000010000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				G10000020000000000000002 /* InkTeX */,
+				G10000030000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		G10000020000000000000002 /* InkTeX */ = {
+			isa = PBXGroup;
+			children = (
+				F10000010000000000000001 /* InkTeXApp.swift */,
+				G10000040000000000000004 /* Models */,
+				G10000050000000000000005 /* Preprocessing */,
+				G10000060000000000000006 /* Inference */,
+				G10000070000000000000007 /* UI */,
+				G10000080000000000000008 /* Resources */,
+				F10000120000000000000012 /* Assets.xcassets */,
+				F10000140000000000000014 /* Info.plist */,
+			);
+			path = InkTeX;
+			sourceTree = "<group>";
+		};
+		G10000030000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A10000010000000000000001 /* InkTeX.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		G10000040000000000000004 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				F10000020000000000000002 /* InkTypes.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		G10000050000000000000005 /* Preprocessing */ = {
+			isa = PBXGroup;
+			children = (
+				F10000030000000000000003 /* StrokePreprocessor.swift */,
+				F10000040000000000000004 /* StripRasterizer.swift */,
+			);
+			path = Preprocessing;
+			sourceTree = "<group>";
+		};
+		G10000060000000000000006 /* Inference */ = {
+			isa = PBXGroup;
+			children = (
+				F10000050000000000000005 /* LatexTokenizer.swift */,
+				F10000060000000000000006 /* ModelBundleLocator.swift */,
+				F10000070000000000000007 /* InkTeXEngine.swift */,
+			);
+			path = Inference;
+			sourceTree = "<group>";
+		};
+		G10000070000000000000007 /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				F10000080000000000000008 /* PencilCanvasView.swift */,
+				F10000090000000000000009 /* KaTeXWebView.swift */,
+				F10000100000000000000010 /* ModelSetupSheet.swift */,
+				F10000110000000000000011 /* ContentView.swift */,
+			);
+			path = UI;
+			sourceTree = "<group>";
+		};
+		G10000080000000000000008 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				F10000130000000000000013 /* katex */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		T10000010000000000000001 /* InkTeX */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C10000020000000000000002 /* Build configuration list for PBXNativeTarget "InkTeX" */;
+			buildPhases = (
+				S10000010000000000000001 /* Sources */,
+				D10000010000000000000001 /* Frameworks */,
+				R10000010000000000000001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = InkTeX;
+			packageProductDependencies = (
+				P10000010000000000000001 /* onnxruntime */,
+			);
+			productName = InkTeX;
+			productReference = A10000010000000000000001 /* InkTeX.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		PRJ000010000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					T10000010000000000000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = C10000010000000000000001 /* Build configuration list for PBXProject "InkTeX" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = G10000010000000000000001;
+			packageReferences = (
+				PKG000010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */,
+			);
+			productRefGroup = G10000030000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				T10000010000000000000001 /* InkTeX */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		R10000010000000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000120000000000000012 /* Assets.xcassets in Resources */,
+				B10000130000000000000013 /* katex in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		S10000010000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000010000000000000001 /* InkTeXApp.swift in Sources */,
+				B10000020000000000000002 /* InkTypes.swift in Sources */,
+				B10000030000000000000003 /* StrokePreprocessor.swift in Sources */,
+				B10000040000000000000004 /* StripRasterizer.swift in Sources */,
+				B10000050000000000000005 /* LatexTokenizer.swift in Sources */,
+				B10000060000000000000006 /* ModelBundleLocator.swift in Sources */,
+				B10000070000000000000007 /* InkTeXEngine.swift in Sources */,
+				B10000080000000000000008 /* PencilCanvasView.swift in Sources */,
+				B10000090000000000000009 /* KaTeXWebView.swift in Sources */,
+				B10000100000000000000010 /* ModelSetupSheet.swift in Sources */,
+				B10000110000000000000011 /* ContentView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		BC0000010000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		BC0000020000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		BC0000030000000000000003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = InkTeX/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-ObjC",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.wosca.inktex;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		BC0000040000000000000004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = InkTeX/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-ObjC",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.wosca.inktex;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		C10000010000000000000001 /* Build configuration list for PBXProject "InkTeX" */ = {
+			isa = XCBuildConfiguration;
+			buildConfigurations = (
+				BC0000010000000000000001 /* Debug */,
+				BC0000020000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C10000020000000000000002 /* Build configuration list for PBXNativeTarget "InkTeX" */ = {
+			isa = XCBuildConfiguration;
+			buildConfigurations = (
+				BC0000030000000000000003 /* Debug */,
+				BC0000040000000000000004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		PKG000010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/thesagezm/onnxruntime-swift-package-manager";
+			requirement = {
+				kind = revision;
+				revision = 7dbd851c52a6e3889077f69dda8c9f8f438b60ab;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		P10000010000000000000001 /* onnxruntime */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = PKG000010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */;
+			productName = onnxruntime;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = PRJ000010000000000000001 /* Project object */;
+}

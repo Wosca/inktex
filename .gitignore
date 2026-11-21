@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Model weights & exported bundles (keep git fast and clean)
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.onnx.data
+*.mlpackage/
+*.mlmodel
+model-bundle/
+model-bundle-*/
+
+# Xcode / macOS
+.DS_Store
+*.xcuserdatad
+xcuserdata/
+DerivedData/
+build/
+*.ipa
+*.xcarchive
+*.dSYM.zip
+*.dSYM
+.swiftpm/
