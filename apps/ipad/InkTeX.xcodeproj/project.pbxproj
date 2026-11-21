@@ -20,7 +20,7 @@
 		B10000110000000000000011 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000110000000000000011 /* ContentView.swift */; };
 		B10000120000000000000012 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F10000120000000000000012 /* Assets.xcassets */; };
 		B10000130000000000000013 /* katex in Resources */ = {isa = PBXBuildFile; fileRef = F10000130000000000000013 /* katex */; };
-		B10000140000000000000014 /* onnxruntime in Frameworks */ = {isa = PBXBuildFile; productRef = P10000010000000000000001 /* onnxruntime */; };
+		B10000140000000000000014 /* onnxruntime in Frameworks */ = {isa = PBXBuildFile; productRef = E10000010000000000000001 /* onnxruntime */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -53,30 +53,30 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		G10000010000000000000001 = {
+		010000010000000000000001 = {
 			isa = PBXGroup;
 			children = (
-				G10000020000000000000002 /* InkTeX */,
-				G10000030000000000000003 /* Products */,
+				010000020000000000000002 /* InkTeX */,
+				010000030000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		G10000020000000000000002 /* InkTeX */ = {
+		010000020000000000000002 /* InkTeX */ = {
 			isa = PBXGroup;
 			children = (
 				F10000010000000000000001 /* InkTeXApp.swift */,
-				G10000040000000000000004 /* Models */,
-				G10000050000000000000005 /* Preprocessing */,
-				G10000060000000000000006 /* Inference */,
-				G10000070000000000000007 /* UI */,
-				G10000080000000000000008 /* Resources */,
+				010000040000000000000004 /* Models */,
+				010000050000000000000005 /* Preprocessing */,
+				010000060000000000000006 /* Inference */,
+				010000070000000000000007 /* UI */,
+				010000080000000000000008 /* Resources */,
 				F10000120000000000000012 /* Assets.xcassets */,
 				F10000140000000000000014 /* Info.plist */,
 			);
 			path = InkTeX;
 			sourceTree = "<group>";
 		};
-		G10000030000000000000003 /* Products */ = {
+		010000030000000000000003 /* Products */ = {
 			isa = PBXGroup;
 			children = (
 				A10000010000000000000001 /* InkTeX.app */,
@@ -84,7 +84,7 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
-		G10000040000000000000004 /* Models */ = {
+		010000040000000000000004 /* Models */ = {
 			isa = PBXGroup;
 			children = (
 				F10000020000000000000002 /* InkTypes.swift */,
@@ -92,7 +92,7 @@
 			path = Models;
 			sourceTree = "<group>";
 		};
-		G10000050000000000000005 /* Preprocessing */ = {
+		010000050000000000000005 /* Preprocessing */ = {
 			isa = PBXGroup;
 			children = (
 				F10000030000000000000003 /* StrokePreprocessor.swift */,
@@ -101,7 +101,7 @@
 			path = Preprocessing;
 			sourceTree = "<group>";
 		};
-		G10000060000000000000006 /* Inference */ = {
+		010000060000000000000006 /* Inference */ = {
 			isa = PBXGroup;
 			children = (
 				F10000050000000000000005 /* LatexTokenizer.swift */,
@@ -111,7 +111,7 @@
 			path = Inference;
 			sourceTree = "<group>";
 		};
-		G10000070000000000000007 /* UI */ = {
+		010000070000000000000007 /* UI */ = {
 			isa = PBXGroup;
 			children = (
 				F10000080000000000000008 /* PencilCanvasView.swift */,
@@ -122,7 +122,7 @@
 			path = UI;
 			sourceTree = "<group>";
 		};
-		G10000080000000000000008 /* Resources */ = {
+		010000080000000000000008 /* Resources */ = {
 			isa = PBXGroup;
 			children = (
 				F10000130000000000000013 /* katex */,
@@ -133,13 +133,13 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		T10000010000000000000001 /* InkTeX */ = {
+		210000010000000000000001 /* InkTeX */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = C10000020000000000000002 /* Build configuration list for PBXNativeTarget "InkTeX" */;
 			buildPhases = (
-				S10000010000000000000001 /* Sources */,
+				310000010000000000000001 /* Sources */,
 				D10000010000000000000001 /* Frameworks */,
-				R10000010000000000000001 /* Resources */,
+				410000010000000000000001 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -147,7 +147,7 @@
 			);
 			name = InkTeX;
 			packageProductDependencies = (
-				P10000010000000000000001 /* onnxruntime */,
+				E10000010000000000000001 /* onnxruntime */,
 			);
 			productName = InkTeX;
 			productReference = A10000010000000000000001 /* InkTeX.app */;
@@ -156,14 +156,14 @@
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		PRJ000010000000000000001 /* Project object */ = {
+		110000010000000000000001 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1600;
 				LastUpgradeCheck = 1600;
 				TargetAttributes = {
-					T10000010000000000000001 = {
+					210000010000000000000001 = {
 						CreatedOnToolsVersion = 16.0;
 					};
 				};
@@ -176,21 +176,21 @@
 				en,
 				Base,
 			);
-			mainGroup = G10000010000000000000001;
+			mainGroup = 010000010000000000000001;
 			packageReferences = (
-				PKG000010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */,
+				E20000010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */,
 			);
-			productRefGroup = G10000030000000000000003 /* Products */;
+			productRefGroup = 010000030000000000000003 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				T10000010000000000000001 /* InkTeX */,
+				210000010000000000000001 /* InkTeX */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		R10000010000000000000001 /* Resources */ = {
+		410000010000000000000001 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -202,7 +202,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		S10000010000000000000001 /* Sources */ = {
+		310000010000000000000001 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -320,7 +320,7 @@
 
 /* Begin XCConfigurationList section */
 		C10000010000000000000001 /* Build configuration list for PBXProject "InkTeX" */ = {
-			isa = XCBuildConfiguration;
+			isa = XCConfigurationList;
 			buildConfigurations = (
 				BC0000010000000000000001 /* Debug */,
 				BC0000020000000000000002 /* Release */,
@@ -329,7 +329,7 @@
 			defaultConfigurationName = Release;
 		};
 		C10000020000000000000002 /* Build configuration list for PBXNativeTarget "InkTeX" */ = {
-			isa = XCBuildConfiguration;
+			isa = XCConfigurationList;
 			buildConfigurations = (
 				BC0000030000000000000003 /* Debug */,
 				BC0000040000000000000004 /* Release */,
@@ -340,7 +340,7 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		PKG000010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */ = {
+		E20000010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/thesagezm/onnxruntime-swift-package-manager";
 			requirement = {
@@ -351,12 +351,12 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		P10000010000000000000001 /* onnxruntime */ = {
+		E10000010000000000000001 /* onnxruntime */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = PKG000010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */;
+			package = E20000010000000000000001 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */;
 			productName = onnxruntime;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
-	rootObject = PRJ000010000000000000001 /* Project object */;
+	rootObject = 110000010000000000000001 /* Project object */;
 }
