@@ -36,7 +36,8 @@ from inktex_model.preprocessing import PreprocessingConfig
 from inktex_model.relative_position import alibi_slopes
 from inktex_model.tokenizer import LatexTokenizer
 
-NEG_MASK_VALUE = -1e9
+NEG_MASK_VALUE = -1e4
+STATIC_KV_LEN = 256
 
 
 def _project_qkv(attention: nn.MultiheadAttention, values: torch.Tensor, part: int) -> torch.Tensor:
@@ -100,17 +101,19 @@ class MemoryProjExport(nn.Module):
 
 
 class DecoderStepExport(nn.Module):
-    """Unified KV-cached decoder supporting BOTH:
-      1. Batched beam decoding:  tokens [B, 1], past_k/v [L, B, H, T, D]
-      2. Parallel prefix verify: tokens [1, S], past_k/v [L, 1, H, 1, D] (verifies S tokens in 1 pass!)
+    """Unified static-KV-cache decoder supporting BOTH:
+      1. Batched beam decoding:  tokens [B, 1], cache_pos [1], past_k/v [L, B, H, MAX_KV, D]
+      2. Parallel prefix verify: tokens [1, S], cache_pos [0], past_k/v [L, 1, H, MAX_KV, D]
 
-    Slot 0 of ``past_k`` / ``past_v`` is always a dummy sentinel masked with ``-1e9`` in self-attention.
+    Fixed-size KV buffers ([L, B, H, MAX_KV, D]) keep shapes constant across all decode steps for
+    Apple CoreML MLProgram (ANE/GPU) and eliminate KV-cache slicing on prefix divergence.
     ``mk``, ``mv``, and ``memory_mask`` keep batch=1 and are broadcast to ``B`` inside the graph.
     """
 
-    def __init__(self, model: BimodalMathModel):
+    def __init__(self, model: BimodalMathModel, max_kv: int = STATIC_KV_LEN):
         super().__init__()
         self.decoder = model.decoder
+        self.max_kv = max_kv
         num_heads = self.decoder.transformer.layers[0].self_attn.num_heads
         self.register_buffer("alibi_slopes", alibi_slopes(num_heads), persistent=False)
         self.register_buffer(
@@ -138,6 +141,7 @@ class DecoderStepExport(nn.Module):
     def forward(
         self,
         token: torch.Tensor,
+        cache_pos: torch.Tensor,
         past_k: torch.Tensor,
         past_v: torch.Tensor,
         mk: torch.Tensor,
@@ -148,18 +152,20 @@ class DecoderStepExport(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         decoder = self.decoder
         batch, step_len = token.shape
-        past_len = past_k.shape[3]
-        total_len = past_len + step_len
+        num_heads = past_k.shape[2]
+        head_dim = past_k.shape[4]
 
         memory_mask = memory_mask_u8.ne(0).expand(batch, -1)
         values = decoder.token_embedding(token)
 
-        # Causal ALiBi self-attention bias [1, H, S, T + S], masking dummy slot 0 and future keys
-        q_pos = past_len + torch.arange(step_len, device=values.device)
-        k_pos = torch.arange(total_len, device=values.device)
+        # Static KV-cache positions: q_pos = [pos, pos+1, ..., pos+S-1], k_pos = [0 ..< MAX_KV]
+        q_pos = cache_pos[0] + torch.arange(step_len, device=values.device, dtype=torch.long)
+        k_pos = torch.arange(self.max_kv, device=values.device, dtype=torch.long)
+        scatter_idx = q_pos.view(1, 1, step_len, 1).expand(batch, num_heads, step_len, head_dim)
+
         dist = (q_pos[:, None] - k_pos[None, :]).clamp_min(0).to(values.dtype)
         self_bias = -self.alibi_slopes.to(values.dtype)[None, :, None, None] * dist[None, None, :, :]
-        invalid_key = (k_pos[None, :] > q_pos[:, None]) | k_pos[None, :].eq(0)
+        invalid_key = k_pos[None, :] > q_pos[:, None]
         self_bias = self_bias.masked_fill(invalid_key[None, None, :, :], NEG_MASK_VALUE)
 
         mask_bias = torch.zeros_like(memory_mask, dtype=values.dtype).masked_fill(memory_mask, NEG_MASK_VALUE)[:, None, None, :]
@@ -174,8 +180,8 @@ class DecoderStepExport(nn.Module):
             q = layer.norm1(values)
             key = _project_qkv(layer.self_attn, q, 1)
             val = _project_qkv(layer.self_attn, q, 2)
-            full_k = torch.cat((past_k[index], key), dim=2)
-            full_v = torch.cat((past_v[index], val), dim=2)
+            full_k = past_k[index].scatter(2, scatter_idx, key)
+            full_v = past_v[index].scatter(2, scatter_idx, val)
             new_ks.append(full_k)
             new_vs.append(full_v)
 
@@ -206,7 +212,6 @@ class DecoderStepExport(nn.Module):
         logits = decoder.output(decoder.transformer.norm(values))  # [B, S, vocab_size]
         if decoder.coverage:
             valid = (~memory_mask).to(values.dtype)  # [B, M]
-            # cov_seq.mean(1) -> [B, S, M]
             uncovered = (torch.exp(-4.0 * cov_seq.mean(1)) * valid[:, None, :]).sum(-1) / valid.sum(-1, keepdim=True).clamp_min(1.0)
             logits = logits - F.softplus(decoder.eos_coverage_strength) * uncovered[:, :, None] * self.eos_one_hot.to(logits.dtype)[None, None, :]
 
@@ -336,11 +341,59 @@ def _quantize_int8(src: Path) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _convert_fp16(src: Path, *, extra_block_ops: tuple[str, ...] = ()) -> None:
+    import onnx
+    from onnxruntime.transformers import float16
+
+    model = onnx.load(str(src))
+    # Keep numerically sensitive reductions & normalizations in FP32 while converting all Conv/MatMul/Gemm weights to FP16
+    block_list = list(float16.DEFAULT_OP_BLOCK_LIST) + [
+        "LayerNormalization",
+        "SimplifiedLayerNormalization",
+        "Softmax",
+        "LogSoftmax",
+        "CumSum",
+        "Exp",
+        "Log",
+        "Pow",
+        "Sqrt",
+        "ReduceMean",
+        "ReduceSum",
+        "ReduceMin",
+        "ReduceMax",
+        *extra_block_ops,
+    ]
+    fp16_model = float16.convert_float_to_float16(
+        model,
+        keep_io_types=True,
+        op_block_list=sorted(set(block_list)),
+    )
+    # Remove duplicate Cast nodes that onnxruntime's float16 converter can emit on fan-out tensors
+    dedup_nodes = []
+    seen_outputs: set[str] = set()
+    seen_names: set[str] = set()
+    for idx, node in enumerate(fp16_model.graph.node):
+        if node.op_type == "Cast" and len(node.output) == 1 and node.output[0] in seen_outputs:
+            continue
+        if node.name:
+            if node.name in seen_names:
+                node.name = f"{node.name}_{idx}"
+            seen_names.add(node.name)
+        for out_name in node.output:
+            if out_name:
+                seen_outputs.add(out_name)
+        dedup_nodes.append(node)
+    del fp16_model.graph.node[:]
+    fp16_model.graph.node.extend(dedup_nodes)
+    onnx.save(fp16_model, str(src))
+
+
 def export_bundle(
     checkpoint_path: Path,
     output_dir: Path,
-    quantize: str = "none",
+    quantize: str = "fp16",
     model_name: str = "InkTeX-75M",
+    static_kv_len: int = STATIC_KV_LEN,
 ) -> Path:
     started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -370,8 +423,9 @@ def export_bundle(
     dummy_memory_mask = torch.zeros((1, 48), dtype=torch.uint8)
 
     dummy_token = torch.tensor([[tokenizer.bos_id, 6, 7], [tokenizer.bos_id, 6, 8]], dtype=torch.long)
-    dummy_past_k = torch.zeros((num_layers, 2, num_heads, 3, head_dim), dtype=torch.float32)
-    dummy_past_v = torch.zeros((num_layers, 2, num_heads, 3, head_dim), dtype=torch.float32)
+    dummy_cache_pos = torch.tensor([0], dtype=torch.long)
+    dummy_past_k = torch.zeros((num_layers, 2, num_heads, static_kv_len, head_dim), dtype=torch.float32)
+    dummy_past_v = torch.zeros((num_layers, 2, num_heads, static_kv_len, head_dim), dtype=torch.float32)
     dummy_mk = torch.zeros((num_layers, 1, num_heads, 48, head_dim), dtype=torch.float32)
     dummy_mv = torch.zeros((num_layers, 1, num_heads, 48, head_dim), dtype=torch.float32)
     dummy_coverage = torch.zeros((2, num_heads, 1, 48), dtype=torch.float32)
@@ -380,9 +434,8 @@ def export_bundle(
     width_dim = torch.export.Dim("strip_width", min=64, max=cfg.vision_max_width)
     points_dim = torch.export.Dim("num_points", min=2, max=cfg.max_points)
     mem_dim = torch.export.Dim("mem_len", min=2, max=cfg.max_points)
-    past_dim = torch.export.Dim("past_len", min=1, max=cfg.max_tokens)
     dec_batch_dim = torch.export.Dim("dec_batch", min=1, max=16)
-    step_len_dim = torch.export.Dim("step_len", min=1, max=cfg.max_tokens)
+    step_len_dim = torch.export.Dim("step_len", min=1, max=static_kv_len - 1)
 
     vision_path = output_dir / "vision_encoder.onnx"
     stroke_path = output_dir / "stroke_encoder.onnx"
@@ -426,17 +479,18 @@ def export_bundle(
         external_data=False,
     )
 
-    print("Exporting decoder_step.onnx (batched + parallel prefix-verify) ...")
+    print(f"Exporting decoder_step.onnx (static KV={static_kv_len}, batched + parallel prefix-verify) ...")
     torch.onnx.export(
-        DecoderStepExport(model).eval(),
-        (dummy_token, dummy_past_k, dummy_past_v, dummy_mk, dummy_mv, dummy_memory_mask, dummy_coverage, dummy_prev_weights),
+        DecoderStepExport(model, max_kv=static_kv_len).eval(),
+        (dummy_token, dummy_cache_pos, dummy_past_k, dummy_past_v, dummy_mk, dummy_mv, dummy_memory_mask, dummy_coverage, dummy_prev_weights),
         decoder_path,
-        input_names=["token", "past_k", "past_v", "mk", "mv", "memory_mask", "coverage", "prev_weights"],
+        input_names=["token", "cache_pos", "past_k", "past_v", "mk", "mv", "memory_mask", "coverage", "prev_weights"],
         output_names=["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
         dynamic_shapes=(
             {0: dec_batch_dim, 1: step_len_dim},
-            {1: dec_batch_dim, 3: past_dim},
-            {1: dec_batch_dim, 3: past_dim},
+            {},
+            {1: dec_batch_dim},
+            {1: dec_batch_dim},
             {3: mem_dim},
             {3: mem_dim},
             {1: mem_dim},
@@ -471,7 +525,16 @@ def export_bundle(
             external_data=False,
         )
 
-    if quantize == "int8":
+    if quantize == "fp16":
+        print("Converting all graphs to CoreML-native FP16 (keep_io_types=True, safe FP32 norms/reductions) ...")
+        _convert_fp16(vision_path)
+        # Keep geometric Div/Sub in stroke_encoder safe for tiny 1-point dots
+        _convert_fp16(stroke_path, extra_block_ops=("Div", "Sub"))
+        _convert_fp16(memproj_path)
+        _convert_fp16(decoder_path)
+        if has_r2l:
+            _convert_fp16(r2l_path)
+    elif quantize == "int8":
         quant_targets = [stroke_path, memproj_path, decoder_path]
         if has_r2l:
             quant_targets.append(r2l_path)
@@ -504,7 +567,7 @@ def export_bundle(
         print(f"  {p.name}: {size / (1024 * 1024):.2f} MB")
 
     manifest = {
-        "format": "inktex-onnx-bundle-v2",
+        "format": "inktex-onnx-bundle-v3",
         "model_name": model_name,
         "preset": cfg.preset,
         "stage": payload.get("stage"),
@@ -516,6 +579,7 @@ def export_bundle(
         "has_r2l": has_r2l,
         "supports_batched_decoder": True,
         "supports_prefix_verify": True,
+        "static_kv_len": static_kv_len,
         "r2l_decoder_layers": cfg.r2l_decoder_layers if has_r2l else 0,
         "d_model": cfg.d_model,
         "decoder_layers": num_layers,
@@ -552,10 +616,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export InkTeX bimodal .pt checkpoint to split ONNX bundle.")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to bimodal-checkpoint-v1 best.pt")
     parser.add_argument("--output", type=Path, required=True, help="Output directory for ONNX bundle + manifest.json")
-    parser.add_argument("--quantize", choices=("none", "int8"), default="none", help="Optional dynamic INT8 quantization")
+    parser.add_argument("--quantize", choices=("none", "fp16", "int8"), default="fp16", help="Weight precision (default: fp16 for Apple CoreML/ANE)")
+    parser.add_argument("--static-kv-len", type=int, default=STATIC_KV_LEN, help="Fixed KV-cache length for CoreML static-shape decoding")
     parser.add_argument("--name", default="InkTeX-75M", help="Human-readable model name recorded in manifest.json")
     args = parser.parse_args()
-    export_bundle(args.checkpoint, args.output, quantize=args.quantize, model_name=args.name)
+    export_bundle(args.checkpoint, args.output, quantize=args.quantize, model_name=args.name, static_kv_len=args.static_kv_len)
 
 
 if __name__ == "__main__":

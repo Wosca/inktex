@@ -100,7 +100,7 @@ public enum ModelBundleLocator {
             }
         }
 
-        // Sort: highest stage, then highest normalized_exact, then highest epoch, then v2 fast decode
+        // Sort: highest stage, highest normalized_exact, highest epoch, v3 static KV, then FP16 preference
         found.sort { a, b in
             let sA = a.manifest.stage ?? 0
             let sB = b.manifest.stage ?? 0
@@ -111,9 +111,12 @@ public enum ModelBundleLocator {
             let epA = a.manifest.epoch ?? 0
             let epB = b.manifest.epoch ?? 0
             if epA != epB { return epA > epB }
-            let v2A = (a.manifest.supportsPrefixVerify == true) ? 1 : 0
-            let v2B = (b.manifest.supportsPrefixVerify == true) ? 1 : 0
-            return v2A > v2B
+            let v3A = (a.manifest.staticKvLen != nil) ? 1 : 0
+            let v3B = (b.manifest.staticKvLen != nil) ? 1 : 0
+            if v3A != v3B { return v3A > v3B }
+            let fp16A = (a.manifest.quantization == "fp16") ? 1 : 0
+            let fp16B = (b.manifest.quantization == "fp16") ? 1 : 0
+            return fp16A > fp16B
         }
         return found
     }

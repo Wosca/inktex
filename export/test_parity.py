@@ -86,9 +86,11 @@ def run_onnx_greedy(
     num_heads = manifest["attention_heads"]
     head_dim = manifest["head_dim"]
     mem_len = memory.shape[1]
+    static_kv = manifest.get("static_kv_len")
 
-    past_k = np.zeros((num_layers, 1, num_heads, 1, head_dim), dtype=np.float32)
-    past_v = np.zeros((num_layers, 1, num_heads, 1, head_dim), dtype=np.float32)
+    init_kv_len = static_kv if static_kv else 1
+    past_k = np.zeros((num_layers, 1, num_heads, init_kv_len, head_dim), dtype=np.float32)
+    past_v = np.zeros((num_layers, 1, num_heads, init_kv_len, head_dim), dtype=np.float32)
     coverage = np.zeros((1, num_heads, 1, mem_len), dtype=np.float32)
     prev_weights = np.zeros((1, num_heads, 1, mem_len), dtype=np.float32)
 
@@ -96,20 +98,20 @@ def run_onnx_greedy(
     generated: list[int] = []
     first_logits: np.ndarray | None = None
 
-    for _ in range(max_tokens):
-        logits, past_k, past_v, coverage, prev_weights = dec_sess.run(
-            None,
-            {
-                "token": token,
-                "past_k": past_k,
-                "past_v": past_v,
-                "mk": mk,
-                "mv": mv,
-                "memory_mask": memory_mask,
-                "coverage": coverage,
-                "prev_weights": prev_weights,
-            },
-        )
+    for step_idx in range(max_tokens):
+        feed = {
+            "token": token,
+            "past_k": past_k,
+            "past_v": past_v,
+            "mk": mk,
+            "mv": mv,
+            "memory_mask": memory_mask,
+            "coverage": coverage,
+            "prev_weights": prev_weights,
+        }
+        if static_kv:
+            feed["cache_pos"] = np.array([step_idx], dtype=np.int64)
+        logits, past_k, past_v, coverage, prev_weights = dec_sess.run(None, feed)
         if first_logits is None:
             first_logits = logits[:, 0, :] if logits.ndim == 3 else logits
         step_logits = logits[0, -1] if logits.ndim == 3 else logits[0]
@@ -286,7 +288,9 @@ def verify_parity(checkpoint_path: Path, bundle_dir: Path, tol: float = 1e-3) ->
         D = manifest["head_dim"]
         M = mem.shape[1]
 
-        # Test prefix verification with a partial prefix (first 5 tokens) + a corrupted suffix (diverging at index 4)
+        # Test prefix verification with a partial prefix + a corrupted suffix
+        static_kv = manifest.get("static_kv_len")
+        init_kv_len = static_kv if static_kv else 1
         body = [t for t in full_tokens if t != tokenizer.eos_id]
         for label, prev_guess in (
             ("exact-prefix", body[:-2]),
@@ -294,19 +298,19 @@ def verify_parity(checkpoint_path: Path, bundle_dir: Path, tol: float = 1e-3) ->
         ):
             t0 = time.perf_counter()
             inp = np.array([[tokenizer.bos_id, *prev_guess]], dtype=np.int64)
-            past_k = np.zeros((L, 1, H, 1, D), dtype=np.float32)
-            past_v = np.zeros((L, 1, H, 1, D), dtype=np.float32)
+            past_k = np.zeros((L, 1, H, init_kv_len, D), dtype=np.float32)
+            past_v = np.zeros((L, 1, H, init_kv_len, D), dtype=np.float32)
             cov = np.zeros((1, H, 1, M), dtype=np.float32)
             prev_w = np.zeros((1, H, 1, M), dtype=np.float32)
 
-            logits, new_k, new_v, new_cov, new_w = dec_sess.run(
-                None,
-                {
-                    "token": inp, "past_k": past_k, "past_v": past_v,
-                    "mk": mk, "mv": mv, "memory_mask": mem_mask_u8,
-                    "coverage": cov, "prev_weights": prev_w,
-                },
-            )
+            feed = {
+                "token": inp, "past_k": past_k, "past_v": past_v,
+                "mk": mk, "mv": mv, "memory_mask": mem_mask_u8,
+                "coverage": cov, "prev_weights": prev_w,
+            }
+            if static_kv:
+                feed["cache_pos"] = np.array([0], dtype=np.int64)
+            logits, new_k, new_v, new_cov, new_w = dec_sess.run(None, feed)
             verified = []
             diverge_i = None
             for i in range(inp.shape[1]):
@@ -322,24 +326,29 @@ def verify_parity(checkpoint_path: Path, bundle_dir: Path, tol: float = 1e-3) ->
 
             steps = 0
             if diverge_i is not None:
-                # Slice KV-cache, coverage, and prev_weights at diverge_i
-                past_k = new_k[:, :, :, : diverge_i + 2, :]
-                past_v = new_v[:, :, :, : diverge_i + 2, :]
+                if static_kv:
+                    # ZERO KV-cache slicing needed! Just pass new_k, new_v with cache_pos = diverge_i + 1
+                    past_k, past_v = new_k, new_v
+                else:
+                    past_k = new_k[:, :, :, : diverge_i + 2, :]
+                    past_v = new_v[:, :, :, : diverge_i + 2, :]
                 cov = new_cov[:, :, diverge_i : diverge_i + 1, :]
                 prev_w = new_w[:, :, diverge_i : diverge_i + 1, :]
                 cur_tok = np.array([[verified[-1]]], dtype=np.int64)
+                next_pos = diverge_i + 1
                 while len(verified) < 64:
                     steps += 1
-                    st_logits, past_k, past_v, cov, prev_w = dec_sess.run(
-                        None,
-                        {
-                            "token": cur_tok, "past_k": past_k, "past_v": past_v,
-                            "mk": mk, "mv": mv, "memory_mask": mem_mask_u8,
-                            "coverage": cov, "prev_weights": prev_w,
-                        },
-                    )
+                    st_feed = {
+                        "token": cur_tok, "past_k": past_k, "past_v": past_v,
+                        "mk": mk, "mv": mv, "memory_mask": mem_mask_u8,
+                        "coverage": cov, "prev_weights": prev_w,
+                    }
+                    if static_kv:
+                        st_feed["cache_pos"] = np.array([next_pos], dtype=np.int64)
+                    st_logits, past_k, past_v, cov, prev_w = dec_sess.run(None, st_feed)
                     nxt = int(np.argmax(st_logits[0, 0]))
                     verified.append(nxt)
+                    next_pos += 1
                     if nxt == tokenizer.eos_id:
                         break
                     cur_tok = np.array([[nxt]], dtype=np.int64)
@@ -351,20 +360,19 @@ def verify_parity(checkpoint_path: Path, bundle_dir: Path, tol: float = 1e-3) ->
 
         # Verify batched B=4 decoding matches B=1 identically
         b_tok = np.full((4, 1), tokenizer.bos_id, dtype=np.int64)
-        b_k = np.zeros((L, 4, H, 1, D), dtype=np.float32)
-        b_v = np.zeros((L, 4, H, 1, D), dtype=np.float32)
+        b_k = np.zeros((L, 4, H, init_kv_len, D), dtype=np.float32)
+        b_v = np.zeros((L, 4, H, init_kv_len, D), dtype=np.float32)
         b_cov = np.zeros((4, H, 1, M), dtype=np.float32)
         b_w = np.zeros((4, H, 1, M), dtype=np.float32)
-        b_logits, _, _, _, _ = dec_sess.run(
-            None,
-            {"token": b_tok, "past_k": b_k, "past_v": b_v, "mk": mk, "mv": mv,
-             "memory_mask": mem_mask_u8, "coverage": b_cov, "prev_weights": b_w},
-        )
-        s_logits, _, _, _, _ = dec_sess.run(
-            None,
-            {"token": b_tok[:1], "past_k": b_k[:, :1], "past_v": b_v[:, :1], "mk": mk, "mv": mv,
-             "memory_mask": mem_mask_u8, "coverage": b_cov[:1], "prev_weights": b_w[:1]},
-        )
+        b_feed = {"token": b_tok, "past_k": b_k, "past_v": b_v, "mk": mk, "mv": mv,
+                  "memory_mask": mem_mask_u8, "coverage": b_cov, "prev_weights": b_w}
+        s_feed = {"token": b_tok[:1], "past_k": b_k[:, :1], "past_v": b_v[:, :1], "mk": mk, "mv": mv,
+                  "memory_mask": mem_mask_u8, "coverage": b_cov[:1], "prev_weights": b_w[:1]}
+        if static_kv:
+            b_feed["cache_pos"] = np.array([0], dtype=np.int64)
+            s_feed["cache_pos"] = np.array([0], dtype=np.int64)
+        b_logits, _, _, _, _ = dec_sess.run(None, b_feed)
+        s_logits, _, _, _, _ = dec_sess.run(None, s_feed)
         b_diff = float(np.max(np.abs(b_logits - s_logits)))
         print(f"[batch4 ] max_diff_vs_b1={b_diff:.6g}")
         if b_diff > tol:

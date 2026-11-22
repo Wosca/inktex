@@ -34,7 +34,12 @@ struct ModelSetupSheet: View {
                         }
                         LabeledContent("Quantization", value: (bundle.manifest.quantization ?? "fp32").uppercased())
                         LabeledContent("R2L Reranker", value: engine.hasR2LScorer ? "Active (3-layer)" : "Not in bundle")
-                        LabeledContent("Fast Decode (v2)", value: engine.supportsV2FastDecode ? "Prefix Verify + Batched Beam" : "Legacy v1")
+                        LabeledContent(
+                            "Decoder Engine",
+                            value: engine.staticKvLen != nil
+                                ? "v3 Static KV (\(engine.staticKvLen!)) + Prefix Verify"
+                                : (engine.supportsV2FastDecode ? "v2 Prefix Verify + Batched Beam" : "Legacy v1")
+                        )
                         LabeledContent("Source", value: bundle.sourceDescription)
                     } else {
                         VStack(alignment: .leading, spacing: 6) {
@@ -101,18 +106,30 @@ struct ModelSetupSheet: View {
                     }
                 }
 
-                // 5. Runtime Acceleration
-                Section("Runtime Acceleration") {
-                    Toggle("CoreML EP for Vision Encoder", isOn: Binding(
-                        get: { engine.useCoreMLForVision },
+                // 5. Runtime Acceleration (CoreML MLProgram + On-Disk Cache)
+                Section("CoreML Acceleration (MLProgram)") {
+                    Picker("CoreML Profile", selection: Binding(
+                        get: { engine.coreMLProfile },
                         set: { newValue in
-                            engine.useCoreMLForVision = newValue
+                            engine.coreMLProfile = newValue
                             engine.reloadModel()
                         }
-                    ))
-                    Text("Uses Apple Neural Engine / GPU for ConvNeXt-Tiny while keeping dynamic-shape transformer steps on M1 performance cores.")
+                    )) {
+                        ForEach(CoreMLProfile.allCases) { profile in
+                            Text(profile.title).tag(profile)
+                        }
+                    }
+
+                    Text(engine.coreMLProfile.description)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    Button {
+                        engine.clearCoreMLDiskCache()
+                        engine.reloadModel()
+                    } label: {
+                        Label("Clear CoreML Compiled Cache", systemImage: "arrow.triangle.2.circlepath")
+                    }
                 }
 
                 // 6. Import / Manage Bundles
@@ -188,14 +205,14 @@ struct MemoryBreakdownCard: View {
     let snapshot: MemorySnapshot
     var onRefresh: (() -> Void)? = nil
 
-    private var segments: [(id: String, name: String, ramMB: Double, diskMB: Double?, color: Color)] {
-        var rows: [(String, String, Double, Double?, Color)] = []
-        rows.append(("baseline", "App Baseline (UI + PencilKit)", snapshot.baselineMB, nil, Color.gray))
+    private var segments: [(id: String, name: String, ramMB: Double, diskMB: Double?, coreML: Bool, color: Color)] {
+        var rows: [(String, String, Double, Double?, Bool, Color)] = []
+        rows.append(("baseline", "App Baseline (UI + PencilKit)", snapshot.baselineMB, nil, false, Color.gray))
         for comp in snapshot.components {
-            rows.append((comp.id, comp.name, comp.ramMB, comp.diskMB, comp.color))
+            rows.append((comp.id, comp.name, comp.ramMB, comp.diskMB, comp.coreMLEnabled, comp.color))
         }
         if snapshot.runtimeOverheadMB >= 0.5 {
-            rows.append(("runtime", "KV-Cache & Runtime Buffers", snapshot.runtimeOverheadMB, nil, Color.orange))
+            rows.append(("runtime", "KV-Cache & Runtime Buffers", snapshot.runtimeOverheadMB, nil, false, Color.orange))
         }
         return rows
     }
@@ -263,6 +280,15 @@ struct MemoryBreakdownCard: View {
                             .font(.caption)
                             .foregroundStyle(.primary)
                             .lineLimit(1)
+                        if seg.coreML {
+                            Text("CoreML")
+                                .font(.system(size: 9, weight: .semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1.5)
+                                .background(Color.blue.opacity(0.18))
+                                .foregroundStyle(.blue)
+                                .clipShape(Capsule())
+                        }
                         Spacer()
                         if let disk = seg.diskMB {
                             Text(String(format: "%.0f MB disk", disk))

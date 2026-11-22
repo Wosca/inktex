@@ -46,6 +46,37 @@ public enum ModalityMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+public enum CoreMLProfile: String, CaseIterable, Identifiable, Sendable {
+    case off
+    case visionOnly
+    case encodersAndR2L
+    case allGraphs
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .off: return "Off (M1 CPU)"
+        case .visionOnly: return "Vision Only"
+        case .encodersAndR2L: return "Encoders + R2L"
+        case .allGraphs: return "All Graphs (Incl. Decoder)"
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .off:
+            return "Runs all 5 graphs on M1 performance cores + AMX."
+        case .visionOnly:
+            return "CoreML MLProgram (ANE/GPU) on ConvNeXt Vision Encoder; M1 CPU on transformers."
+        case .encodersAndR2L:
+            return "CoreML MLProgram (ANE/GPU) on Vision, Stroke, Memory Proj & R2L; M1 CPU on step decoder. Best all-round for FP16."
+        case .allGraphs:
+            return "CoreML MLProgram (ANE/GPU) on all 5 graphs including the fixed-shape static KV-cache decoder."
+        }
+    }
+}
+
 public enum DecodingMode: String, CaseIterable, Identifiable, Sendable {
     case greedy
     case beam
@@ -241,6 +272,7 @@ public struct ModelManifest: Codable, Sendable {
     public let hasR2L: Bool?
     public let supportsBatchedDecoder: Bool?
     public let supportsPrefixVerify: Bool?
+    public let staticKvLen: Int?
     public let r2lDecoderLayers: Int?
     public let dModel: Int
     public let decoderLayers: Int
@@ -269,6 +301,7 @@ public struct ModelManifest: Codable, Sendable {
         case hasR2L = "has_r2l"
         case supportsBatchedDecoder = "supports_batched_decoder"
         case supportsPrefixVerify = "supports_prefix_verify"
+        case staticKvLen = "static_kv_len"
         case r2lDecoderLayers = "r2l_decoder_layers"
         case dModel = "d_model"
         case decoderLayers = "decoder_layers"
@@ -294,6 +327,7 @@ public struct MemoryComponent: Sendable, Identifiable {
     public let name: String
     public let ramMB: Double
     public let diskMB: Double
+    public let coreMLEnabled: Bool
     public let colorRGB: (Double, Double, Double)
 
     public var color: Color {
