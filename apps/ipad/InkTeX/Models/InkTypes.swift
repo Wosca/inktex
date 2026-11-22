@@ -289,6 +289,48 @@ public struct ModelManifest: Codable, Sendable {
     }
 }
 
+public struct MemoryComponent: Sendable, Identifiable {
+    public let id: String
+    public let name: String
+    public let ramMB: Double
+    public let diskMB: Double
+    public let colorRGB: (Double, Double, Double)
+
+    public var color: Color {
+        Color(red: colorRGB.0, green: colorRGB.1, blue: colorRGB.2)
+    }
+}
+
+public struct MemorySnapshot: Sendable {
+    public let baselineMB: Double
+    public let components: [MemoryComponent]
+    public let currentFootprintMB: Double
+    public let peakFootprintMB: Double
+    public let lastInferenceDeltaMB: Double
+    public let availableHeadroomMB: Double
+
+    public var componentsSumMB: Double {
+        components.reduce(0) { $0 + $1.ramMB }
+    }
+
+    public var runtimeOverheadMB: Double {
+        max(0, currentFootprintMB - baselineMB - componentsSumMB)
+    }
+
+    public var totalDiskMB: Double {
+        components.reduce(0) { $0 + $1.diskMB }
+    }
+
+    public static let empty = MemorySnapshot(
+        baselineMB: 0,
+        components: [],
+        currentFootprintMB: 0,
+        peakFootprintMB: 0,
+        lastInferenceDeltaMB: 0,
+        availableHeadroomMB: 0
+    )
+}
+
 public struct RecognitionResult: Sendable {
     public let latex: String
     public let decodedTokens: [DecodedToken]

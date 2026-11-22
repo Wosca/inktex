@@ -10,6 +10,19 @@ struct ModelSetupSheet: View {
     var body: some View {
         NavigationStack {
             List {
+                // 1. Live Hardware RAM Breakdown (exact Darwin phys_footprint per component!)
+                Section {
+                    MemoryBreakdownCard(
+                        snapshot: engine.memorySnapshot,
+                        onRefresh: { engine.refreshMemory() }
+                    )
+                    .listRowInsets(EdgeInsets(top: 10, leading: 14, bottom: 10, trailing: 14))
+                    Toggle("Show Live RAM in Bottom Bar", isOn: $engine.showLiveRamInBar)
+                } header: {
+                    Text("Memory Usage (Live)")
+                }
+
+                // 2. Active Model & Checkpoint Switcher
                 Section("Active Model") {
                     if let bundle = engine.loadedBundle {
                         LabeledContent("Model", value: bundle.manifest.modelName)
@@ -17,9 +30,9 @@ struct ModelSetupSheet: View {
                             LabeledContent("Checkpoint", value: "Stage \(stage) · Epoch \(epoch)")
                         }
                         if let exact = bundle.manifest.metrics?.normalizedExact {
-                            LabeledContent("Val Exact", value: String(format: "%.1f%%", exact * 100))
+                            LabeledContent("Val Exact", value: String(format: "%.2f%%", exact * 100))
                         }
-                        LabeledContent("Quantization", value: bundle.manifest.quantization ?? "fp32")
+                        LabeledContent("Quantization", value: (bundle.manifest.quantization ?? "fp32").uppercased())
                         LabeledContent("R2L Reranker", value: engine.hasR2LScorer ? "Active (3-layer)" : "Not in bundle")
                         LabeledContent("Fast Decode (v2)", value: engine.supportsV2FastDecode ? "Prefix Verify + Batched Beam" : "Legacy v1")
                         LabeledContent("Source", value: bundle.sourceDescription)
@@ -28,7 +41,7 @@ struct ModelSetupSheet: View {
                             Label("No model bundle loaded", systemImage: "exclamationmark.triangle.fill")
                                 .foregroundStyle(.orange)
                                 .font(.headline)
-                            Text("Import your exported `model-bundle` folder from Files / iCloud Drive / AirDrop, or bundle it directly in Xcode.")
+                            Text("Import an exported `model-bundle` folder from Files / AirDrop, or add it in Xcode.")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
@@ -36,6 +49,34 @@ struct ModelSetupSheet: View {
                     }
                 }
 
+                // 3. Multi-Model Switcher (automatically sorted best/latest first!)
+                if engine.availableBundles.count > 1 {
+                    Section("Available Models (Best First)") {
+                        ForEach(engine.availableBundles) { bundle in
+                            Button {
+                                engine.selectBundle(bundle)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(bundle.displayTitle)
+                                            .font(.subheadline.weight(.medium))
+                                            .foregroundStyle(.primary)
+                                        Text("\(bundle.sourceDescription) · \((bundle.manifest.quantization ?? "fp32").uppercased())")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if engine.loadedBundle == bundle {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(Color.accentColor)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 4. Live Decoding & Speed
                 Section("Live Decoding & Speed") {
                     Toggle("Two-Phase Live Preview", isOn: $engine.liveTwoPhase)
                     Text("Shows instant prefix-verified Greedy while writing, then silently polishes with Batched Beam + R2L after you pause (reusing cached encoder memory).")
@@ -60,6 +101,7 @@ struct ModelSetupSheet: View {
                     }
                 }
 
+                // 5. Runtime Acceleration
                 Section("Runtime Acceleration") {
                     Toggle("CoreML EP for Vision Encoder", isOn: Binding(
                         get: { engine.useCoreMLForVision },
@@ -73,7 +115,8 @@ struct ModelSetupSheet: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Swap / Import Model Bundle") {
+                // 6. Import / Manage Bundles
+                Section("Import / Manage Models") {
                     Button {
                         showingFolderPicker = true
                     } label: {
@@ -83,19 +126,20 @@ struct ModelSetupSheet: View {
                     Button {
                         engine.reloadModel()
                     } label: {
-                        Label("Reload Model", systemImage: "arrow.clockwise")
+                        Label("Reload Active Model", systemImage: "arrow.clockwise")
                     }
 
-                    if engine.loadedBundle?.sourceDescription.contains("Imported") == true {
+                    if let active = engine.loadedBundle,
+                       active.directory.standardizedFileURL.path.hasPrefix(ModelBundleLocator.documentsDirectory.standardizedFileURL.path) {
                         Button(role: .destructive) {
                             do {
-                                try ModelBundleLocator.removeImportedBundle()
+                                try ModelBundleLocator.removeImportedBundle(active)
                                 engine.reloadModel()
                             } catch {
                                 importError = error.localizedDescription
                             }
                         } label: {
-                            Label("Remove Imported Bundle", systemImage: "trash")
+                            Label("Delete Active Imported Model", systemImage: "trash")
                         }
                     }
 
@@ -113,6 +157,9 @@ struct ModelSetupSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .onAppear {
+                engine.refreshMemory()
+            }
             .fileImporter(
                 isPresented: $showingFolderPicker,
                 allowedContentTypes: [.folder],
@@ -123,8 +170,8 @@ struct ModelSetupSheet: View {
                 case .success(let urls):
                     guard let folder = urls.first else { return }
                     do {
-                        _ = try ModelBundleLocator.importBundle(from: folder)
-                        engine.reloadModel()
+                        let installed = try ModelBundleLocator.importBundle(from: folder)
+                        engine.selectBundle(installed)
                     } catch {
                         importError = error.localizedDescription
                     }
@@ -136,11 +183,115 @@ struct ModelSetupSheet: View {
     }
 }
 
+/// Visual per-component RAM monitor using real Darwin `phys_footprint` & `os_proc_available_memory()`.
+struct MemoryBreakdownCard: View {
+    let snapshot: MemorySnapshot
+    var onRefresh: (() -> Void)? = nil
+
+    private var segments: [(id: String, name: String, ramMB: Double, diskMB: Double?, color: Color)] {
+        var rows: [(String, String, Double, Double?, Color)] = []
+        rows.append(("baseline", "App Baseline (UI + PencilKit)", snapshot.baselineMB, nil, Color.gray))
+        for comp in snapshot.components {
+            rows.append((comp.id, comp.name, comp.ramMB, comp.diskMB, comp.color))
+        }
+        if snapshot.runtimeOverheadMB >= 0.5 {
+            rows.append(("runtime", "KV-Cache & Runtime Buffers", snapshot.runtimeOverheadMB, nil, Color.orange))
+        }
+        return rows
+    }
+
+    private var barTotalMB: Double {
+        max(1.0, segments.reduce(0) { $0 + max(0, $1.ramMB) })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Top summary row
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(String(format: "%.0f MB", snapshot.currentFootprintMB))
+                        .font(.title2.weight(.bold).monospacedDigit())
+                    Text(
+                        String(
+                            format: "Peak %.0f MB · %.1f GB free headroom",
+                            snapshot.peakFootprintMB,
+                            snapshot.availableHeadroomMB / 1024.0
+                        )
+                    )
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                if let onRefresh {
+                    Button {
+                        onRefresh()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.subheadline)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+
+            // Stacked horizontal proportion bar
+            GeometryReader { geo in
+                HStack(spacing: 1.5) {
+                    ForEach(segments, id: \.id) { seg in
+                        let frac = max(0, seg.ramMB) / barTotalMB
+                        if frac > 0.005 {
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(seg.color)
+                                .frame(width: max(4, (geo.size.width - CGFloat(segments.count) * 1.5) * frac))
+                        }
+                    }
+                }
+            }
+            .frame(height: 12)
+            .clipShape(Capsule())
+
+            // Per-component table (Measured RAM + Disk size)
+            VStack(spacing: 6) {
+                ForEach(segments, id: \.id) { seg in
+                    HStack(spacing: 8) {
+                        Image(systemName: "circle.fill")
+                            .font(.system(size: 8))
+                            .foregroundStyle(seg.color)
+                        Text(seg.name)
+                            .font(.caption)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Spacer()
+                        if let disk = seg.diskMB {
+                            Text(String(format: "%.0f MB disk", disk))
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.tertiary)
+                        }
+                        Text(String(format: "%.1f MB", seg.ramMB))
+                            .font(.caption.weight(.semibold).monospacedDigit())
+                            .frame(width: 64, alignment: .trailing)
+                    }
+                }
+            }
+
+            if snapshot.lastInferenceDeltaMB > 0.05 {
+                Text(String(format: "Last recognition transient RAM delta: +%.1f MB", snapshot.lastInferenceDeltaMB))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
 /// Spacious, uncluttered Inspector sheet for inspecting the full-resolution Vision Strip,
-/// per-character confidence heatmap, symbol types, token breakdown, and L2R/R2L beam comparison.
+/// per-character confidence heatmap, symbol types, token breakdown, L2R/R2L beams, and live RAM.
 struct InspectorSheet: View {
     let result: RecognitionResult
+    let memorySnapshot: MemorySnapshot
     @Binding var stripColorMode: StripColorMode
+    var onRefreshMemory: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -176,7 +327,6 @@ struct InspectorSheet: View {
                             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         }
 
-                        // Spacious color legend
                         FlowLayout(spacing: 12) {
                             switch stripColorMode {
                             case .strokeOrder:
@@ -217,7 +367,7 @@ struct InspectorSheet: View {
                             metricTile(title: "Prefix Cached", value: "\(result.prefixVerifiedCount) tok")
                         }
                         metricTile(title: "Confidence", value: String(format: "%.1f%%", result.overallConfidence * 100))
-                        metricTile(title: "Input", value: "\(result.strokeCount) str · \(result.pointCount) pts")
+                        metricTile(title: "RAM Used", value: String(format: "%.0f MB", memorySnapshot.currentFootprintMB))
                     }
 
                     // 3. Wrapping Token Breakdown
@@ -273,7 +423,7 @@ struct InspectorSheet: View {
                                     HStack(spacing: 8) {
                                         Image(systemName: beam.isWinner ? "star.fill" : "circle")
                                             .font(.caption)
-                                            .foregroundStyle(beam.wasPromotedByR2L ? .purple : (beam.isWinner ? .accentColor : .secondary))
+                                            .foregroundStyle(beam.wasPromotedByR2L ? Color.purple : (beam.isWinner ? Color.accentColor : Color.secondary))
                                         Text(beam.latex)
                                             .font(.system(.callout, design: .monospaced))
                                             .textSelection(.enabled)
@@ -300,6 +450,16 @@ struct InspectorSheet: View {
                         .background(Color(uiColor: .secondarySystemGroupedBackground))
                         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
+
+                    // 5. Per-Component RAM Breakdown Card
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("RAM Breakdown")
+                            .font(.headline)
+                        MemoryBreakdownCard(snapshot: memorySnapshot, onRefresh: onRefreshMemory)
+                    }
+                    .padding(16)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
                 .padding(16)
             }
@@ -310,6 +470,9 @@ struct InspectorSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .onAppear {
+                onRefreshMemory()
             }
         }
     }

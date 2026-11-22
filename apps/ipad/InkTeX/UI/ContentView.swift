@@ -138,8 +138,13 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showInspectorSheet) {
                 if let result = latestResult {
-                    InspectorSheet(result: result, stripColorMode: $stripColorMode)
-                        .presentationDetents([.medium, .large])
+                    InspectorSheet(
+                        result: result,
+                        memorySnapshot: engine.memorySnapshot,
+                        stripColorMode: $stripColorMode,
+                        onRefreshMemory: { engine.refreshMemory() }
+                    )
+                    .presentationDetents([.medium, .large])
                 }
             }
         }
@@ -204,6 +209,22 @@ struct ContentView: View {
                             .clipShape(Capsule())
                     }
                 }
+            }
+
+            if engine.showLiveRamInBar && engine.memorySnapshot.currentFootprintMB > 0 {
+                Button {
+                    engine.refreshMemory()
+                    showModelSheet = true
+                } label: {
+                    Label(String(format: "%.0f MB", engine.memorySnapshot.currentFootprintMB), systemImage: "memorychip")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.secondary.opacity(0.12))
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
             }
 
             Spacer()

@@ -1,5 +1,35 @@
+import Darwin
 import Foundation
 import OnnxRuntimeBindings
+import os
+
+public enum MemoryMonitor {
+    private static let bytesPerMB: Double = 1024.0 * 1024.0
+
+    /// Exact physical memory footprint in MB (matches Xcode's Memory Gauge & iPadOS Jetsam).
+    public static func physicalFootprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.stride / MemoryLayout<natural_t>.stride)
+        let kerr = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), intPtr, &count)
+            }
+        }
+        guard kerr == KERN_SUCCESS else { return 0 }
+        return Double(info.phys_footprint) / bytesPerMB
+    }
+
+    /// Remaining app RAM headroom in MB before iPadOS Jetsam terminates the process.
+    public static func availableHeadroomMB() -> Double {
+        Double(os_proc_available_memory()) / bytesPerMB
+    }
+
+    public static func fileSizeMB(_ url: URL) -> Double {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let bytes = (attrs?[.size] as? NSNumber)?.doubleValue ?? 0
+        return bytes / bytesPerMB
+    }
+}
 
 @MainActor
 public final class InkTeXEngine: ObservableObject {
@@ -11,15 +41,20 @@ public final class InkTeXEngine: ObservableObject {
     }
 
     @Published public private(set) var status: Status = .loading
+    @Published public private(set) var availableBundles: [LocatedModelBundle] = []
     @Published public private(set) var loadedBundle: LocatedModelBundle?
     @Published public private(set) var hasR2LScorer: Bool = false
     @Published public private(set) var supportsV2FastDecode: Bool = false
     @Published public private(set) var isRecognizing: Bool = false
+    @Published public private(set) var memorySnapshot: MemorySnapshot = .empty
     @Published public var useCoreMLForVision: Bool = true
     @Published public var liveTwoPhase: Bool = true
+    @Published public var showLiveRamInBar: Bool = true
     @Published public var beamWidth: Int = 4
     @Published public var r2lWeight: Double = 0.5
 
+    private var preferredBundleId: String? = nil
+    private var peakFootprintMB: Double = 0
     private let workerQueue = DispatchQueue(label: "com.wosca.inktex.inference", qos: .userInitiated)
     private var runtime: LoadedRuntime?
 
@@ -76,6 +111,8 @@ public final class InkTeXEngine: ObservableObject {
         let decoderStepSession: ORTSession
         let r2lScorerSession: ORTSession?
         let isV2Decoder: Bool
+        let baselineMB: Double
+        let memoryComponents: [MemoryComponent]
 
         // Incremental caches (accessed strictly on workerQueue)
         var lastPrefixBodyIds: [Int] = []
@@ -90,15 +127,69 @@ public final class InkTeXEngine: ObservableObject {
             let visionOpts = try Self.makeOptions(useCoreML: useCoreMLForVision, threads: 4)
             let cpuOpts = try Self.makeOptions(useCoreML: false, threads: 4)
 
+            var components: [MemoryComponent] = []
+            let base = MemoryMonitor.physicalFootprintMB()
+            self.baselineMB = base
+
+            var before = base
             self.visionSession = try ORTSession(env: env, modelPath: bundle.visionEncoderURL.path, sessionOptions: visionOpts)
+            var after = MemoryMonitor.physicalFootprintMB()
+            components.append(MemoryComponent(
+                id: "vision",
+                name: useCoreMLForVision ? "Vision Encoder (CoreML)" : "Vision Encoder (CPU)",
+                ramMB: max(0, after - before),
+                diskMB: MemoryMonitor.fileSizeMB(bundle.visionEncoderURL),
+                colorRGB: (0.22, 0.74, 0.97)
+            ))
+
+            before = after
             self.strokeSession = try ORTSession(env: env, modelPath: bundle.strokeEncoderURL.path, sessionOptions: cpuOpts)
+            after = MemoryMonitor.physicalFootprintMB()
+            components.append(MemoryComponent(
+                id: "stroke",
+                name: "Stroke Encoder (8L)",
+                ramMB: max(0, after - before),
+                diskMB: MemoryMonitor.fileSizeMB(bundle.strokeEncoderURL),
+                colorRGB: (0.20, 0.83, 0.60)
+            ))
+
+            before = after
             self.memoryProjSession = try ORTSession(env: env, modelPath: bundle.memoryProjURL.path, sessionOptions: cpuOpts)
+            after = MemoryMonitor.physicalFootprintMB()
+            components.append(MemoryComponent(
+                id: "memproj",
+                name: "Memory Projection",
+                ramMB: max(0, after - before),
+                diskMB: MemoryMonitor.fileSizeMB(bundle.memoryProjURL),
+                colorRGB: (0.98, 0.75, 0.14)
+            ))
+
+            before = after
             self.decoderStepSession = try ORTSession(env: env, modelPath: bundle.decoderStepURL.path, sessionOptions: cpuOpts)
+            after = MemoryMonitor.physicalFootprintMB()
+            components.append(MemoryComponent(
+                id: "decoder",
+                name: "L2R Decoder (6L KV-Cache)",
+                ramMB: max(0, after - before),
+                diskMB: MemoryMonitor.fileSizeMB(bundle.decoderStepURL),
+                colorRGB: (0.75, 0.52, 0.99)
+            ))
+
             if let r2lURL = bundle.r2lScorerURL {
+                before = after
                 self.r2lScorerSession = try ORTSession(env: env, modelPath: r2lURL.path, sessionOptions: cpuOpts)
+                after = MemoryMonitor.physicalFootprintMB()
+                components.append(MemoryComponent(
+                    id: "r2l",
+                    name: "R2L Reranker (3L)",
+                    ramMB: max(0, after - before),
+                    diskMB: MemoryMonitor.fileSizeMB(r2lURL),
+                    colorRGB: (0.96, 0.45, 0.71)
+                ))
             } else {
                 self.r2lScorerSession = nil
             }
+            self.memoryComponents = components
         }
 
         private static func makeOptions(useCoreML: Bool, threads: Int32) throws -> ORTSessionOptions {
@@ -170,17 +261,65 @@ public final class InkTeXEngine: ObservableObject {
         }
     }
 
+    public func selectBundle(_ bundle: LocatedModelBundle) {
+        preferredBundleId = bundle.id
+        reloadModel()
+    }
+
+    public func refreshMemory(lastInferenceDeltaMB: Double? = nil) {
+        let current = MemoryMonitor.physicalFootprintMB()
+        peakFootprintMB = max(peakFootprintMB, current)
+        let headroom = MemoryMonitor.availableHeadroomMB()
+        let delta = lastInferenceDeltaMB ?? memorySnapshot.lastInferenceDeltaMB
+        if let rt = runtime {
+            memorySnapshot = MemorySnapshot(
+                baselineMB: rt.baselineMB,
+                components: rt.memoryComponents,
+                currentFootprintMB: current,
+                peakFootprintMB: peakFootprintMB,
+                lastInferenceDeltaMB: delta,
+                availableHeadroomMB: headroom
+            )
+        } else {
+            memorySnapshot = MemorySnapshot(
+                baselineMB: current,
+                components: [],
+                currentFootprintMB: current,
+                peakFootprintMB: peakFootprintMB,
+                lastInferenceDeltaMB: 0,
+                availableHeadroomMB: headroom
+            )
+        }
+    }
+
     public func reloadModel() {
         status = .loading
         let useCoreML = useCoreMLForVision
+        let preferred = preferredBundleId
+        // Release old runtime first so baseline RAM reflects the clean app footprint
+        runtime = nil
         workerQueue.async { [weak self] in
             guard let self else { return }
-            guard let bundle = ModelBundleLocator.locate() else {
+            let allBundles = ModelBundleLocator.locateAll()
+            let chosen = allBundles.first(where: { $0.id == preferred }) ?? allBundles.first
+            guard let bundle = chosen else {
+                let current = MemoryMonitor.physicalFootprintMB()
+                let headroom = MemoryMonitor.availableHeadroomMB()
                 Task { @MainActor in
+                    self.availableBundles = allBundles
                     self.runtime = nil
                     self.loadedBundle = nil
                     self.hasR2LScorer = false
                     self.supportsV2FastDecode = false
+                    self.peakFootprintMB = max(self.peakFootprintMB, current)
+                    self.memorySnapshot = MemorySnapshot(
+                        baselineMB: current,
+                        components: [],
+                        currentFootprintMB: current,
+                        peakFootprintMB: self.peakFootprintMB,
+                        lastInferenceDeltaMB: 0,
+                        availableHeadroomMB: headroom
+                    )
                     self.status = .missingModel
                 }
                 return
@@ -189,15 +328,29 @@ public final class InkTeXEngine: ObservableObject {
                 let loaded = try LoadedRuntime(bundle: bundle, useCoreMLForVision: useCoreML)
                 let hasR2L = loaded.r2lScorerSession != nil
                 let isV2 = loaded.isV2Decoder
+                let afterLoad = MemoryMonitor.physicalFootprintMB()
+                let headroom = MemoryMonitor.availableHeadroomMB()
                 Task { @MainActor in
+                    self.availableBundles = allBundles
                     self.runtime = loaded
                     self.loadedBundle = bundle
+                    self.preferredBundleId = bundle.id
                     self.hasR2LScorer = hasR2L
                     self.supportsV2FastDecode = isV2
+                    self.peakFootprintMB = max(self.peakFootprintMB, afterLoad)
+                    self.memorySnapshot = MemorySnapshot(
+                        baselineMB: loaded.baselineMB,
+                        components: loaded.memoryComponents,
+                        currentFootprintMB: afterLoad,
+                        peakFootprintMB: self.peakFootprintMB,
+                        lastInferenceDeltaMB: 0,
+                        availableHeadroomMB: headroom
+                    )
                     self.status = .ready
                 }
             } catch {
                 Task { @MainActor in
+                    self.availableBundles = allBundles
                     self.runtime = nil
                     self.loadedBundle = bundle
                     self.hasR2LScorer = false
@@ -227,10 +380,11 @@ public final class InkTeXEngine: ObservableObject {
         let width = beamWidth
         let weight = r2lWeight
 
-        return try await withCheckedThrowingContinuation { continuation in
+        let (result, inferDeltaMB): (RecognitionResult, Double) = try await withCheckedThrowingContinuation { continuation in
             workerQueue.async {
+                let beforeMB = MemoryMonitor.physicalFootprintMB()
                 do {
-                    let result = try Self.runInference(
+                    let res = try Self.runInference(
                         runtime: runtime,
                         strokes: strokes,
                         modality: modality,
@@ -239,12 +393,15 @@ public final class InkTeXEngine: ObservableObject {
                         r2lWeight: weight,
                         maxTokens: maxTokens
                     )
-                    continuation.resume(returning: result)
+                    let afterMB = MemoryMonitor.physicalFootprintMB()
+                    continuation.resume(returning: (res, max(0, afterMB - beforeMB)))
                 } catch {
                     continuation.resume(throwing: error)
                 }
             }
         }
+        refreshMemory(lastInferenceDeltaMB: inferDeltaMB)
+        return result
     }
 
     // MARK: - Core Inference Pipeline
