@@ -1,0 +1,105 @@
+# BimodalMath 75M recipe for Google AI Pro on Colab G4 (RTX PRO 6000 Blackwell, 96 GB).
+#
+# Budget: 100 compute units / month, about 6.7 CU/h on G4 (~15 GPU hours).
+#   Stage 1  vision + decoder pretraining        ~22 CU  (~3.2 h, one session)
+#   Stage 2  end-to-end bimodal training         ~42 CU  (~6 h, two 3 h sessions)
+#   Stage 3  hard-example structure-reward GRPO  ~18 CU  (~2.7 h, one session)
+#   Reserve                                      ~18 CU  (restarts, re-validation, export)
+# Hard-example mining for Stage 3 runs locally (`train_bimodal.py --mine-hard`) and costs 0 CU.
+#
+# Every session is capped by --max-wall-minutes (runtime.default_max_wall_minutes). On the cap
+# the trainer writes recovery.pt, syncs to Drive, reports state "paused_wall_limit" and exits 0;
+# the next session resumes with --resume auto.
+
+seed: 1337
+
+model:
+  preset: bimodal_75m
+  position_encoding: relative
+  coverage: true
+  r2l_decoder_layers: 3
+  max_points: 2048
+  max_tokens: 512
+  vision_backbone: convnext_tiny.fb_in22k_ft_in1k_384
+  vision_pretrained: true
+
+# Stage 1: rendered/offline strips only. The stroke encoder is skipped (modality_mode: vision).
+stage1:
+  epochs: 10
+  batch_size: 192
+  grad_accum: 1
+  lr: 3.0e-4
+  vision_lr: 1.0e-4          # convnext backbone; projection/fusion/decoders use lr
+  weight_decay: 0.01         # never applied to biases, norms, gates or modality embeddings
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.05         # cosine floor as a fraction of the peak learning rate
+  label_smoothing: 0.02
+  r2l_weight: 0.3
+  modality_mode: vision
+  use_upsample_hint: true    # repeat samples by their shard upsample_hint (CROHME x3)
+  ema_decay: 0.999           # EMA weights drive validation and best.pt
+  max_tokens: 256
+  grad_clip: 1.0
+  num_workers: 4
+  amp_dtype: bfloat16
+
+# Stage 2: ink + strip, initialised from Stage 1 best.pt (EMA). Structural heads start fresh.
+stage2:
+  epochs: 18                 # includes the cooldown epochs below
+  cooldown_epochs: 2         # last 2 epochs: clean human data only, constant cooldown_lr, EMA kept
+  cooldown_lr: 3.0e-5
+  batch_size: 128
+  grad_accum: 1
+  lr: 2.0e-4
+  vision_lr: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  label_smoothing: 0.02
+  r2l_weight: 0.3
+  modality_mode: auto
+  vision_drop_prob: 0.15     # rows with both streams lose vision with this probability
+  stroke_drop_prob: 0.15     # ... or lose ink with this probability
+  use_upsample_hint: true
+  ema_decay: 0.999
+  max_tokens: 256
+  grad_clip: 1.0
+  num_workers: 4
+  amp_dtype: bfloat16
+  structure_loss_weights:    # stroke_structure auxiliary heads on annotated CROHME ink
+    symbol: 0.2
+    group: 0.1
+    relation: 0.1
+
+# Stage 3: GRPO on mined hard examples (stage3_hard/) with clean human anchors.
+stage3:
+  epochs: 3
+  batch_size: 16             # prompts per micro-step; x group_size = 128 rollouts
+  grad_accum: 2              # 32 prompts / 256 rollouts per optimizer update
+  group_size: 8
+  temperature: 0.85
+  top_p: 0.95
+  max_gen_tokens: 160
+  lr: 1.5e-5
+  kl_beta: 0.04              # exact per-token KL(policy || frozen Stage 2 reference)
+  sft_anchor_weight: 0.25    # teacher-forced CE on the human rows of each batch
+  clip_eps: 0.2
+  reward_weights:
+    exact_norm: 1.0          # normalized LaTeX matches the reference
+    strict_case_bonus: 0.25  # exact token match, case preserved (C/c, X/x, y/z, ./,)
+    structure_skeleton: 0.5  # 1 - normalized edit distance over structural tokens
+    edit_penalty: 0.5        # minus min(1, token edit distance / reference length)
+  ema_decay: 0.999
+  grad_clip: 1.0
+  num_workers: 4
+  amp_dtype: bfloat16
+
+validation:
+  batch_size: 64
+  max_gen_tokens: 256
+  eval_every_epochs: 1
+  primary_metric: normalized_exact   # higher is better; ties broken by lower token_cer
+
+runtime:
+  sync_every_minutes: 20
+  default_max_wall_minutes: 180
+  keep_last_checkpoints: 2           # epoch-NNN.pt snapshots kept locally alongside best/recovery

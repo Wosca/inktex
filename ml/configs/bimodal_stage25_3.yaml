@@ -1,0 +1,99 @@
+# BimodalMath 75M: Stage 2.5 polish + fixed Stage 3 GRPO on a local RTX 4070 Ti (12 GB).
+#
+#   Stage 2.5  python train_bimodal.py --stage 2 --config configs/bimodal_stage25_3.yaml --shards <shards>
+#                --output <run25> --init-from <run2>/epoch-017.pt
+#   Mining     python train_bimodal.py --mine-hard --config configs/bimodal_stage25_3.yaml --shards <shards>
+#                --init-from <run25>/best.pt --mine-sources crohme_train mathwriting_train --crohme-upsample 8
+#   Stage 3    python train_bimodal.py --stage 3 --config configs/bimodal_stage25_3.yaml --shards <shards>
+#                --output <run3> --init-from <run25>/best.pt
+#
+# Labels, validation references, rewards and mining all use tokenizer/standardize.py.
+
+seed: 1337
+standardize_labels: true
+
+model:
+  preset: bimodal_75m
+  position_encoding: relative
+  coverage: true
+  r2l_decoder_layers: 3
+  max_points: 2048
+  max_tokens: 512
+  vision_backbone: convnext_tiny.fb_in22k_ft_in1k_384
+  vision_pretrained: false   # every tensor comes from epoch-017.pt
+
+# Stage 2.5: stroke wake-up on clean human online ink, CROHME-balanced (~28% of draws).
+stage2:
+  epochs: 3                  # includes the cooldown epoch
+  cooldown_epochs: 1
+  cooldown_lr: 1.0e-5
+  cooldown_vision_drop_prob: 0.15
+  batch_size: 8
+  grad_accum: 8              # effective batch 64
+  allowed_sources: [crohme_train, mathwriting_train]
+  source_upsample:           # ~90k CROHME + ~230k MathWriting draws per epoch
+    crohme_train: 8.0
+    mathwriting_train: 1.0
+  shuffle_buffer: 4096       # spreads the CROHME repeats
+  lr: 2.5e-5                 # decoders, fusion, vision projection
+  stroke_lr: 8.0e-5
+  vision_lr: 5.0e-6          # convnext backbone
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.1
+  label_smoothing: 0.02
+  r2l_weight: 0.3
+  modality_mode: auto
+  vision_drop_prob: 0.50
+  stroke_drop_prob: 0.05
+  ema_decay: 0.999
+  max_tokens: 256
+  grad_clip: 1.0
+  num_workers: 4
+  amp_dtype: bfloat16
+  structure_loss_weights:
+    symbol: 0.25
+    group: 0.15
+    relation: 0.15
+
+# Stage 3: GRPO on mined clean-human hard examples; teacher forcing only on stage3_role=anchor rows.
+stage3:
+  epochs: 2
+  batch_size: 2              # prompts per micro-step; x group_size = 16 rollouts
+  grad_accum: 16             # 32 prompts / 256 rollouts per optimizer update
+  group_size: 8
+  temperature: 0.85
+  top_p: 0.95
+  max_gen_tokens: 160
+  freeze_vision: true
+  lr: 5.0e-6
+  stroke_lr: 5.0e-6
+  vision_lr: 0.0
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.1
+  kl_beta: 0.15
+  sft_anchor_weight: 0.15
+  r2l_anchor_weight: 0.05
+  clip_eps: 0.2
+  reward_weights:
+    exact_norm: 1.0
+    strict_case_bonus: 0.25
+    structure_skeleton: 0.5
+    edit_penalty: 0.5
+  ema_decay: 0.999
+  grad_clip: 1.0
+  num_workers: 2
+  amp_dtype: bfloat16
+
+validation:
+  batch_size: 64
+  max_gen_tokens: 256
+  eval_every_epochs: 1
+  eval_every_steps: 1000     # --eval-every-steps overrides; use ~150 for Stage 3
+  log_modalities: true       # also vision-only and stroke-only on val_dev
+  primary_metric: normalized_exact
+
+runtime:
+  sync_every_minutes: 30
+  default_max_wall_minutes: 0
+  keep_last_checkpoints: 3
