@@ -4,6 +4,8 @@
     python train_bimodal.py --stage 2 --shards <shards> --output <run2> --init-from <run1>/best.pt
     python train_bimodal.py --stage 2 --config configs/bimodal_stage25_3.yaml --shards <shards> --output <run25> \
         --init-from <run2>/epoch-017.pt
+    python train_bimodal.py --stage 2 --config configs/bimodal_stage26.yaml --shards <shards> --output <run26> \
+        --init-from <run25>/best.pt [--teacher-checkpoint <stroke2latex>/best.pt]
     python train_bimodal.py --mine-hard --shards <shards> --init-from <run2>/best.pt
     python train_bimodal.py --stage 3 --shards <shards> --output <run3> --init-from <run2>/best.pt
     python train_bimodal.py --eval-only --shards <shards> --init-from <run>/best.pt
@@ -39,15 +41,17 @@ from torch.utils.data import DataLoader
 import yaml
 
 from data.bimodal_shards import (
-    SYNTHETIC_SOURCES, BimodalEvalDataset, BimodalShardDataset, ShardWriter, collate_bimodal_batch, iter_shard,
-    resolve_shards, sha256_file,
+    SYNTHETIC_SOURCES, BimodalAugmentConfig, BimodalEvalDataset, BimodalShardDataset, ShardWriter,
+    collate_bimodal_batch, iter_shard, resolve_shards, sha256_file,
 )
+from data.preprocessing import PreprocessingConfig
 from evaluation.recognition import canonical
 from model.bimodal import BimodalMathModel, BimodalModelConfig, get_bimodal_config
 from model.stroke_structure import structure_loss
 from tokenizer.latex_tokenizer import LatexTokenizer, canonicalize_latex_tokens, tokenize_latex
 from tokenizer.standardize import standardize_latex
 from training.benchmark_metrics import reference_tokens
+from training.checkpoint import load_checkpoint
 from training.losses import sequence_cross_entropy
 from training.metrics import edit_distance
 from training.recovery import atomic_json, restore_rng, rng_state
@@ -68,7 +72,7 @@ DEFAULT_REWARD_WEIGHTS = {"exact_norm": 1.0, "strict_case_bonus": 0.25, "structu
 PLACEHOLDER_MARKS = ("xxx", "your", "placeholder", "changeme", "token_here", "<", "...")
 BATCH_TENSORS = ("images", "image_widths", "stroke_features", "stroke_padding_mask", "has_strokes", "has_timing",
                  "tokens", "token_padding_mask", "r2l_tokens", "r2l_token_padding_mask", "synthetic", "is_anchor",
-                 "has_stage3_role")
+                 "has_stage3_role", "teacher_features", "teacher_padding_mask")
 SYNC_FAILED_EXIT = 75
 
 
@@ -626,6 +630,80 @@ def structure_record(targets: dict[str, torch.Tensor] | None, symbols: int, rela
             "relations_available": edges is not None}
 
 
+class TeacherKD:
+    """Frozen stroke-only ``Stroke2Latex`` distilled into the student on the vocabulary both share.
+
+    The teacher reads ``batch["teacher_features"]``: the augmented ink re-expressed in its own
+    preprocessing (``data.bimodal_shards.teacher_stroke_features``).
+    """
+
+    def __init__(self, model: torch.nn.Module, teacher: LatexTokenizer, student: LatexTokenizer,
+                 preprocessing: PreprocessingConfig, device: torch.device, amp_dtype: str | None):
+        self.device, self.amp, self.preprocessing = device, amp_dtype, preprocessing
+        self.model = model.to(device).eval().requires_grad_(False)
+        if device.type == "cuda" and amp_dtype in ("bfloat16", "bf16"):
+            self.model.to(dtype=torch.bfloat16)
+        self.max_points, self.max_tokens = int(model.config.max_points), int(model.config.max_tokens)
+        self.pad_id = student.pad_id
+        mapping = torch.tensor([teacher.token_to_id.get(token, -1) for token in student.tokens], dtype=torch.long)
+        excluded = {student.pad_id, student.bos_id, student.unk_id}
+        shared = [index for index, target in enumerate(mapping.tolist()) if target >= 0 and index not in excluded]
+        self.student_to_teacher = mapping.to(device)
+        self.teacher_input = torch.where(mapping >= 0, mapping, torch.tensor(teacher.unk_id)).to(device)
+        self.shared_student_ids = torch.tensor(shared, dtype=torch.long, device=device)
+        self.shared_teacher_ids = mapping[shared].to(device)
+        to_shared = torch.full((len(student),), -1, dtype=torch.long)
+        to_shared[shared] = torch.arange(len(shared))
+        self.student_to_shared = to_shared.to(device)
+
+    @classmethod
+    def load(cls, path: str | Path, student: LatexTokenizer, device: torch.device,
+             amp_dtype: str | None) -> "TeacherKD":
+        model, teacher, preprocessing, _ = load_checkpoint(path)
+        return cls(model, teacher, student, preprocessing, device, amp_dtype)
+
+    def summary(self) -> dict[str, Any]:
+        return {"parameters": sum(parameter.numel() for parameter in self.model.parameters()),
+                "shared_tokens": len(self.shared_student_ids), "max_points": self.max_points,
+                "max_tokens": self.max_tokens, "normalization": self.preprocessing.normalization}
+
+    def __call__(self, batch: dict[str, Any], student_logits: torch.Tensor, temperature: float,
+                 min_target_prob: float) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = student_logits.new_zeros((), dtype=torch.float32)
+        features = batch.get("teacher_features")
+        if features is None:
+            return zero, {"kd_rows": 0.0}
+        padding = batch["teacher_padding_mask"]
+        points = (~padding).sum(1)
+        token_lengths = (~batch["token_padding_mask"]).sum(1)
+        eligible = (batch["has_strokes"] & points.gt(0) & points.le(self.max_points)
+                    & token_lengths.le(self.max_tokens))
+        rows = eligible.nonzero().squeeze(1)
+        if not len(rows):
+            return zero, {"kd_rows": 0.0}
+        width = int(points[rows].max())
+        length = min(int(token_lengths[rows].max()) - 1, student_logits.shape[1])
+        tokens = batch["tokens"][rows]
+        with torch.no_grad(), autocast(self.device, self.amp):
+            teacher_logits = self.model(features[rows, :width], padding[rows, :width],
+                                        self.teacher_input[tokens[:, :length]],
+                                        batch["token_padding_mask"][rows, :length])
+        teacher_logits = teacher_logits.float()[..., self.shared_teacher_ids]
+        student_shared = student_logits[rows, :length].float()[..., self.shared_student_ids]
+        targets = tokens[:, 1:length + 1]
+        valid = targets.ne(self.pad_id)
+        shared_targets = self.student_to_shared[targets]
+        target_prob = teacher_logits.softmax(-1).gather(-1, shared_targets.clamp_min(0)[..., None]).squeeze(-1)
+        mask = valid & shared_targets.ge(0) & target_prob.ge(min_target_prob)
+        teacher_log = (teacher_logits / temperature).log_softmax(-1)
+        student_log = (student_shared / temperature).log_softmax(-1)
+        divergence = (teacher_log.exp() * (teacher_log - student_log)).sum(-1) * temperature ** 2
+        count = mask.sum()
+        loss = torch.where(mask, divergence, torch.zeros_like(divergence)).sum() / count.clamp_min(1)
+        return loss, {"kd_loss": float(loss.detach()), "kd_coverage": float(count) / max(1, int(valid.sum())),
+                      "kd_rows": float(len(rows))}
+
+
 # --------------------------------------------------------------------------- scoring
 
 
@@ -863,6 +941,9 @@ class Trainer:
         self.epoch_stats = Accumulator()
         self.reference_checkpoint: str | None = None
         self.ref_model: BimodalMathModel | None = None
+        if getattr(args, "teacher_checkpoint", None):
+            self.cfg["teacher_checkpoint"] = str(args.teacher_checkpoint)
+        self.teacher: TeacherKD | None = None
         self.state = "starting"
 
     # ----------------------------------------------------------------- state
@@ -981,6 +1062,13 @@ class Trainer:
             if self.device.type == "cuda":
                 self.ref_model.to(dtype=torch.bfloat16)
 
+        teacher_path = self.cfg.get("teacher_checkpoint")
+        if teacher_path and self.stage == 2 and max(self.kd_weight(False), self.kd_weight(True)) > 0:
+            self.teacher = TeacherKD.load(teacher_path, self.tokenizer, self.device, self.amp)
+            log(f"teacher: {teacher_path} {json.dumps(self.teacher.summary())}")
+        elif teacher_path:
+            log(f"teacher: {teacher_path} unused (stage {self.stage}, teacher_kd_weight 0)")
+
         lr = float(self.cfg.get("lr", 1e-4))
         vision_lr = float(self.cfg.get("vision_lr", lr))
         stroke_lr = float(self.cfg["stroke_lr"]) if self.cfg.get("stroke_lr") is not None else None
@@ -1025,6 +1113,8 @@ class Trainer:
             "init_report": {key: value if isinstance(value, int) else len(value)
                             for key, value in (self.init_report or {}).items()},
             "reference_checkpoint": self.reference_checkpoint, "standardize_labels": self.standardize,
+            "teacher_checkpoint": str(self.cfg["teacher_checkpoint"]) if self.cfg.get("teacher_checkpoint") else None,
+            "teacher": self.teacher.summary() if self.teacher is not None else None,
             "tokenizer_sha256": self.tokenizer_sha, "manifest_sha256": self.manifest_sha})
 
     @property
@@ -1054,6 +1144,21 @@ class Trainer:
 
     def is_cooldown(self, epoch: int) -> bool:
         return self.cooldown_epochs > 0 and epoch >= self.epochs - self.cooldown_epochs
+
+    def kd_weight(self, cooldown: bool) -> float:
+        override = self.cfg.get("cooldown_teacher_kd_weight") if cooldown else None
+        return float(self.cfg.get("teacher_kd_weight", 0.0) if override is None else override)
+
+    def augment_config(self, cooldown: bool) -> BimodalAugmentConfig | None:
+        values = self.cfg.get("augment")
+        if cooldown and self.cfg.get("cooldown_augment") is not None:
+            values = {**(values or {}), **self.cfg["cooldown_augment"]}
+        if values is None:
+            return None
+        config = BimodalAugmentConfig.from_dict(values)
+        if cooldown and self.cfg.get("cooldown_disable_band_mask"):
+            config.vision_band_mask_prob = 0.0
+        return config
 
     def estimate_samples(self, clean: bool) -> int:
         if self.stage == 3:
@@ -1155,7 +1260,9 @@ class Trainer:
             max_tokens=max_tokens, use_upsample_hint=bool(self.cfg.get("use_upsample_hint", False)),
             allowed_sources=self.cfg.get("allowed_sources"), source_upsample=self.cfg.get("source_upsample"),
             standardize_labels=self.standardize, skip_batches=skip, batch_size=batch_size,
-            loader_workers=self.workers)
+            loader_workers=self.workers, augment=self.augment_config(cooldown),
+            teacher_preprocessing=self.teacher.preprocessing
+            if self.teacher is not None and self.kd_weight(cooldown) > 0 else None)
         dataset.set_epoch(epoch)
         options: dict[str, Any] = {}
         if self.workers:
@@ -1201,6 +1308,12 @@ class Trainer:
         ce = sequence_cross_entropy(out["logits"], tokens[:, 1:], pad, smoothing)
         loss = ce
         stats = {"ce": float(ce.detach())}
+        kd_weight = self.kd_weight(cooldown)
+        if self.teacher is not None and kd_weight > 0:
+            kd, kd_stats = self.teacher(batch, out["logits"], float(cfg.get("teacher_kd_temp", 2.0)),
+                                        float(cfg.get("teacher_kd_min_target_prob", 0.05)))
+            loss = loss + kd_weight * kd
+            stats.update(kd_stats)
         if use_r2l:
             r2l = sequence_cross_entropy(out["r2l_logits"], batch["r2l_tokens"][:, 1:], pad, smoothing)
             loss = loss + r2l_weight * r2l
@@ -1444,8 +1557,8 @@ class Trainer:
                 if self.global_step % log_every == 0:
                     rate = window_samples / max(1e-6, time.perf_counter() - window_start)
                     shown = " ".join(f"{key}={value:.4f}" for key, value in stats.items()
-                                     if key in ("loss", "ce", "r2l_ce", "structure", "reward", "reward_std", "kl",
-                                                "anchor_ce", "r2l_anchor_ce"))
+                                     if key in ("loss", "ce", "r2l_ce", "structure", "kd_loss", "kd_coverage",
+                                                "reward", "reward_std", "kl", "anchor_ce", "r2l_anchor_ce"))
                     rates = "/".join(f"{group['lr']:.2e}" for group in self.optimizer.param_groups
                                      if not group["name"].endswith("no_decay")) \
                         or f"{self.optimizer.param_groups[0]['lr']:.2e}"
@@ -1708,6 +1821,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="directory with manifest.json, tokenizer.json, stage1_train/, stage2_train/, val_dev/")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--init-from", "--checkpoint", dest="init_from", type=Path)
+    parser.add_argument("--teacher-checkpoint", type=Path,
+                        help="frozen Stroke2Latex for shared-vocab logit distillation (overrides teacher_checkpoint)")
     parser.add_argument("--resume", help="'auto' or a recovery.pt path")
     parser.add_argument("--max-wall-minutes", type=float, help="0 = unlimited; default runtime.default_max_wall_minutes")
     parser.add_argument("--drive-sync-dir", type=Path)

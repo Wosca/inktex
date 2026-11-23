@@ -6,7 +6,7 @@ from pathlib import Path
 import shutil
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -18,9 +18,11 @@ from data.bimodal_raster import (
 )
 from data.bimodal_shards import (
     SYNTHETIC_SOURCES, BimodalAugmentConfig, BimodalEvalDataset, BimodalShardDataset, augment_stroke_features,
-    collate_bimodal_batch, iter_shard, sha256_file, verify_manifest_checksums,
+    collate_bimodal_batch, iter_shard, mask_vision_bands, sample_affine, sha256_file, stroke_bounds,
+    teacher_stroke_features, verify_manifest_checksums, warp_image, warp_stroke_features,
 )
-from data.preprocessing import FEATURE_NAMES
+from data.preprocessing import FEATURE_NAMES, PreprocessingConfig, preprocess_example
+from data.schema import Stroke, StrokeExpression, StrokePoint
 from tokenizer.latex_tokenizer import LatexTokenizer
 
 LABELS = ["x+1", "a^{2}+b^{2}", r"\frac{1}{2}", "y=2x", "z_{1}", "C+c", r"\gamma r", "8f", "u+v", "X-x",
@@ -508,6 +510,188 @@ def test_timing_dropout_statistics(packed):
     evaluation = BimodalShardDataset(packed, stage="stage2", train=False)
     timed_eval = [sample for sample in evaluation if sample["has_timing"]]
     assert timed_eval and all(sample["stroke_features"][:, 4].any() for sample in timed_eval)
+
+
+def ink_expression(strokes, *, timed: bool = True) -> StrokeExpression:
+    clock, parts = 0.0, []
+    for stroke in strokes:
+        points = []
+        for x, y in stroke:
+            points.append(StrokePoint(float(x), float(y), time=clock if timed else None))
+            clock += 12.0
+        clock += 150.0
+        parts.append(Stroke(points))
+    return StrokeExpression("aug", "x", "x", parts, "external", "crohme")
+
+
+def packed_features(strokes, *, timed: bool = True, config: PreprocessingConfig = pack.PREPROCESSING) -> np.ndarray:
+    return preprocess_example(ink_expression(strokes, timed=timed), config).features.astype(np.float16) \
+        .astype(np.float32)
+
+
+def strip_array(strokes) -> tuple[np.ndarray, int]:
+    image, width = pack._render_online(strokes)
+    return decode_png(encode_png(image)), width
+
+
+def ink_overlap(left: np.ndarray, right: np.ndarray) -> float:
+    """IoU of slightly dilated ink masks (pen-width rounding is not a geometry error)."""
+    width = max(left.shape[-1], right.shape[-1])
+    masks = []
+    for image in (left, right):
+        canvas = np.zeros((image.shape[1], width), dtype=np.uint8)
+        canvas[:, :image.shape[-1]] = np.where(image[0] > 32, 255, 0)
+        masks.append(np.asarray(Image.fromarray(canvas).filter(ImageFilter.MaxFilter(5))) > 0)
+    return float((masks[0] & masks[1]).sum() / max(1, (masks[0] | masks[1]).sum()))
+
+
+def rotation(degrees: float, shear: float = 0.0, sx: float = 1.0, sy: float = 1.0) -> np.ndarray:
+    angle = np.radians(degrees)
+    turn = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+    return turn @ np.array([[1.0, shear], [0.0, 1.0]]) @ np.diag([sx, sy])
+
+
+def test_augment_config_defaults_stay_legacy_and_yaml_lists_become_tuples():
+    default = BimodalAugmentConfig()
+    assert not default.coupled_geometry and default.rotation_degrees == default.shear == 0.0
+    assert default.point_dropout == default.stroke_jitter == default.vision_band_mask_prob == 0.0
+    assert BimodalAugmentConfig.from_dict(None) == default == BimodalAugmentConfig.from_dict({})
+    config = BimodalAugmentConfig.from_dict({"coupled_geometry": True, "anisotropic_scale": [0.88, 1.12],
+                                             "vision_band_mask_count": [1, 2], "intensity_jitter": 0.12})
+    assert config.anisotropic_scale == (0.88, 1.12) and config.vision_band_mask_count == (1, 2)
+    assert config.coupled_geometry and config.intensity_jitter == 0.12 and config.timing_dropout == 0.5
+    with pytest.raises(ValueError, match="rotation"):
+        BimodalAugmentConfig.from_dict({"rotation": 4.5})
+
+
+@pytest.mark.parametrize("matrix", [rotation(8.0), rotation(-6.0, shear=0.12), rotation(3.0, 0.08, 1.12, 0.9)])
+def test_coupled_geometry_moves_strip_and_ink_the_same_way(matrix):
+    strokes = glyph_strokes(21, glyphs=4)
+    image, width = strip_array(strokes)
+    features = packed_features(strokes)
+    plain = BimodalAugmentConfig()
+    assert ink_overlap(image, strip_array(pack.feature_strokes(features))[0]) > 0.8
+    warped_image, warped_width = warp_image(image, width, matrix)
+    assert warped_image.dtype == np.uint8 and warped_image.shape[1] == 128 and warped_image.shape[2] % 16 == 0
+    assert 16 <= warped_width <= warped_image.shape[2] <= 640
+    rng = np.random.default_rng(0)
+    same = strip_array(pack.feature_strokes(warp_stroke_features(features, matrix, rng, plain)))[0]
+    mirrored = matrix.copy()
+    mirrored[0, 1], mirrored[1, 0] = matrix[1, 0], matrix[0, 1]
+    other = strip_array(pack.feature_strokes(warp_stroke_features(features, mirrored, rng, plain)))[0]
+    assert ink_overlap(warped_image, same) > 0.7
+    assert ink_overlap(warped_image, same) > ink_overlap(warped_image, other) + 0.4
+
+
+def test_coupled_ink_keeps_strokes_flags_timing_and_glyph_normalization():
+    line = np.stack([np.linspace(0, 240, 60), np.full(60, 40.0)], axis=1)
+    strokes = [line, *glyph_strokes(5), line[::-1] + [0, 90]]
+    features = packed_features(strokes)
+    bounds = stroke_bounds(features)
+    config = BimodalAugmentConfig(coupled_geometry=True, rotation_degrees=4.5, shear=0.08,
+                                  anisotropic_scale=(0.88, 1.12), stroke_jitter=0.002, point_dropout=0.5,
+                                  timing_dropout=0.0, time_scale=(1.0, 1.0))
+    total_ms = np.expm1(features[:, 4].astype(np.float64) * np.log1p(2000.0)).sum()
+    rng = np.random.default_rng(3)
+    for _ in range(25):
+        out = augment_stroke_features(features, True, rng, config, sample_affine(rng, config))
+        assert out.dtype == np.float32 and out.shape[1] == 10 and len(out) < len(features)
+        kept = stroke_bounds(out)
+        assert len(kept) == len(bounds) == int((out[:, 7] > 0.5).sum()) == int((out[:, 8] > 0.5).sum())
+        assert all(out[a, 7] == 1 and out[b - 1, 8] == 1 for a, b in kept)
+        assert np.array_equal(out[[a for a, _ in kept], 9], features[[a for a, _ in bounds], 9])
+        delta = np.diff(out[:, :2], axis=0)
+        inside = out[1:, 7] < 0.5
+        assert np.allclose(out[1:, 2:4][inside], delta[inside], atol=1e-5)
+        assert not out[out[:, 7] > 0.5, 2:4].any()
+        assert np.allclose(out[0, :2], features[0, :2], atol=0.02)
+        assert np.expm1(out[:, 4].astype(np.float64) * np.log1p(2000.0)).sum() == pytest.approx(total_ms, rel=2e-3)
+        heights = [np.ptp(out[a:b, 1]) for a, b in kept if np.ptp(out[a:b, 1]) > 1e-9]
+        assert np.median(heights) == pytest.approx(1.0, rel=0.15)
+    legacy = augment_stroke_features(features, True, np.random.default_rng(1), BimodalAugmentConfig())
+    assert len(legacy) == len(features) and np.array_equal(legacy[:, 7:], features[:, 7:])
+
+
+def test_coupled_dataset_keeps_stroke_counts_structure_and_strip_contract(packed):
+    config = BimodalAugmentConfig.from_dict({
+        "coupled_geometry": True, "rotation_degrees": 4.5, "shear": 0.08, "anisotropic_scale": [0.88, 1.12],
+        "stroke_jitter": 0.002, "point_dropout": 0.3, "vision_band_mask_prob": 0.5, "morphology_probability": 0.35,
+        "intensity_jitter": 0.12})
+    clean = {sample["id"]: sample for sample in BimodalShardDataset(packed, stage="stage2", train=False)}
+    dataset = BimodalShardDataset(packed, stage="stage2", seed=2, augment=config)
+    structured = inked = 0
+    for epoch in range(3):
+        dataset.set_epoch(epoch)
+        for sample in dataset:
+            ink, order = sample["image"].numpy()
+            assert ink.shape[0] == 128 and ink.shape[1] <= 640
+            assert 16 <= sample["image_width"] <= ink.shape[1]
+            assert order[ink == 0].max(initial=0) == 0
+            features = sample["stroke_features"]
+            if features is None:
+                assert not order.any()
+                continue
+            inked += 1
+            assert ink.shape[1] % 16 == 0
+            assert order[ink > 0].min(initial=1) >= 1
+            starts = int((features[:, 7] > 0.5).sum())
+            assert starts == int((clean[sample["id"]]["stroke_features"][:, 7] > 0.5).sum())
+            if sample["structure_targets"] is not None:
+                structured += 1
+                assert starts == len(sample["structure_targets"]["stroke_group_ids"])
+    assert inked > 50 and structured == 9
+    batch = collate_bimodal_batch(list(dataset)[:16])
+    assert batch["teacher_features"] is None and batch["teacher_padding_mask"] is None
+
+
+def test_vision_band_mask_hits_ink_strips_only(packed):
+    full = np.full((2, 128, 64), 200, dtype=np.uint8)
+    capped = BimodalAugmentConfig(vision_band_mask_prob=1.0, vision_band_mask_count=(3, 3),
+                                  vision_band_mask_width=(40, 40))
+    for seed in range(20):
+        out = mask_vision_bands(full, 64, np.random.default_rng(seed), capped)
+        blank = ~out.any(axis=(0, 1))
+        assert 0 < blank.sum() <= 16 and np.array_equal(out[0] == 0, out[1] == 0)
+    assert mask_vision_bands(full, 64, np.random.default_rng(0), BimodalAugmentConfig()) is full
+
+    config = BimodalAugmentConfig(image_probability=0.0, vision_band_mask_prob=1.0)
+    clean = {sample["id"]: sample for sample in BimodalShardDataset(packed, stage="stage2", train=False)}
+    offline = masked = 0
+    for sample in BimodalShardDataset(packed, stage="stage2", seed=4, augment=config):
+        before, after = clean[sample["id"]]["image"].numpy(), sample["image"].numpy()
+        if sample["stroke_features"] is None:
+            offline += 1
+            assert np.array_equal(before, after)
+            continue
+        changed = (before != after).any(axis=(0, 1))
+        assert not changed[sample["image_width"]:].any() and changed.sum() <= 0.25 * sample["image_width"]
+        assert not after[:, :, changed].any()
+        masked += bool(changed.any())
+    assert offline > 0 and masked > 0
+
+
+def test_teacher_features_follow_the_teacher_preprocessing():
+    strokes = glyph_strokes(11, glyphs=4)
+    glyph = packed_features(strokes)
+    teacher = PreprocessingConfig(min_resampled_points_per_stroke=8)
+    expected = preprocess_example(ink_expression(strokes), teacher).features
+    converted = teacher_stroke_features(glyph, teacher)
+    assert converted.dtype == np.float32 and converted.shape[1] == 10
+    assert len(stroke_bounds(converted)) == len(stroke_bounds(expected)) == len(strokes)
+    assert abs(len(converted) - len(expected)) <= 0.1 * len(expected) + len(strokes)
+    assert np.allclose(converted[:, :2].min(0), expected[:, :2].min(0), atol=0.02)
+    assert np.allclose(converted[:, :2].max(0), expected[:, :2].max(0), atol=0.02)
+    assert sorted(set(converted[:, 9].tolist())) == pytest.approx(sorted(set(expected[:, 9].tolist())))
+    assert not converted[converted[:, 7] > 0.5, 2:4].any() and not converted[:, 5:7].any()
+
+    def total_ms(values):
+        return np.expm1(values[:, 4].astype(np.float64) * np.log1p(2000.0)).sum()
+
+    assert total_ms(converted) == pytest.approx(total_ms(expected), rel=0.02)
+    untimed = teacher_stroke_features(packed_features(strokes, timed=False), teacher)
+    assert not untimed[:, 4].any()
+    budget = teacher_stroke_features(glyph, PreprocessingConfig(max_points=40, min_resampled_points_per_stroke=8))
+    assert len(budget) <= 40 and len(stroke_bounds(budget)) == len(strokes)
 
 
 def test_epoch_shuffle_is_deterministic(packed):

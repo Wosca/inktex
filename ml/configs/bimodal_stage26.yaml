@@ -1,0 +1,88 @@
+# BimodalMath 75M: Stage 2.6 single-model polish on a local RTX 4070 Ti (12 GB).
+#
+#   python train_bimodal.py --stage 2 --config configs/bimodal_stage26.yaml --shards <shards> --output <run26> \
+#       --init-from E:/math-recogniser-training/bimodal_75m_v1/stage25/best.pt
+#
+# Coupled strip + ink geometry, vision band masking and agreement-gated logit distillation from the
+# frozen stroke-only Stroke2Latex teacher (shared vocabulary, teacher's own ink preprocessing).
+# The architecture is unchanged, so best.pt stays drop-in for export/export_onnx.py.
+
+seed: 1337
+standardize_labels: true
+
+model:
+  preset: bimodal_75m
+  position_encoding: relative
+  coverage: true
+  r2l_decoder_layers: 3
+  max_points: 2048
+  max_tokens: 512
+  vision_backbone: convnext_tiny.fb_in22k_ft_in1k_384
+  vision_pretrained: false   # every tensor comes from stage25/best.pt
+
+stage2:
+  standardize_labels: true
+  epochs: 5                  # includes the cooldown epoch
+  cooldown_epochs: 1
+  cooldown_lr: 8.0e-6
+  cooldown_vision_drop_prob: 0.15
+  cooldown_disable_band_mask: true
+  cooldown_teacher_kd_weight: 0.15
+  batch_size: 8
+  grad_accum: 8              # effective batch 64
+  allowed_sources: [crohme_train, mathwriting_train]
+  source_upsample:
+    crohme_train: 8.0
+    mathwriting_train: 1.0
+  shuffle_buffer: 4096
+  lr: 2.0e-5
+  stroke_lr: 6.0e-5
+  vision_lr: 4.0e-6
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.1
+  label_smoothing: 0.02
+  r2l_weight: 0.3
+  modality_mode: auto
+  vision_drop_prob: 0.45
+  stroke_drop_prob: 0.05
+  ema_decay: 0.999
+  max_tokens: 256
+  grad_clip: 1.0
+  num_workers: 4
+  amp_dtype: bfloat16
+  structure_loss_weights:
+    symbol: 0.25
+    group: 0.15
+    relation: 0.15
+  teacher_checkpoint: E:/math-recogniser-training/checkpoints/crohme_teacher_20260926_pretrain/best.pt
+  teacher_kd_weight: 0.35
+  teacher_kd_temp: 2.0
+  teacher_kd_min_target_prob: 0.05
+  augment:
+    coupled_geometry: true
+    rotation_degrees: 4.5
+    shear: 0.08
+    anisotropic_scale: [0.88, 1.12]
+    stroke_jitter: 0.002
+    point_dropout: 0.015
+    vision_band_mask_prob: 0.5
+    vision_band_mask_count: [1, 2]
+    vision_band_mask_width: [16, 40]
+    vision_band_mask_max_fraction: 0.25
+    timing_dropout: 0.5
+    morphology_probability: 0.35
+    intensity_jitter: 0.12
+
+validation:
+  batch_size: 64
+  max_gen_tokens: 256
+  eval_every_epochs: 1
+  eval_every_steps: 1000
+  log_modalities: true
+  primary_metric: normalized_exact
+
+runtime:
+  sync_every_minutes: 30
+  default_max_wall_minutes: 0
+  keep_last_checkpoints: 3

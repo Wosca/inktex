@@ -25,8 +25,14 @@ import yaml
 
 import train_bimodal
 from data.bimodal_raster import encode_png, render_strokes_to_strip
-from data.bimodal_shards import ShardWriter, collate_bimodal_batch, encode_npz, iter_shard, sha256_file
+from data.bimodal_shards import (
+    BimodalAugmentConfig, ShardWriter, collate_bimodal_batch, encode_npz, iter_shard, sha256_file,
+    teacher_stroke_features,
+)
+from data.preprocessing import PreprocessingConfig
 from model.bimodal import BimodalMathModel, BimodalModelConfig
+from model.stroke2latex import ModelConfig, Stroke2Latex
+from training.checkpoint import save_checkpoint
 from model.stroke_structure import structure_loss
 from tokenizer.latex_tokenizer import LatexTokenizer
 from tokenizer.normalization import LABEL_VERSION, normalize_training_latex
@@ -36,6 +42,7 @@ from tools import export_drive_ids
 ML = Path(__file__).resolve().parents[1]
 CONFIG = ML / "configs" / "bimodal_g4.yaml"
 STAGE25_CONFIG = ML / "configs" / "bimodal_stage25_3.yaml"
+STAGE26_CONFIG = ML / "configs" / "bimodal_stage26.yaml"
 NOTEBOOK = ML / "colab" / "train_bimodal_g4.ipynb"
 DATASETS = Path(r"E:\math-recogniser-datasets")
 LABELS = ["x+1", "a^{2}+b^{2}", r"\frac{1}{2}", "y=2x", "z_{1}", "C+c", r"\sqrt{2}", "1,2", "X-x", "u+v"]
@@ -301,6 +308,169 @@ def test_stage25_3_recipe_matches_local_plan():
     assert validation["eval_every_steps"] == 1000 and validation["log_modalities"] is True
     assert config["runtime"] == {"sync_every_minutes": 30, "default_max_wall_minutes": 0,
                                  "keep_last_checkpoints": 3}
+
+
+def test_stage26_recipe_matches_local_plan():
+    config = yaml.safe_load(STAGE26_CONFIG.read_text(encoding="utf-8"))
+    stage25 = yaml.safe_load(STAGE25_CONFIG.read_text(encoding="utf-8"))
+    assert config["seed"] == 1337 and config["standardize_labels"] is True
+    assert config["model"] == stage25["model"] and set(config) == {"seed", "standardize_labels", "model", "stage2",
+                                                                    "validation", "runtime"}
+    two = config["stage2"]
+    assert two["standardize_labels"] is True
+    assert (two["epochs"], two["cooldown_epochs"], two["cooldown_lr"], two["cooldown_vision_drop_prob"]) == \
+        (5, 1, 8.0e-6, 0.15)
+    assert two["cooldown_disable_band_mask"] is True and two["cooldown_teacher_kd_weight"] == 0.15
+    assert (two["batch_size"], two["grad_accum"], two["shuffle_buffer"]) == (8, 8, 4096)
+    assert two["allowed_sources"] == ["crohme_train", "mathwriting_train"]
+    assert two["source_upsample"] == {"crohme_train": 8.0, "mathwriting_train": 1.0}
+    assert (two["lr"], two["stroke_lr"], two["vision_lr"], two["weight_decay"], two["warmup_ratio"],
+            two["min_lr_ratio"]) == (2.0e-5, 6.0e-5, 4.0e-6, 0.01, 0.05, 0.1)
+    assert (two["label_smoothing"], two["r2l_weight"], two["modality_mode"], two["vision_drop_prob"],
+            two["stroke_drop_prob"], two["ema_decay"]) == (0.02, 0.3, "auto", 0.45, 0.05, 0.999)
+    assert (two["max_tokens"], two["grad_clip"], two["num_workers"], two["amp_dtype"]) == (256, 1.0, 4, "bfloat16")
+    assert two["structure_loss_weights"] == {"symbol": 0.25, "group": 0.15, "relation": 0.15}
+    assert two["teacher_checkpoint"] == \
+        "E:/math-recogniser-training/checkpoints/crohme_teacher_20260926_pretrain/best.pt"
+    assert (two["teacher_kd_weight"], two["teacher_kd_temp"], two["teacher_kd_min_target_prob"]) == (0.35, 2.0, 0.05)
+    augment = BimodalAugmentConfig.from_dict(two["augment"])
+    assert augment.coupled_geometry and (augment.rotation_degrees, augment.shear) == (4.5, 0.08)
+    assert augment.anisotropic_scale == (0.88, 1.12) and augment.vision_band_mask_width == (16, 40)
+    assert (augment.stroke_jitter, augment.point_dropout, augment.vision_band_mask_prob,
+            augment.vision_band_mask_max_fraction) == (0.002, 0.015, 0.5, 0.25)
+    assert (augment.timing_dropout, augment.morphology_probability, augment.intensity_jitter) == (0.5, 0.35, 0.12)
+    assert config["validation"] == {"batch_size": 64, "max_gen_tokens": 256, "eval_every_epochs": 1,
+                                    "eval_every_steps": 1000, "log_modalities": True,
+                                    "primary_metric": "normalized_exact"}
+    trainer = SimpleNamespace(cfg=two)
+    assert train_bimodal.Trainer.kd_weight(trainer, False) == 0.35
+    assert train_bimodal.Trainer.kd_weight(trainer, True) == 0.15
+    assert train_bimodal.Trainer.augment_config(trainer, False).vision_band_mask_prob == 0.5
+    cooled = train_bimodal.Trainer.augment_config(trainer, True)
+    assert cooled.vision_band_mask_prob == 0.0 and cooled.coupled_geometry
+    milder = SimpleNamespace(cfg={**two, "cooldown_augment": {"rotation_degrees": 2.0}, "cooldown_teacher_kd_weight": None})
+    assert train_bimodal.Trainer.augment_config(milder, True).rotation_degrees == 2.0
+    assert train_bimodal.Trainer.kd_weight(milder, True) == 0.35
+    assert train_bimodal.Trainer.augment_config(SimpleNamespace(cfg={}), True) is None
+
+
+STUDENT_TOKENS = ["<PAD>", "<BOS>", "<EOS>", "<UNK>", "x", "+", "1", r"\foo", "y"]
+TEACHER_TOKENS = ["<PAD>", "<BOS>", "<EOS>", "<UNK>", "y", r"\bar", "1", "x", "+"]
+
+
+class FixedTeacher(torch.nn.Module):
+    """Returns preset teacher-vocabulary logits and records what it was fed."""
+
+    def __init__(self, logits: torch.Tensor, max_points: int, max_tokens: int):
+        super().__init__()
+        self.config = SimpleNamespace(max_points=max_points, max_tokens=max_tokens)
+        self.weight = torch.nn.Parameter(torch.zeros(()))
+        self.logits, self.calls = logits, []
+
+    def forward(self, features, padding, tokens, token_padding):
+        self.calls.append({"features": features, "padding": padding, "tokens": tokens,
+                           "token_padding": token_padding})
+        return self.logits + self.weight
+
+
+def kd_batch(student: LatexTokenizer) -> dict:
+    ids = student.token_to_id
+    rows = [["x", "+", "1"], ["y", r"\foo", "x"], ["1"], ["x"]]
+    sequences = [torch.tensor([student.bos_id, *[ids[token] for token in row], student.eos_id]) for row in rows]
+    tokens = torch.full((4, 5), student.pad_id)
+    for index, sequence in enumerate(sequences):
+        tokens[index, :len(sequence)] = sequence
+    points = [4, 3, 20, 0]
+    features = torch.zeros(4, 20, 10)
+    padding = torch.ones(4, 20, dtype=torch.bool)
+    for index, count in enumerate(points):
+        features[index, :count, :2] = torch.randn(count, 2)
+        padding[index, :count] = False
+    return {"tokens": tokens, "token_padding_mask": tokens.eq(student.pad_id),
+            "has_strokes": torch.tensor([True, True, True, False]),
+            "teacher_features": features, "teacher_padding_mask": padding}
+
+
+def test_teacher_kd_maps_shared_vocabulary_and_gates_on_agreement():
+    student, teacher = (LatexTokenizer.from_dict({"tokens": tokens}) for tokens in (STUDENT_TOKENS, TEACHER_TOKENS))
+    t = teacher.token_to_id
+    favoured = [["x", "+", "y", "<EOS>"], ["y", "x", "x", "<EOS>"]]
+    logits = torch.full((2, 4, len(teacher)), -4.0)
+    for row, names in enumerate(favoured):
+        for position, name in enumerate(names):
+            logits[row, position, t[name]] = 4.0
+    fixed = FixedTeacher(logits, max_points=16, max_tokens=8)
+    kd = train_bimodal.TeacherKD(fixed, teacher, student, PreprocessingConfig(), torch.device("cpu"), "float32")
+    assert kd.student_to_teacher.tolist() == [0, 1, 2, 3, 7, 8, 6, -1, 4]
+    assert kd.teacher_input.tolist() == [0, 1, 2, 3, 7, 8, 6, teacher.unk_id, 4]
+    assert kd.shared_student_ids.tolist() == [2, 4, 5, 6, 8] and kd.shared_teacher_ids.tolist() == [2, 7, 8, 6, 4]
+    assert kd.student_to_shared.tolist() == [-1, -1, 0, -1, 1, 2, 3, -1, 4]
+    assert kd.summary()["shared_tokens"] == 5 and not fixed.weight.requires_grad
+
+    batch = kd_batch(student)
+    student_logits = torch.randn(4, 4, len(student), requires_grad=True)
+    loss, stats = kd(batch, student_logits, temperature=2.0, min_target_prob=0.05)
+    call = fixed.calls[-1]
+    assert call["features"].shape == (2, 4, 10) and call["tokens"].shape == (2, 4)
+    assert call["tokens"][1].tolist() == [teacher.bos_id, t["y"], teacher.unk_id, t["x"]]
+    assert stats["kd_rows"] == 2 and stats["kd_coverage"] == pytest.approx(6 / 8)
+    assert loss > 0 and stats["kd_loss"] == pytest.approx(float(loss.detach()))
+    loss.backward()
+    grad = student_logits.grad
+    assert fixed.weight.grad is None
+    assert not grad[2:].any() and not grad[:, :, [0, 1, 3, 7]].any()
+    assert not grad[0, 2].any() and not grad[1, 1].any()
+    assert grad[0, 0].any() and grad[1, 0].any() and grad[1, 3].any()
+
+    matched = torch.full((4, 4, len(student)), -20.0)
+    matched[:2, :, kd.shared_student_ids] = logits[:, :, kd.shared_teacher_ids]
+    assert float(kd(batch, matched, 2.0, 0.05)[0]) == pytest.approx(0.0, abs=1e-6)
+    assert kd(batch, student_logits, 2.0, 0.0)[1]["kd_coverage"] == pytest.approx(7 / 8)
+    blocked, blocked_stats = kd(batch, student_logits, 2.0, 1.01)
+    assert float(blocked) == 0.0 and blocked_stats["kd_coverage"] == 0.0
+
+    calls = len(fixed.calls)
+    assert kd({**batch, "teacher_features": None}, student_logits, 2.0, 0.05)[1] == {"kd_rows": 0.0}
+    nothing = {**batch, "has_strokes": torch.zeros(4, dtype=torch.bool)}
+    empty, empty_stats = kd(nothing, student_logits, 2.0, 0.05)
+    assert float(empty) == 0.0 and empty_stats == {"kd_rows": 0.0} and len(fixed.calls) == calls
+
+
+def tiny_teacher(tokenizer: LatexTokenizer, max_points: int = 256) -> Stroke2Latex:
+    torch.manual_seed(0)
+    return Stroke2Latex(ModelConfig(vocab_size=len(tokenizer), d_model=32, encoder_layers=1, decoder_layers=1,
+                                    attention_heads=4, feedforward_dim=64, max_points=max_points, max_tokens=64))
+
+
+def test_teacher_kd_with_real_stroke2latex_keeps_teacher_frozen():
+    student = LatexTokenizer.build(normalize_training_latex(label) for label in LABELS)
+    teacher_tokens = LatexTokenizer.build(normalize_training_latex(label) for label in LABELS[:5])
+    preprocessing = PreprocessingConfig(max_points=40, min_resampled_points_per_stroke=8)
+    kd = train_bimodal.TeacherKD(tiny_teacher(teacher_tokens, max_points=40), teacher_tokens, student, preprocessing,
+                                 torch.device("cpu"), "float32")
+    samples = []
+    for seed in range(3):
+        meta, png, npz = make_sample(seed, "crohme_train", "train", ink=True)
+        glyph = np.load(io.BytesIO(npz))["features"].astype(np.float32)
+        converted = teacher_stroke_features(glyph, preprocessing)
+        if seed == 2:
+            converted = np.concatenate([converted] * 30)
+        tokens = torch.tensor(student.encode(meta["normalized_latex"]))
+        samples.append({"image": torch.zeros(2, 128, 64, dtype=torch.uint8), "image_width": 64,
+                        "stroke_features": torch.from_numpy(glyph), "teacher_features": torch.from_numpy(converted),
+                        "has_timing": True, "tokens": tokens, "r2l_tokens": tokens, "structure_targets": None,
+                        "id": str(seed), "source": "crohme_train", "latex": "", "normalized_latex": "",
+                        "synthetic": False})
+    batch = collate_bimodal_batch(samples, student.pad_id)
+    assert batch["teacher_features"].shape[0] == 3 and int((~batch["teacher_padding_mask"][2]).sum()) > 40
+    head = torch.nn.Linear(4, len(student))
+    student_logits = head(torch.randn(3, batch["tokens"].shape[1] - 1, 4))
+    loss, stats = kd(batch, student_logits, 2.0, 0.0)
+    assert stats["kd_rows"] == 2 and 0 < stats["kd_coverage"] <= 1 and torch.isfinite(loss) and loss > 0
+    loss.backward()
+    assert head.weight.grad is not None and head.weight.grad.abs().sum() > 0
+    assert all(parameter.grad is None and not parameter.requires_grad for parameter in kd.model.parameters())
+    assert not kd.model.training
 
 
 def test_parameter_groups_split_stroke_learning_rate():
@@ -634,6 +804,41 @@ def test_stage2_bimodal_from_stage1_with_structure_r2l_and_cooldown(stage2, stag
     assert metrics[-1]["val"]["modality"] == "auto"
     status = read_json(stage2.output / "status.json")
     assert status["state"] == "completed" and status["global_step"] == 6 + 6 + 5
+
+
+def test_stage26_coupled_augmentation_and_teacher_kd_end_to_end(workspace, stage1, tmp_path):
+    tokenizer = LatexTokenizer.build(normalize_training_latex(label) for label in LABELS[:6])
+    teacher_path = tmp_path / "teacher.pt"
+    save_checkpoint(teacher_path, tiny_teacher(tokenizer), tokenizer,
+                    PreprocessingConfig(min_resampled_points_per_stroke=8), 0, {})
+    config = yaml.safe_load(workspace.config.read_text(encoding="utf-8"))
+    stage26 = yaml.safe_load(STAGE26_CONFIG.read_text(encoding="utf-8"))["stage2"]
+    config["stage2"].update(epochs=2, cooldown_epochs=1, teacher_checkpoint=str(tmp_path / "missing.pt"),
+                            teacher_kd_weight=0.5, cooldown_teacher_kd_weight=0.2, teacher_kd_temp=2.0,
+                            teacher_kd_min_target_prob=0.0, cooldown_disable_band_mask=True,
+                            augment={**stage26["augment"], "point_dropout": 0.2})
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    output = tmp_path / "stage26"
+    logs = run("--config", path, "--stage", 2, "--shards", workspace.shards, "--output", output,
+               "--init-from", stage1.output / "best.pt", "--teacher-checkpoint", teacher_path, *COMMON)
+    assert f"teacher: {teacher_path}" in logs and "kd_loss=" in logs and "kd_coverage=" in logs
+    resolved = read_json(output / "config_resolved.json")
+    assert resolved["teacher_checkpoint"] == str(teacher_path) == resolved["stage_config"]["teacher_checkpoint"]
+    assert resolved["teacher"]["normalization"] == "expression" and resolved["teacher"]["shared_tokens"] > 20
+    assert resolved["stage_config"]["augment"]["coupled_geometry"] is True
+    metrics = read_metrics(output / "metrics.jsonl")
+    assert [record["cooldown"] for record in metrics] == [False, True]
+    for record in metrics:
+        train = record["train"]
+        assert train["kd_loss"] > 0 and 0 < train["kd_coverage"] <= 1 and train["kd_rows"] > 0
+        assert math.isfinite(train["loss"]) and "structure_misaligned" not in train
+    best = torch.load(output / "best.pt", map_location="cpu", weights_only=False)
+    model = BimodalMathModel(BimodalModelConfig.from_dict({**best["model_config"], "vision_pretrained": False}))
+    assert set(best["model_state_dict"]) == set(model.state_dict())
+    model.load_state_dict(best["model_state_dict"])
+    recovery = torch.load(output / "recovery.pt", map_location="cpu", weights_only=False)
+    assert recovery["train_config"]["teacher_checkpoint"] == str(teacher_path)
 
 
 def test_mine_hard_then_grpo_stage3(workspace, stage3):
