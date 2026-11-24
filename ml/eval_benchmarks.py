@@ -352,7 +352,9 @@ def run_greedy(model, samples: list[dict[str, Any]], tokenizer: LatexTokenizer, 
 
 @torch.inference_mode()
 def run_beam_r2l(model, samples: list[dict[str, Any]], tokenizer: LatexTokenizer, device: torch.device,
-                 max_gen: int, batch_size: int = 16, tag: str = "") -> tuple[dict[int, tuple[str, bool]], dict[int, tuple[str, bool]], dict[int, list[dict[str, Any]]]]:
+                 max_gen: int, batch_size: int = 16, tag: str = "",
+                 beam_width: int = BEAM_WIDTH, length_penalty: float = LENGTH_PENALTY,
+                 r2l_weight: float = R2L_WEIGHT) -> tuple[dict[int, tuple[str, bool]], dict[int, tuple[str, bool]], dict[int, list[dict[str, Any]]]]:
     t0 = time.perf_counter()
     order = sorted(range(len(samples)), key=lambda i: samples[i]["image_width"])
     beam_only_preds: dict[int, tuple[str, bool]] = {}
@@ -362,14 +364,15 @@ def run_beam_r2l(model, samples: list[dict[str, Any]], tokenizer: LatexTokenizer
         chunk_indices = order[start:start + batch_size]
         batch = collate_eval([samples[i] for i in chunk_indices])
         moved = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-        out = decode_beam_and_r2l(model, moved, tokenizer, device, width=BEAM_WIDTH, max_tokens=max_gen)
+        out = decode_beam_and_r2l(model, moved, tokenizer, device, width=beam_width,
+                                  max_tokens=max_gen, length_penalty=length_penalty)
         for row, idx in enumerate(chunk_indices):
             cands = []
-            for k in range(BEAM_WIDTH):
+            for k in range(beam_width):
                 pred = tokenizer.decode(out["token_ids"][row][k])
-                l2r_norm = out["l2r_scores"][row][k] / (max(1, out["l2r_lengths"][row][k]) ** LENGTH_PENALTY)
-                r2l_norm = out["r2l_scores"][row][k] / (max(1, out["r2l_lengths"][row][k]) ** LENGTH_PENALTY)
-                combined = (1.0 - R2L_WEIGHT) * l2r_norm + R2L_WEIGHT * r2l_norm
+                l2r_norm = out["l2r_scores"][row][k] / (max(1, out["l2r_lengths"][row][k]) ** length_penalty)
+                r2l_norm = out["r2l_scores"][row][k] / (max(1, out["r2l_lengths"][row][k]) ** length_penalty)
+                combined = (1.0 - r2l_weight) * l2r_norm + r2l_weight * r2l_norm
                 cands.append({
                     "prediction": pred,
                     "truncated": not out["finished"][row][k],
@@ -383,8 +386,19 @@ def run_beam_r2l(model, samples: list[dict[str, Any]], tokenizer: LatexTokenizer
             beam_r2l_preds[idx] = (best_r2l["prediction"], best_r2l["truncated"])
         done = min(start + batch_size, len(order))
         if done % 1024 == 0 or done == len(order):
-            print(f"  [{tag}] beam5+r2l decoded {done}/{len(order)} ({time.perf_counter() - t0:.1f}s)", flush=True)
+            print(f"  [{tag}] beam{beam_width}+r2l decoded {done}/{len(order)} ({time.perf_counter() - t0:.1f}s)", flush=True)
     return beam_only_preds, beam_r2l_preds, nbest_dump
+
+
+def _resolve_tokenizer(payload: dict[str, Any], tokenizer_path: Path | None) -> LatexTokenizer:
+    if tokenizer_path is not None:
+        return LatexTokenizer.load(tokenizer_path)
+    if payload.get("tokenizer") is not None:
+        return LatexTokenizer.from_dict(payload["tokenizer"])
+    fallback = REPO_ML / "tokenizer" / "bimodal_tokenizer.json"
+    if fallback.is_file():
+        return LatexTokenizer.load(fallback)
+    raise FileNotFoundError("No tokenizer embedded in checkpoint and --tokenizer not provided")
 
 
 def main() -> None:
@@ -392,26 +406,33 @@ def main() -> None:
     parser.add_argument("--name", required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--tokenizer", type=Path, default=Path(r"E:\math-recogniser-training\colab-shards\tokenizer.json"))
+    parser.add_argument("--tokenizer", type=Path, default=None, help="Optional tokenizer.json (defaults to checkpoint embedded tokenizer)")
     parser.add_argument("--crohme-test", type=Path, default=Path(r"E:\math-recogniser-datasets\canonical\crohme23\test.jsonl"))
     parser.add_argument("--crohme-tools", type=Path, default=Path(r"E:\math-recogniser-training\tools\crohme-eval"))
     parser.add_argument("--crohme-archive", type=Path, default=Path(r"E:\math-recogniser-datasets\archives\CROHME23.zip"))
     parser.add_argument("--mathwriting-test", type=Path, default=Path(r"E:\mathwriting-2024\test"))
     parser.add_argument("--datasets", nargs="+", choices=("crohme", "mathwriting"), default=["crohme", "mathwriting"])
+    parser.add_argument("--beam-width", type=int, default=BEAM_WIDTH, help="Recommended: 5")
+    parser.add_argument("--r2l-weight", type=float, default=R2L_WEIGHT, help="Recommended: 0.5")
+    parser.add_argument("--length-penalty", type=float, default=LENGTH_PENALTY, help="Recommended: 0.7")
     parser.add_argument("--skip-greedy", action="store_true")
     parser.add_argument("--batch-size", type=int, default=16)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = LatexTokenizer.load(args.tokenizer)
     print(f"=== [{args.name}] Loading {args.checkpoint} ===", flush=True)
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    tokenizer = _resolve_tokenizer(payload, args.tokenizer)
     model = model_from_payload(payload, device)
     model.eval()
     max_gen = int(payload["model_config"].get("max_tokens", 256))
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    report: dict[str, Any] = {"name": args.name, "checkpoint": str(args.checkpoint)}
+    report: dict[str, Any] = {
+        "name": args.name,
+        "checkpoint": str(args.checkpoint),
+        "decoding": {"beam_width": args.beam_width, "r2l_weight": args.r2l_weight, "length_penalty": args.length_penalty},
+    }
 
     if "crohme" in args.datasets:
         crohme_samples = load_crohme_samples(args.crohme_test)
@@ -421,26 +442,34 @@ def main() -> None:
                 f"{args.name}_greedy", args.checkpoint, args.out_dir / "crohme_greedy",
                 crohme_samples, greedy_preds, args.crohme_tools, args.crohme_archive,
             )
-        beam_only, beam_r2l, nbest = run_beam_r2l(model, crohme_samples, tokenizer, device, max_gen, batch_size=args.batch_size, tag=f"{args.name}_crohme")
+        beam_only, beam_r2l, nbest = run_beam_r2l(
+            model, crohme_samples, tokenizer, device, max_gen, batch_size=args.batch_size,
+            tag=f"{args.name}_crohme", beam_width=args.beam_width,
+            length_penalty=args.length_penalty, r2l_weight=args.r2l_weight,
+        )
         (args.out_dir / "crohme_nbest.json").write_text(
             json.dumps([{"id": crohme_samples[i]["id"], "candidates": nbest[i]} for i in range(len(crohme_samples))], ensure_ascii=False),
             encoding="utf-8",
         )
         report["crohme_beam5"] = run_crohme_organizer(
-            f"{args.name}_beam5", args.checkpoint, args.out_dir / "crohme_beam5_only",
+            f"{args.name}_beam{args.beam_width}", args.checkpoint, args.out_dir / f"crohme_beam{args.beam_width}_only",
             crohme_samples, beam_only, args.crohme_tools, args.crohme_archive,
         )
         report["crohme_beam5_r2l"] = run_crohme_organizer(
-            f"{args.name}_beam5_r2l", args.checkpoint, args.out_dir / "crohme_beam5_r2l",
+            f"{args.name}_beam{args.beam_width}_r2l", args.checkpoint, args.out_dir / f"crohme_beam{args.beam_width}_r2l",
             crohme_samples, beam_r2l, args.crohme_tools, args.crohme_archive,
         )
         (args.out_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     if "mathwriting" in args.datasets:
         mw_samples = load_mathwriting_samples(args.mathwriting_test)
-        beam_only, beam_r2l, _ = run_beam_r2l(model, mw_samples, tokenizer, device, max_gen, batch_size=args.batch_size, tag=f"{args.name}_mw")
-        report["mathwriting_beam5"] = score_mathwriting(f"{args.name}_mw_beam5", mw_samples, beam_only)
-        report["mathwriting_beam5_r2l"] = score_mathwriting(f"{args.name}_mw_beam5_r2l", mw_samples, beam_r2l)
+        beam_only, beam_r2l, _ = run_beam_r2l(
+            model, mw_samples, tokenizer, device, max_gen, batch_size=args.batch_size,
+            tag=f"{args.name}_mw", beam_width=args.beam_width,
+            length_penalty=args.length_penalty, r2l_weight=args.r2l_weight,
+        )
+        report["mathwriting_beam5"] = score_mathwriting(f"{args.name}_mw_beam{args.beam_width}", mw_samples, beam_only)
+        report["mathwriting_beam5_r2l"] = score_mathwriting(f"{args.name}_mw_beam{args.beam_width}_r2l", mw_samples, beam_r2l)
         (args.out_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     print("\n=== FULL BENCHMARK REPORT ===", flush=True)
