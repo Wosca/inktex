@@ -1,0 +1,70 @@
+# InkTeX v2 — Stage B0: Vision Alignment (Local RTX 4070 Ti 12 GB, $0 cloud cost)
+# Initializes stroke_encoder + decoder from Stage A best.pt (skipping vision_encoder & fusion.blocks
+# so ConvNeXt-V2-Tiny FCMAE pretrained weights are preserved!).
+# Stroke encoder & style encoder stay frozen; ConvNeXt-V2-Tiny + FPN + vision projection align to the
+# Stage A decoder (decoder at 0.1x LR).
+#
+# Run:
+#   $env:PYTHONPATH='C:\Users\oscar\Home\Github\inktex\ml'
+#   python -m v2.train_v2 --config configs/v2_stage_b0_vision.yaml ^
+#       --shards E:/math-recogniser-training/v2-shards ^
+#       --init-from E:/math-recogniser-training/inktex_v2/stage_a_stroke/best.pt ^
+#       --output E:/math-recogniser-training/inktex_v2/stage_b0_vision
+
+seed: 2026
+stage: stage_b0_vision
+
+model:
+  preset: inktex_v2_100m
+  vision_pretrained: true    # CRITICAL: load FCMAE ConvNeXt-V2-Tiny pretrained weights
+
+train:
+  train_splits:
+    - split: train_online
+      weight: 0.60
+    - split: train_offline
+      weight: 0.40
+  modality_mode: vision
+  static_buckets: true       # match exact iPad ConvNeXt-V2 GRN width buckets {256,512,768,1024}
+  grad_checkpointing: false
+  total_steps: 10000         # ~1.28M vision-aligned draws (~10-14h on RTX 4070 Ti)
+  batch_size: 8
+  grad_accum: 16             # effective batch = 128
+  lr: 3.0e-4                 # fusion / default LR
+  vision_lr: 3.0e-4          # ConvNeXt-V2 + FPN + vision projection
+  decoder_lr: 3.0e-5         # 0.1x gentle adaptation
+  weight_decay: 0.03
+  warmup_steps: 500
+  min_lr_ratio: 0.10
+  r2l_weight: 0.30
+  label_smoothing: 0.02
+  token_corrupt_prob: 0.0
+  ema_decay: 0.999
+  grad_clip: 1.0
+  num_workers: 4
+  shuffle_buffer: 8192
+  eval_every_steps: 1000
+  save_every_steps: 500
+  log_every_steps: 100
+  val_batch_size: 32
+  val_max_samples: 0         # FULL locked val_crohme (1,358) & val_mw (1,024)
+  source_upsample:
+    crohme_train: 4.0
+    mathwriting_train: 1.0
+    mathwriting_synthetic: 0.35
+    hwrt_train: 0.25
+    hme100k_train: 1.5       # real handwritten offline equations
+    unimer_printed: 0.15     # capped <=5% effective weight (clean printed math only)
+  augment:
+    enabled: true
+    rotation_degrees: 4.0
+    shear: 0.06
+    anisotropic_scale: [0.90, 1.10]
+    scale_jitter: [0.85, 1.15]
+    stroke_width_range: [1.6, 3.2]
+    morphology_prob: 0.25
+    intensity_jitter: 0.12
+    vision_band_mask_prob: 0.20
+    vision_band_mask_count: [1, 2]
+    vision_band_mask_width: [16, 48]
+    vision_band_mask_max_fraction: 0.20

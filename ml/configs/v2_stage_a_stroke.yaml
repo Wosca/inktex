@@ -1,0 +1,60 @@
+# InkTeX v2 — Stage A: Stroke Foundation (Local RTX 4070 Ti 12 GB, $0 cloud cost)
+# Hard Gate before Stage B0/B: beat archived 70.8% CROHME 2019 stroke-only teacher!
+# Verified on RTX 4070 Ti: batch 8 x grad_accum 16 keeps >=4.5 GiB free VRAM and runs ~2x faster than batch 16!
+#
+# Run:
+#   $env:PYTHONPATH='C:\Users\oscar\Home\Github\inktex\ml'
+#   python -m v2.train_v2 --config configs/v2_stage_a_stroke.yaml ^
+#       --shards E:/math-recogniser-training/v2-shards ^
+#       --output E:/math-recogniser-training/inktex_v2/stage_a_stroke
+
+seed: 1337
+stage: stage_a_stroke
+
+model:
+  preset: inktex_v2_100m
+  vision_pretrained: false   # vision is frozen & skipped during Stage A
+
+train:
+  train_splits:
+    - split: train_online
+      weight: 1.0
+  modality_mode: stroke
+  static_buckets: false
+  grad_checkpointing: false  # enable true if ever pushing batch > 8 on 12 GB
+  total_steps: 24000         # ~3.07M effective draws (batch 8 x grad_accum 16 = 128)
+  batch_size: 8
+  grad_accum: 16             # effective batch = 128
+  lr: 3.0e-4
+  stroke_lr: 3.0e-4
+  decoder_lr: 3.0e-4
+  weight_decay: 0.03
+  warmup_steps: 1000
+  min_lr_ratio: 0.05
+  r2l_weight: 0.30
+  label_smoothing: 0.02
+  token_corrupt_prob: 0.0    # enable 0.10 only if ablation confirms gain
+  ema_decay: 0.999
+  grad_clip: 1.0
+  num_workers: 4
+  shuffle_buffer: 16384
+  eval_every_steps: 2000
+  save_every_steps: 500
+  log_every_steps: 100
+  val_batch_size: 32
+  val_max_samples: 0         # 0 = FULL locked val_crohme & val_mw sets (zero prefix bias!)
+  source_upsample:
+    crohme_train: 5.0        # ~56.5k / pass (~16% CROHME human)
+    mathwriting_train: 1.0   # ~229.8k / pass (~66% MW human)
+    mathwriting_synthetic: 0.45  # ~54.0k / pass (~15.5% synthetic)
+    hwrt_train: 0.35         # ~7.5k / pass (~2.2% isolated symbols)
+  augment:
+    enabled: true
+    rotation_degrees: 5.0
+    shear: 0.08
+    anisotropic_scale: [0.88, 1.12]
+    post_resample_jitter: 0.004
+    stroke_shift: 0.02
+    timing_dropout: 0.50
+    stroke_order_swap_prob: 0.06
+    stroke_reverse_prob: 0.04

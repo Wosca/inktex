@@ -1,0 +1,72 @@
+# InkTeX v2 — Stage B: High-Res Joint Bimodal Fusion (A100-80GB / L40S / H100)
+# All branches unfrozen with differential LRs. Online rows (78%) see 60/30/10 bimodal/stroke/vision;
+# combined with 22% offline vision-only rows, overall mix is ~47% bimodal / 23% stroke-only / 30% vision-only,
+# with coupled stroke+raster augmentation and zero-re-encode mutual stroke KD (mutual_kd_weight=0.20).
+# Initialized from Stage B0 best.pt.
+
+seed: 3037
+stage: stage_b_joint
+
+model:
+  preset: inktex_v2_100m
+  vision_pretrained: false   # loaded cleanly from Stage B0 best.pt via --init-from
+
+train:
+  train_splits:
+    - split: train_online
+      weight: 0.78
+    - split: train_offline
+      weight: 0.22
+  modality_mode: auto
+  static_buckets: true       # exact ConvNeXt-V2 GRN width buckets & stroke chunk buckets
+  grad_checkpointing: false  # A100-80GB / H100 / L40S has plenty of VRAM; set true on 12-24 GB
+  total_steps: 24000         # ~3.07M effective draws (batch 32 x grad_accum 4 = 128 on 48-80 GB)
+  batch_size: 32
+  grad_accum: 4              # effective batch = 128
+  lr: 3.0e-4                 # fusion blocks / default LR
+  stroke_lr: 1.0e-4
+  vision_lr: 1.5e-4
+  decoder_lr: 1.5e-4
+  weight_decay: 0.04
+  warmup_steps: 1000
+  min_lr_ratio: 0.05
+  r2l_weight: 0.30
+  vision_drop_prob: 0.30     # 30% ink-only (preserves live latency & stroke-only accuracy)
+  stroke_drop_prob: 0.10     # 10% vision-only (preserves offline robustness)
+  mutual_kd_weight: 0.20     # fused -> stroke-only mutual KD on undropped bimodal rows
+  label_smoothing: 0.03
+  token_corrupt_prob: 0.0
+  ema_decay: 0.999
+  grad_clip: 1.0
+  num_workers: 8
+  shuffle_buffer: 16384
+  eval_every_steps: 2000
+  save_every_steps: 500
+  log_every_steps: 100
+  val_batch_size: 64
+  val_max_samples: 0
+  source_upsample:
+    crohme_train: 5.0
+    mathwriting_train: 1.0
+    mathwriting_synthetic: 0.35
+    hwrt_train: 0.25
+    hme100k_train: 1.5
+    unimer_printed: 0.15
+  augment:
+    enabled: true
+    rotation_degrees: 5.0
+    shear: 0.08
+    anisotropic_scale: [0.88, 1.12]
+    post_resample_jitter: 0.004
+    stroke_shift: 0.02
+    timing_dropout: 0.50
+    stroke_order_swap_prob: 0.06
+    stroke_reverse_prob: 0.04
+    scale_jitter: [0.85, 1.15]
+    stroke_width_range: [1.6, 3.2]
+    morphology_prob: 0.30
+    intensity_jitter: 0.12
+    vision_band_mask_prob: 0.35
+    vision_band_mask_count: [1, 2]
+    vision_band_mask_width: [16, 48]
+    vision_band_mask_max_fraction: 0.25

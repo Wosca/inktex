@@ -1,0 +1,73 @@
+# InkTeX v2 — Stage C: Human-Only Cooldown
+# Final human-only polish (~700k human draws): zero synthetic or printed rows.
+# Low cosine LR, gentle augmentation, high EMA (0.9995), grad_checkpointing enabled for 12 GB VRAM.
+
+seed: 4048
+stage: stage_c_cooldown
+
+model:
+  preset: inktex_v2_100m
+  vision_pretrained: false   # loaded cleanly from Stage B best.pt via --init-from
+
+train:
+  train_splits:
+    - split: train_online
+      weight: 0.85
+    - split: train_offline
+      weight: 0.15
+  allowed_sources:
+    - crohme_train
+    - mathwriting_train
+    - hwrt_train
+    - hme100k_train
+  modality_mode: auto
+  static_buckets: true
+  grad_checkpointing: true   # keeps full 98.3M bimodal training well within 12 GB VRAM
+  total_steps: 5500          # ~704k human-only draws (~8-12h on RTX 4070 Ti)
+  batch_size: 4
+  grad_accum: 32             # effective batch = 128
+  lr: 6.0e-5                 # fusion blocks / default LR
+  stroke_lr: 3.0e-5
+  vision_lr: 3.0e-5
+  decoder_lr: 4.0e-5
+  weight_decay: 0.04
+  warmup_steps: 300
+  min_lr_ratio: 0.05
+  r2l_weight: 0.30
+  vision_drop_prob: 0.25
+  stroke_drop_prob: 0.05
+  mutual_kd_weight: 0.20
+  label_smoothing: 0.02
+  token_corrupt_prob: 0.0
+  ema_decay: 0.9995
+  grad_clip: 1.0
+  num_workers: 4
+  shuffle_buffer: 16384
+  eval_every_steps: 500
+  save_every_steps: 500
+  log_every_steps: 100
+  val_batch_size: 32
+  val_max_samples: 0
+  source_upsample:
+    crohme_train: 6.0
+    mathwriting_train: 1.0
+    hwrt_train: 0.15
+    hme100k_train: 1.0
+  augment:
+    enabled: true
+    rotation_degrees: 3.0
+    shear: 0.05
+    anisotropic_scale: [0.92, 1.08]
+    post_resample_jitter: 0.002
+    stroke_shift: 0.015
+    timing_dropout: 0.40
+    stroke_order_swap_prob: 0.03
+    stroke_reverse_prob: 0.02
+    scale_jitter: [0.90, 1.10]
+    stroke_width_range: [1.8, 2.8]
+    morphology_prob: 0.15
+    intensity_jitter: 0.08
+    vision_band_mask_prob: 0.15
+    vision_band_mask_count: [1, 2]
+    vision_band_mask_width: [16, 36]
+    vision_band_mask_max_fraction: 0.18
