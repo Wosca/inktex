@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-import OnnxRuntimeBindings
+@preconcurrency import OnnxRuntimeBindings
 import os
 
 public enum MemoryMonitor {
@@ -119,7 +119,7 @@ public final class InkTeXEngine: ObservableObject {
         }
     }
 
-    private final class LoadedRuntime {
+    private final class LoadedRuntime: @unchecked Sendable {
         let env: ORTEnv
         let bundle: LocatedModelBundle
         let tokenizer: LatexTokenizer
@@ -495,7 +495,7 @@ public final class InkTeXEngine: ObservableObject {
         }
     }
 
-    private static func installPersonalization(_ state: PersonalizationState, on rt: LoadedRuntime) {
+    private nonisolated static func installPersonalization(_ state: PersonalizationState, on rt: LoadedRuntime) {
         let profileChanged = rt.activeProfileDigest != state.profileDigest
         let adapterChanged = rt.activeAdapterDigest != state.adapterDigest
         rt.personalization = state
@@ -522,12 +522,15 @@ public final class InkTeXEngine: ObservableObject {
         guard let runtime else {
             throw Self.inferenceError("Model is not loaded yet.")
         }
-        guard runtime.isV2, let styleSess = runtime.writerStyleSession else {
+        guard runtime.isV2, runtime.writerStyleSession != nil else {
             throw Self.inferenceError("Active model is v1 and does not include writer_style_v2.onnx.")
         }
         return try await withCheckedThrowingContinuation { continuation in
             workerQueue.async {
                 do {
+                    guard let styleSess = runtime.writerStyleSession else {
+                        throw Self.inferenceError("Active model is v1 and does not include writer_style_v2.onnx.")
+                    }
                     let t0 = CFAbsoluteTimeGetCurrent()
                     let pers = runtime.bundle.manifest.personalization
                     let maxStrokes = pers?.styleMaxStrokes ?? InkPreprocessorV2.styleMaxStrokes
@@ -747,7 +750,7 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - Core Inference Pipeline
 
-    private static func runInference(
+    private nonisolated static func runInference(
         runtime: LoadedRuntime,
         strokes: [RawStroke],
         modality: ModalityMode,
@@ -1006,7 +1009,7 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - InkTeX v2 Canvas Encoding + Cached Personalization
 
-    private static func resolveWriterStyleTensor(runtime: LoadedRuntime) throws -> (ORTValue, Bool) {
+    private nonisolated static func resolveWriterStyleTensor(runtime: LoadedRuntime) throws -> (ORTValue, Bool) {
         let p = runtime.personalization
         guard p.styleEnabled, !p.calibrationStrokes.isEmpty else {
             guard let zero = runtime.zeroStyleTensor else {
@@ -1062,7 +1065,7 @@ public final class InkTeXEngine: ObservableObject {
         return (wsVal, true)
     }
 
-    private static func resolveLoRATensors(runtime: LoadedRuntime) throws -> (ORTValue, ORTValue, Bool) {
+    private nonisolated static func resolveLoRATensors(runtime: LoadedRuntime) throws -> (ORTValue, ORTValue, Bool) {
         guard let zeroA = runtime.zeroLoraATensor, let zeroB = runtime.zeroLoraBTensor else {
             throw inferenceError("Missing pre-allocated zero LoRA tensors.")
         }
@@ -1088,7 +1091,7 @@ public final class InkTeXEngine: ObservableObject {
         return (aVal, bVal, true)
     }
 
-    private static func encodeCanvasV2(
+    private nonisolated static func encodeCanvasV2(
         runtime: LoadedRuntime,
         strokes: [RawStroke],
         modality: ModalityMode,
@@ -1258,7 +1261,7 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - Legacy InkTeX v1 Canvas Encoding
 
-    private static func encodeCanvasV1(
+    private nonisolated static func encodeCanvasV1(
         runtime: LoadedRuntime,
         strokes: [RawStroke],
         modality: ModalityMode,
@@ -1363,11 +1366,11 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - Decoder Feed Helpers (Unified v2 + v1)
 
-    private static func decoderOutputNames(isV2: Bool) -> Set<String> {
+    private nonisolated static func decoderOutputNames(isV2: Bool) -> Set<String> {
         isV2 ? ["logits", "new_k", "new_v"] : ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"]
     }
 
-    private static func makeDecoderInputs(
+    private nonisolated static func makeDecoderInputs(
         isV2: Bool,
         token: ORTValue,
         cachePos: Int?,
@@ -1397,7 +1400,7 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - Shared Bidirectional R2L Reranking (InkTeX v2 — Single Batched Pass!)
 
-    private static func scoreR2LSharedDecoderV2(
+    private nonisolated static func scoreR2LSharedDecoderV2(
         runtime: LoadedRuntime,
         encoded: EncodedMemoryCache,
         candidates: [[Int]],
@@ -1481,7 +1484,7 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - 1. Prefix-Verified Parallel Greedy Decoding (Zero-Slice Static KV!)
 
-    private static func decodePrefixVerifiedGreedy(
+    private nonisolated static func decodePrefixVerifiedGreedy(
         runtime: LoadedRuntime,
         encoded: EncodedMemoryCache,
         prevGuess: [Int],
@@ -1682,7 +1685,7 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - 2. Standard Single-Step Greedy
 
-    private static func decodeSingleGreedy(
+    private nonisolated static func decodeSingleGreedy(
         runtime: LoadedRuntime,
         encoded: EncodedMemoryCache,
         tokenLimit: Int,
@@ -1771,7 +1774,7 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - 3. Optimized Batched Beam Search (Active-Slot memcpy + Reusable Scratch Buffers)
 
-    private static func decodeBatchedBeam(
+    private nonisolated static func decodeBatchedBeam(
         runtime: LoadedRuntime,
         encoded: EncodedMemoryCache,
         beamWidth: Int,
@@ -2083,7 +2086,7 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - 4. Legacy v1 Bundle Beam Search
 
-    private static func decodeLegacyBeam(
+    private nonisolated static func decodeLegacyBeam(
         runtime: LoadedRuntime,
         encoded: EncodedMemoryCache,
         beamWidth: Int,
@@ -2161,7 +2164,7 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - Math & Tensor Helpers
 
-    private static func copyFloatSlice(src: [Float], srcOffset: Int, dst: inout [Float], dstOffset: Int, count: Int) {
+    private nonisolated static func copyFloatSlice(src: [Float], srcOffset: Int, dst: inout [Float], dstOffset: Int, count: Int) {
         guard count > 0 else { return }
         src.withUnsafeBufferPointer { sBuf in
             dst.withUnsafeMutableBufferPointer { dBuf in
@@ -2171,7 +2174,7 @@ public final class InkTeXEngine: ObservableObject {
         }
     }
 
-    private static func makeToken(stepIdx: Int, tokenId: Int, prob: Float, visionAttn: [Float]?, manifest: ModelManifest) -> DecodedToken {
+    private nonisolated static func makeToken(stepIdx: Int, tokenId: Int, prob: Float, visionAttn: [Float]?, manifest: ModelManifest) -> DecodedToken {
         let text = (tokenId >= 0 && tokenId < manifest.tokens.count) ? manifest.tokens[tokenId] : "<UNK>"
         return DecodedToken(
             id: stepIdx,
@@ -2183,7 +2186,7 @@ public final class InkTeXEngine: ObservableObject {
         )
     }
 
-    private static func fingerprintStrokes(
+    private nonisolated static func fingerprintStrokes(
         _ strokes: [RawStroke],
         profileDigest: UInt64 = 0,
         adapterDigest: UInt64 = 0
@@ -2208,7 +2211,7 @@ public final class InkTeXEngine: ObservableObject {
         return h
     }
 
-    private static func logSoftmaxAt(_ logits: [Float], offset: Int, count: Int, targetId: Int) -> Double {
+    private nonisolated static func logSoftmaxAt(_ logits: [Float], offset: Int, count: Int, targetId: Int) -> Double {
         guard count > 0, targetId >= 0, targetId < count else { return -20.0 }
         var maxVal = -Float.greatestFiniteMagnitude
         for i in 0..<count {
@@ -2223,7 +2226,7 @@ public final class InkTeXEngine: ObservableObject {
         return Double(logits[offset + targetId]) - logZ
     }
 
-    private static func argmaxLogSoftmax(_ logits: [Float], offset: Int, count: Int) -> (id: Int, logProb: Double, prob: Float) {
+    private nonisolated static func argmaxLogSoftmax(_ logits: [Float], offset: Int, count: Int) -> (id: Int, logProb: Double, prob: Float) {
         var bestIdx = 0
         var bestVal = -Float.greatestFiniteMagnitude
         for i in 0..<count {
@@ -2241,7 +2244,7 @@ public final class InkTeXEngine: ObservableObject {
         return (bestIdx, logProb, Float(exp(logProb)))
     }
 
-    private static func topKLogSoftmax(_ logits: [Float], offset: Int, count: Int, k: Int) -> [(id: Int, logProb: Double, prob: Float)] {
+    private nonisolated static func topKLogSoftmax(_ logits: [Float], offset: Int, count: Int, k: Int) -> [(id: Int, logProb: Double, prob: Float)] {
         guard count > 0 else { return [] }
         var maxVal = -Float.greatestFiniteMagnitude
         for i in 0..<count {
@@ -2275,7 +2278,7 @@ public final class InkTeXEngine: ObservableObject {
         }
     }
 
-    private static func averageVisionAttention(
+    private nonisolated static func averageVisionAttention(
         weights: [Float],
         numHeads: Int,
         totalMemLen: Int,
@@ -2294,7 +2297,7 @@ public final class InkTeXEngine: ObservableObject {
         return avg
     }
 
-    private static func extractVisionAttentionAtStep(
+    private nonisolated static func extractVisionAttentionAtStep(
         _ allPrevW: [Float],
         numHeads: Int,
         stepLen: Int,
@@ -2315,40 +2318,40 @@ public final class InkTeXEngine: ObservableObject {
         return avg
     }
 
-    private static func makeFloatTensor(_ values: [Float], shape: [Int]) throws -> ORTValue {
+    private nonisolated static func makeFloatTensor(_ values: [Float], shape: [Int]) throws -> ORTValue {
         let data = values.withUnsafeBufferPointer { buf -> NSMutableData in
             NSMutableData(bytes: buf.baseAddress, length: buf.count * MemoryLayout<Float>.stride)
         }
         return try ORTValue(tensorData: data, elementType: .float, shape: shape.map { NSNumber(value: $0) })
     }
 
-    private static func makeInt64Tensor(_ values: [Int64], shape: [Int]) throws -> ORTValue {
+    private nonisolated static func makeInt64Tensor(_ values: [Int64], shape: [Int]) throws -> ORTValue {
         let data = values.withUnsafeBufferPointer { buf -> NSMutableData in
             NSMutableData(bytes: buf.baseAddress, length: buf.count * MemoryLayout<Int64>.stride)
         }
         return try ORTValue(tensorData: data, elementType: .int64, shape: shape.map { NSNumber(value: $0) })
     }
 
-    private static func makeUInt8Tensor(_ values: [UInt8], shape: [Int]) throws -> ORTValue {
+    private nonisolated static func makeUInt8Tensor(_ values: [UInt8], shape: [Int]) throws -> ORTValue {
         let data = values.withUnsafeBufferPointer { buf -> NSMutableData in
             NSMutableData(bytes: buf.baseAddress, length: buf.count * MemoryLayout<UInt8>.stride)
         }
         return try ORTValue(tensorData: data, elementType: .uInt8, shape: shape.map { NSNumber(value: $0) })
     }
 
-    private static func extractFloats(_ value: ORTValue) throws -> [Float] {
+    private nonisolated static func extractFloats(_ value: ORTValue) throws -> [Float] {
         let data = try value.tensorData() as Data
         return data.withUnsafeBytes { raw in
             Array(raw.bindMemory(to: Float.self))
         }
     }
 
-    private static func extractUInt8s(_ value: ORTValue) throws -> [UInt8] {
+    private nonisolated static func extractUInt8s(_ value: ORTValue) throws -> [UInt8] {
         let data = try value.tensorData() as Data
         return Array(data)
     }
 
-    private static func inferenceError(_ message: String) -> NSError {
+    private nonisolated static func inferenceError(_ message: String) -> NSError {
         NSError(domain: "InkTeX.Engine", code: 200, userInfo: [NSLocalizedDescriptionKey: message])
     }
 }
