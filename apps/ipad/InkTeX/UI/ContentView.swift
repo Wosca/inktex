@@ -3,6 +3,7 @@ import UIKit
 
 struct ContentView: View {
     @StateObject private var engine = InkTeXEngine()
+    @StateObject private var personalization = PersonalizationStore()
     @StateObject private var canvasController = PencilCanvasController()
     @Environment(\.colorScheme) private var colorScheme
 
@@ -14,6 +15,9 @@ struct ContentView: View {
     @State private var stripColorMode: StripColorMode = .confidence
     @State private var showInspectorSheet: Bool = false
     @State private var showModelSheet: Bool = false
+    @State private var showPersonalizationSheet: Bool = false
+    @State private var showCorrectionSheet: Bool = false
+    @State private var savedCorrectionFeedback: Bool = false
 
     @State private var latestResult: RecognitionResult?
     @State private var isRefiningBeam: Bool = false
@@ -82,8 +86,8 @@ struct ContentView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                // Clean Settings icon only on top-left (no title/dot clutter)
-                ToolbarItem(placement: .topBarLeading) {
+                // Clean Settings + Personalization icons on top-left
+                ToolbarItemGroup(placement: .topBarLeading) {
                     Button {
                         showModelSheet = true
                     } label: {
@@ -91,6 +95,18 @@ struct ContentView: View {
                             .foregroundStyle(settingsIconColor)
                     }
                     .help("Model & Settings")
+
+                    Button {
+                        showPersonalizationSheet = true
+                    } label: {
+                        Image(
+                            systemName: personalization.isAnyPersonalizationActive
+                                ? "person.crop.circle.badge.checkmark"
+                                : "person.crop.circle"
+                        )
+                        .foregroundStyle(personalization.isAnyPersonalizationActive ? Color.accentColor : Color.primary)
+                    }
+                    .help("Handwriting Personalization")
                 }
 
                 ToolbarItem(placement: .principal) {
@@ -136,6 +152,28 @@ struct ContentView: View {
             .sheet(isPresented: $showModelSheet) {
                 ModelSetupSheet(engine: engine)
             }
+            .sheet(isPresented: $showPersonalizationSheet) {
+                PersonalizationSheet(store: personalization, engine: engine)
+            }
+            .sheet(isPresented: $showCorrectionSheet) {
+                let strokes = canvasController.extractRawStrokes()
+                CorrectionEditorSheet(
+                    strokes: strokes,
+                    predictedLatex: latestResult?.latex ?? "",
+                    isDark: colorScheme == .dark
+                ) { corrected in
+                    personalization.saveCorrection(
+                        strokes: strokes,
+                        predictedLatex: latestResult?.latex ?? "",
+                        correctedLatex: corrected
+                    )
+                    savedCorrectionFeedback = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                        savedCorrectionFeedback = false
+                    }
+                }
+                .presentationDetents([.medium, .large])
+            }
             .sheet(isPresented: $showInspectorSheet) {
                 if let result = latestResult {
                     InspectorSheet(
@@ -146,6 +184,16 @@ struct ContentView: View {
                     )
                     .presentationDetents([.medium, .large])
                 }
+            }
+            .onAppear {
+                personalization.onStateChanged = { state in
+                    engine.applyPersonalization(state)
+                    let strokes = canvasController.extractRawStrokes()
+                    if !strokes.isEmpty && autoRecognize {
+                        triggerRecognition(strokes, immediate: true)
+                    }
+                }
+                engine.applyPersonalization(personalization.currentState())
             }
         }
     }
@@ -191,6 +239,14 @@ struct ContentView: View {
                     if isRefiningBeam {
                         ProgressView()
                             .controlSize(.mini)
+                    } else if result.matchedCorrectionCache {
+                        Text("Saved")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.18))
+                            .foregroundStyle(.blue)
+                            .clipShape(Capsule())
                     } else if result.r2lChangedWinner {
                         Text("R2L Pick")
                             .font(.caption2.weight(.semibold))
@@ -206,6 +262,16 @@ struct ContentView: View {
                             .padding(.vertical, 2)
                             .background(Color.green.opacity(0.18))
                             .foregroundStyle(.green)
+                            .clipShape(Capsule())
+                    }
+
+                    if result.usedWriterStyle || result.usedLoRAAdapter {
+                        Text(result.usedLoRAAdapter ? "LoRA" : "Style")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.teal.opacity(0.18))
+                            .foregroundStyle(.teal)
                             .clipShape(Capsule())
                     }
                 }
@@ -333,6 +399,18 @@ struct ContentView: View {
                 }
 
                 Button {
+                    showCorrectionSheet = true
+                } label: {
+                    Label(
+                        savedCorrectionFeedback ? "Saved" : "Correct",
+                        systemImage: savedCorrectionFeedback ? "checkmark.circle" : "pencil.line"
+                    )
+                    .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.bordered)
+                .disabled(canvasController.strokeCount == 0)
+
+                Button {
                     guard let tex = latestResult?.latex, !tex.isEmpty else { return }
                     UIPasteboard.general.string = tex
                     copiedFeedback = true
@@ -414,6 +492,47 @@ struct ContentView: View {
         let selectedModality = modality
         let selectedDecoding = decodingMode
         let useTwoPhase = !immediate && engine.liveTwoPhase && selectedDecoding != .greedy
+
+        // Optional Tier 3a: instant exact-geometry personal correction cache (<0.1 ms, opt-in)
+        if let bundle = engine.loadedBundle,
+           let cached = personalization.lookupCachedCorrection(for: strokes) {
+            let strip = engine.isV2Model
+                ? StripRasterizer.renderV2(strokes: strokes, config: bundle.manifest.vision)
+                : StripRasterizer.render(strokes: strokes, config: bundle.manifest.vision)
+            latestResult = RecognitionResult(
+                latex: cached.correctedLatex,
+                decodedTokens: [],
+                overallConfidence: 1.0,
+                totalMs: 0.1,
+                encodeMs: 0,
+                decodeMs: 0,
+                r2lMs: 0,
+                strokeCount: strokes.count,
+                pointCount: strokes.reduce(0) { $0 + $1.points.count },
+                stripHeight: strip.height,
+                stripWidth: strip.width,
+                visionGridW: 0,
+                visionGridH: 0,
+                stripLumBytes: strip.lumBytes,
+                stripOrderBytes: strip.orderBytes,
+                modality: selectedModality,
+                decodingMode: selectedDecoding,
+                r2lUsed: false,
+                r2lChangedWinner: false,
+                prefixVerifiedCount: 0,
+                encoderCacheHit: true,
+                beams: [],
+                truncated: false,
+                isV2Model: engine.isV2Model,
+                chunkBucket: nil,
+                activeProfileName: personalization.activeProfile?.name,
+                usedWriterStyle: false,
+                usedLoRAAdapter: false,
+                matchedCorrectionCache: true
+            )
+            errorMessage = nil
+            return
+        }
 
         recognitionTask = Task {
             if !immediate {

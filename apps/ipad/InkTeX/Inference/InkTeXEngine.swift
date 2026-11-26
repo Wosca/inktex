@@ -43,7 +43,11 @@ public final class InkTeXEngine: ObservableObject {
     @Published public private(set) var status: Status = .loading
     @Published public private(set) var availableBundles: [LocatedModelBundle] = []
     @Published public private(set) var loadedBundle: LocatedModelBundle?
+    @Published public private(set) var isV2Model: Bool = false
     @Published public private(set) var hasR2LScorer: Bool = false
+    @Published public private(set) var hasSharedR2L: Bool = false
+    @Published public private(set) var supportsDynamicLoRA: Bool = false
+    @Published public private(set) var activeStyleModelSha: String? = nil
     @Published public private(set) var supportsV2FastDecode: Bool = false
     @Published public private(set) var staticKvLen: Int? = nil
     @Published public private(set) var isRecognizing: Bool = false
@@ -56,6 +60,7 @@ public final class InkTeXEngine: ObservableObject {
 
     private var preferredBundleId: String? = nil
     private var peakFootprintMB: Double = 0
+    private var latestPersonalization: PersonalizationState = .none
     private let workerQueue = DispatchQueue(label: "com.wosca.inktex.inference", qos: .userInitiated)
     private var runtime: LoadedRuntime?
 
@@ -68,6 +73,10 @@ public final class InkTeXEngine: ObservableObject {
         let strokeMemLen: Int
         let visionMemLen: Int
         let totalMemLen: Int
+        let chunkBucket: Int?
+        let usedWriterStyle: Bool
+        let usedLoRAAdapter: Bool
+        let activeProfileName: String?
         let memTensor: ORTValue
         let memMaskVal: ORTValue
         let mkVal: ORTValue
@@ -82,6 +91,10 @@ public final class InkTeXEngine: ObservableObject {
             strokeMemLen: Int,
             visionMemLen: Int,
             totalMemLen: Int,
+            chunkBucket: Int? = nil,
+            usedWriterStyle: Bool = false,
+            usedLoRAAdapter: Bool = false,
+            activeProfileName: String? = nil,
             memTensor: ORTValue,
             memMaskVal: ORTValue,
             mkVal: ORTValue,
@@ -95,6 +108,10 @@ public final class InkTeXEngine: ObservableObject {
             self.strokeMemLen = strokeMemLen
             self.visionMemLen = visionMemLen
             self.totalMemLen = totalMemLen
+            self.chunkBucket = chunkBucket
+            self.usedWriterStyle = usedWriterStyle
+            self.usedLoRAAdapter = usedLoRAAdapter
+            self.activeProfileName = activeProfileName
             self.memTensor = memTensor
             self.memMaskVal = memMaskVal
             self.mkVal = mkVal
@@ -106,51 +123,131 @@ public final class InkTeXEngine: ObservableObject {
         let env: ORTEnv
         let bundle: LocatedModelBundle
         let tokenizer: LatexTokenizer
+        let isV2: Bool
+        let writerStyleSession: ORTSession?
+        let writerStyleSha: String
         let visionSession: ORTSession
         let strokeSession: ORTSession
         let memoryProjSession: ORTSession
         let decoderStepSession: ORTSession
         let r2lScorerSession: ORTSession?
         let isV2Decoder: Bool
+        let hasSharedR2L: Bool
         let staticKvLen: Int?
+        let staticShapes: Bool
+        let supportsDynamicLoRA: Bool
+        let styleDim: Int
+        let loraShapeA: [Int]
+        let loraShapeB: [Int]
+        let zeroStyleTensor: ORTValue?
+        let zeroLoraATensor: ORTValue?
+        let zeroLoraBTensor: ORTValue?
         let baselineMB: Double
         let memoryComponents: [MemoryComponent]
 
-        // Incremental caches (accessed strictly on workerQueue)
+        // Incremental & personalization caches (accessed strictly on workerQueue)
         var lastPrefixBodyIds: [Int] = []
         var lastEncoded: EncodedMemoryCache? = nil
+        var personalization: PersonalizationState = .none
+        var activeProfileDigest: UInt64 = 0
+        var activeAdapterDigest: UInt64 = 0
+        var cachedStyleDigest: UInt64 = 0
+        var cachedStyleTensor: ORTValue? = nil
+        var cachedAdapterDigest: UInt64 = 0
+        var cachedLoraATensor: ORTValue? = nil
+        var cachedLoraBTensor: ORTValue? = nil
 
         init(bundle: LocatedModelBundle, profile: CoreMLProfile) throws {
             self.bundle = bundle
+            self.isV2 = bundle.isV2
             self.tokenizer = LatexTokenizer(manifest: bundle.manifest)
-            self.staticKvLen = bundle.manifest.staticKvLen
-            self.isV2Decoder = (bundle.manifest.supportsPrefixVerify == true)
+            self.staticKvLen = bundle.manifest.staticKvLen ?? (bundle.isV2 ? 256 : nil)
+            self.staticShapes = bundle.manifest.staticShapes == true
+            self.isV2Decoder = bundle.isV2
+                || (bundle.manifest.supportsPrefixVerify == true)
                 || (bundle.manifest.supportsBatchedDecoder == true)
                 || (bundle.manifest.staticKvLen != nil)
+            self.hasSharedR2L = bundle.isV2 && (bundle.manifest.resolvedBosR2LId != nil)
             self.env = try ORTEnv(loggingLevel: .warning)
 
-            let bundleTag = "\(bundle.manifest.modelName)-\(bundle.manifest.epoch ?? 0)-\(bundle.manifest.quantization ?? "fp32")"
+            let pers = bundle.manifest.personalization
+            self.styleDim = pers?.styleDim ?? 64
+            let loraLayersCount = pers?.loraLayers.count ?? 0
+            let loraRank = pers?.loraRank ?? 0
+            let strokeDim = pers?.strokeDim ?? bundle.manifest.strokeDim ?? 576
+            self.supportsDynamicLoRA = bundle.isV2 && (pers?.dynamicLora == true) && loraLayersCount > 0 && loraRank > 0
+            self.loraShapeA = [loraLayersCount, 3, loraRank, strokeDim]
+            self.loraShapeB = [loraLayersCount, 3, strokeDim, loraRank]
+
+            let bundleTag = "\(bundle.manifest.modelName)-\(bundle.manifest.epoch ?? 0)-\(bundle.manifest.quantization ?? "fp32")-\(profile.rawValue)"
                 .replacingOccurrences(of: " ", with: "_")
                 .replacingOccurrences(of: "/", with: "_")
+
+            func fileFallbackTag(_ url: URL) -> String {
+                let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+                let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+                let mtime = Int64(((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0).rounded())
+                return "sz\(size)-t\(mtime)"
+            }
+
+            func graphCacheKey(_ name: String, fileKey: String, url: URL) -> String {
+                let sha = bundle.manifest.files?[fileKey]?.sha256.prefix(12).description ?? fileFallbackTag(url)
+                return "\(bundleTag)/\(name)-\(sha)"
+            }
 
             let wantVisionCoreML = (profile != .off)
             let wantEncodersCoreML = (profile == .encodersAndR2L || profile == .allGraphs)
             let wantDecoderCoreML = (profile == .allGraphs)
+            let useStaticCoreML = self.isV2 && self.staticShapes
 
             var components: [MemoryComponent] = []
             let base = MemoryMonitor.physicalFootprintMB()
             self.baselineMB = base
 
             var before = base
+            var after = base
+
+            if bundle.isV2, let styleURL = bundle.writerStyleURL {
+                // WriterStyleEncoder is tiny (~50K params) and runs ONCE per calibration:
+                // M1 CPU executes it in <0.5 ms with zero CoreML compilation overhead.
+                self.writerStyleSha = bundle.manifest.files?["writer_style"]?.sha256 ?? fileFallbackTag(styleURL)
+                let (styleSess, styleCoreML) = try Self.loadSession(
+                    env: env,
+                    url: styleURL,
+                    tryCoreML: false,
+                    requireStaticShapes: true,
+                    cacheKey: graphCacheKey("writer_style", fileKey: "writer_style", url: styleURL),
+                    threads: 2
+                )
+                self.writerStyleSession = styleSess
+                after = MemoryMonitor.physicalFootprintMB()
+                components.append(MemoryComponent(
+                    id: "writer_style",
+                    name: "Writer Style Encoder (FiLM)",
+                    ramMB: max(0, after - before),
+                    diskMB: MemoryMonitor.fileSizeMB(styleURL),
+                    coreMLEnabled: styleCoreML,
+                    colorRGB: (0.96, 0.45, 0.71)
+                ))
+                before = after
+            } else {
+                self.writerStyleSession = nil
+                self.writerStyleSha = ""
+            }
+
             let (visSess, visCoreML) = try Self.loadSession(
-                env: env, url: bundle.visionEncoderURL,
-                tryCoreML: wantVisionCoreML, cacheKey: "\(bundleTag)/vision", threads: 4
+                env: env,
+                url: bundle.visionEncoderURL,
+                tryCoreML: wantVisionCoreML,
+                requireStaticShapes: useStaticCoreML,
+                cacheKey: graphCacheKey("vision", fileKey: "vision_encoder", url: bundle.visionEncoderURL),
+                threads: 4
             )
             self.visionSession = visSess
-            var after = MemoryMonitor.physicalFootprintMB()
+            after = MemoryMonitor.physicalFootprintMB()
             components.append(MemoryComponent(
                 id: "vision",
-                name: "Vision Encoder (ConvNeXt)",
+                name: bundle.isV2 ? "Vision Encoder (ConvNeXt-V2 + FPN)" : "Vision Encoder (ConvNeXt)",
                 ramMB: max(0, after - before),
                 diskMB: MemoryMonitor.fileSizeMB(bundle.visionEncoderURL),
                 coreMLEnabled: visCoreML,
@@ -159,14 +256,21 @@ public final class InkTeXEngine: ObservableObject {
 
             before = after
             let (strSess, strCoreML) = try Self.loadSession(
-                env: env, url: bundle.strokeEncoderURL,
-                tryCoreML: wantEncodersCoreML, cacheKey: "\(bundleTag)/stroke", threads: 4
+                env: env,
+                url: bundle.strokeEncoderURL,
+                tryCoreML: wantEncodersCoreML,
+                requireStaticShapes: useStaticCoreML,
+                cacheKey: graphCacheKey("stroke", fileKey: "stroke_encoder", url: bundle.strokeEncoderURL),
+                threads: 4
             )
             self.strokeSession = strSess
             after = MemoryMonitor.physicalFootprintMB()
+            let strokeLayerLabel = bundle.manifest.strokeLayers.map { "\($0)L" } ?? (bundle.isV2 ? "13L" : "8L")
             components.append(MemoryComponent(
                 id: "stroke",
-                name: "Stroke Encoder (8L)",
+                name: bundle.isV2
+                    ? "Stroke Encoder (\(strokeLayerLabel)\(self.supportsDynamicLoRA ? " + LoRA" : ""))"
+                    : "Stroke Encoder (\(strokeLayerLabel))",
                 ramMB: max(0, after - before),
                 diskMB: MemoryMonitor.fileSizeMB(bundle.strokeEncoderURL),
                 coreMLEnabled: strCoreML,
@@ -174,15 +278,20 @@ public final class InkTeXEngine: ObservableObject {
             ))
 
             before = after
+            let memFileKey = bundle.isV2 ? "fusion_memproj" : "memory_proj"
             let (projSess, projCoreML) = try Self.loadSession(
-                env: env, url: bundle.memoryProjURL,
-                tryCoreML: wantEncodersCoreML, cacheKey: "\(bundleTag)/memproj", threads: 4
+                env: env,
+                url: bundle.memoryProjURL,
+                tryCoreML: wantEncodersCoreML,
+                requireStaticShapes: useStaticCoreML,
+                cacheKey: graphCacheKey(memFileKey, fileKey: memFileKey, url: bundle.memoryProjURL),
+                threads: 4
             )
             self.memoryProjSession = projSess
             after = MemoryMonitor.physicalFootprintMB()
             components.append(MemoryComponent(
                 id: "memproj",
-                name: "Memory Projection",
+                name: bundle.isV2 ? "Bimodal Fusion + Memory Proj" : "Memory Projection",
                 ramMB: max(0, after - before),
                 diskMB: MemoryMonitor.fileSizeMB(bundle.memoryProjURL),
                 coreMLEnabled: projCoreML,
@@ -191,14 +300,26 @@ public final class InkTeXEngine: ObservableObject {
 
             before = after
             let (decSess, decCoreML) = try Self.loadSession(
-                env: env, url: bundle.decoderStepURL,
-                tryCoreML: wantDecoderCoreML, cacheKey: "\(bundleTag)/decoder", threads: 4
+                env: env,
+                url: bundle.decoderStepURL,
+                tryCoreML: wantDecoderCoreML,
+                requireStaticShapes: false,
+                cacheKey: graphCacheKey("decoder", fileKey: "decoder_step", url: bundle.decoderStepURL),
+                threads: 4
             )
             self.decoderStepSession = decSess
             after = MemoryMonitor.physicalFootprintMB()
+            let decTitle: String
+            if bundle.isV2 {
+                decTitle = "Shared Bidi Decoder (L2R+R2L, KV \(self.staticKvLen ?? 256))"
+            } else if let kv = self.staticKvLen {
+                decTitle = "L2R Decoder (Static KV \(kv))"
+            } else {
+                decTitle = "L2R Decoder (6L KV-Cache)"
+            }
             components.append(MemoryComponent(
                 id: "decoder",
-                name: staticKvLen != nil ? "L2R Decoder (Static KV \(staticKvLen!))" : "L2R Decoder (6L KV-Cache)",
+                name: decTitle,
                 ramMB: max(0, after - before),
                 diskMB: MemoryMonitor.fileSizeMB(bundle.decoderStepURL),
                 coreMLEnabled: decCoreML,
@@ -208,8 +329,12 @@ public final class InkTeXEngine: ObservableObject {
             if let r2lURL = bundle.r2lScorerURL {
                 before = after
                 let (r2lSess, r2lCoreML) = try Self.loadSession(
-                    env: env, url: r2lURL,
-                    tryCoreML: wantEncodersCoreML, cacheKey: "\(bundleTag)/r2l", threads: 4
+                    env: env,
+                    url: r2lURL,
+                    tryCoreML: wantEncodersCoreML,
+                    requireStaticShapes: false,
+                    cacheKey: graphCacheKey("r2l", fileKey: "r2l_scorer", url: r2lURL),
+                    threads: 4
                 )
                 self.r2lScorerSession = r2lSess
                 after = MemoryMonitor.physicalFootprintMB()
@@ -224,6 +349,34 @@ public final class InkTeXEngine: ObservableObject {
             } else {
                 self.r2lScorerSession = nil
             }
+
+            // Pre-allocate reusable zero personalization tensors ONCE at load time (0 allocation per stroke!)
+            if bundle.isV2 {
+                self.zeroStyleTensor = try InkTeXEngine.makeFloatTensor(
+                    [Float](repeating: 0, count: self.styleDim),
+                    shape: [1, self.styleDim]
+                )
+                if self.supportsDynamicLoRA {
+                    let countA = self.loraShapeA.reduce(1, *)
+                    let countB = self.loraShapeB.reduce(1, *)
+                    self.zeroLoraATensor = try InkTeXEngine.makeFloatTensor(
+                        [Float](repeating: 0, count: countA),
+                        shape: self.loraShapeA
+                    )
+                    self.zeroLoraBTensor = try InkTeXEngine.makeFloatTensor(
+                        [Float](repeating: 0, count: countB),
+                        shape: self.loraShapeB
+                    )
+                } else {
+                    self.zeroLoraATensor = nil
+                    self.zeroLoraBTensor = nil
+                }
+            } else {
+                self.zeroStyleTensor = nil
+                self.zeroLoraATensor = nil
+                self.zeroLoraBTensor = nil
+            }
+
             self.memoryComponents = components
         }
 
@@ -241,6 +394,7 @@ public final class InkTeXEngine: ObservableObject {
             env: ORTEnv,
             url: URL,
             tryCoreML: Bool,
+            requireStaticShapes: Bool,
             cacheKey: String,
             threads: Int32
         ) throws -> (ORTSession, Bool) {
@@ -255,7 +409,7 @@ public final class InkTeXEngine: ObservableObject {
                         "ModelFormat": "MLProgram",
                         "MLComputeUnits": "All",
                         "EnableOnSubgraphs": "1",
-                        "RequireStaticInputShapes": "0",
+                        "RequireStaticInputShapes": requireStaticShapes ? "1" : "0",
                         "ModelCacheDirectory": cacheDir.path,
                     ]
                     do {
@@ -328,6 +482,91 @@ public final class InkTeXEngine: ObservableObject {
         reloadModel()
     }
 
+    // MARK: - Personalization Wiring
+
+    /// Updates active writer profile / LoRA adapter state and immediately invalidates
+    /// cached encoder memory & prefix guesses when either digest changes.
+    public func applyPersonalization(_ state: PersonalizationState) {
+        latestPersonalization = state
+        let rt = runtime
+        workerQueue.async {
+            guard let rt else { return }
+            Self.installPersonalization(state, on: rt)
+        }
+    }
+
+    private static func installPersonalization(_ state: PersonalizationState, on rt: LoadedRuntime) {
+        let profileChanged = rt.activeProfileDigest != state.profileDigest
+        let adapterChanged = rt.activeAdapterDigest != state.adapterDigest
+        rt.personalization = state
+        rt.activeProfileDigest = state.profileDigest
+        rt.activeAdapterDigest = state.adapterDigest
+        if profileChanged {
+            rt.cachedStyleDigest = 0
+            rt.cachedStyleTensor = nil
+        }
+        if adapterChanged {
+            rt.cachedAdapterDigest = 0
+            rt.cachedLoraATensor = nil
+            rt.cachedLoraBTensor = nil
+        }
+        if profileChanged || adapterChanged {
+            rt.lastEncoded = nil
+            rt.lastPrefixBodyIds = []
+        }
+    }
+
+    /// Runs `writer_style_v2.onnx` once on calibration strokes so the UI can persist
+    /// and display the enrolled 64-d writer vector immediately.
+    public func computeWriterStyle(strokes: [RawStroke]) async throws -> (vector: [Float], modelSha: String, elapsedMs: Double) {
+        guard let runtime else {
+            throw Self.inferenceError("Model is not loaded yet.")
+        }
+        guard runtime.isV2, let styleSess = runtime.writerStyleSession else {
+            throw Self.inferenceError("Active model is v1 and does not include writer_style_v2.onnx.")
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            workerQueue.async {
+                do {
+                    let t0 = CFAbsoluteTimeGetCurrent()
+                    let pers = runtime.bundle.manifest.personalization
+                    let maxStrokes = pers?.styleMaxStrokes ?? InkPreprocessorV2.styleMaxStrokes
+                    let ptsPerStroke = pers?.stylePoints ?? InkPreprocessorV2.stylePoints
+                    let styleIn = InkPreprocessorV2.extractStyleStrokes(
+                        strokes: strokes,
+                        maxStrokes: maxStrokes,
+                        pointsPerStroke: ptsPerStroke
+                    )
+                    let ptsVal = try Self.makeFloatTensor(
+                        styleIn.stylePoints,
+                        shape: [1, maxStrokes, ptsPerStroke, InkPreprocessorV2.stylePointDim]
+                    )
+                    let aspVal = try Self.makeFloatTensor(styleIn.styleAspect, shape: [1, maxStrokes, 4])
+                    let maskVal = try Self.makeUInt8Tensor(styleIn.styleMask, shape: [1, maxStrokes])
+                    let out = try styleSess.run(
+                        withInputs: [
+                            "style_points": ptsVal,
+                            "style_aspect": aspVal,
+                            "style_mask": maskVal,
+                        ],
+                        outputNames: ["writer_style"],
+                        runOptions: nil
+                    )
+                    guard let wsVal = out["writer_style"] else {
+                        throw Self.inferenceError("Missing 'writer_style' output from writer_style_v2.onnx")
+                    }
+                    let vec = try Self.extractFloats(wsVal)
+                    let ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+                    continuation.resume(returning: (vec, runtime.writerStyleSha, ms))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    // MARK: - Cache & Model Lifecycle
+
     public func clearCaches() {
         let rt = runtime
         workerQueue.async {
@@ -377,6 +616,7 @@ public final class InkTeXEngine: ObservableObject {
         status = .loading
         let profile = coreMLProfile
         let preferred = preferredBundleId
+        let currentPersonalization = latestPersonalization
         runtime = nil
         workerQueue.async { [weak self] in
             guard let self else { return }
@@ -389,7 +629,11 @@ public final class InkTeXEngine: ObservableObject {
                     self.availableBundles = allBundles
                     self.runtime = nil
                     self.loadedBundle = nil
+                    self.isV2Model = false
                     self.hasR2LScorer = false
+                    self.hasSharedR2L = false
+                    self.supportsDynamicLoRA = false
+                    self.activeStyleModelSha = nil
                     self.supportsV2FastDecode = false
                     self.staticKvLen = nil
                     self.peakFootprintMB = max(self.peakFootprintMB, current)
@@ -407,8 +651,13 @@ public final class InkTeXEngine: ObservableObject {
             }
             do {
                 let loaded = try LoadedRuntime(bundle: bundle, profile: profile)
-                let hasR2L = loaded.r2lScorerSession != nil
-                let isV2 = loaded.isV2Decoder
+                Self.installPersonalization(currentPersonalization, on: loaded)
+                let isV2 = loaded.isV2
+                let hasShared = loaded.hasSharedR2L
+                let hasR2L = hasShared || (loaded.r2lScorerSession != nil)
+                let dynLora = loaded.supportsDynamicLoRA
+                let styleSha = loaded.writerStyleSha.isEmpty ? nil : loaded.writerStyleSha
+                let isFastDec = loaded.isV2Decoder
                 let staticKV = loaded.staticKvLen
                 let afterLoad = MemoryMonitor.physicalFootprintMB()
                 let headroom = MemoryMonitor.availableHeadroomMB()
@@ -417,8 +666,12 @@ public final class InkTeXEngine: ObservableObject {
                     self.runtime = loaded
                     self.loadedBundle = bundle
                     self.preferredBundleId = bundle.id
+                    self.isV2Model = isV2
                     self.hasR2LScorer = hasR2L
-                    self.supportsV2FastDecode = isV2
+                    self.hasSharedR2L = hasShared
+                    self.supportsDynamicLoRA = dynLora
+                    self.activeStyleModelSha = styleSha
+                    self.supportsV2FastDecode = isFastDec
                     self.staticKvLen = staticKV
                     self.peakFootprintMB = max(self.peakFootprintMB, afterLoad)
                     self.memorySnapshot = MemorySnapshot(
@@ -436,7 +689,11 @@ public final class InkTeXEngine: ObservableObject {
                     self.availableBundles = allBundles
                     self.runtime = nil
                     self.loadedBundle = bundle
+                    self.isV2Model = false
                     self.hasR2LScorer = false
+                    self.hasSharedR2L = false
+                    self.supportsDynamicLoRA = false
+                    self.activeStyleModelSha = nil
                     self.supportsV2FastDecode = false
                     self.staticKvLen = nil
                     self.status = .failed(error.localizedDescription)
@@ -503,7 +760,11 @@ public final class InkTeXEngine: ObservableObject {
         let manifest = runtime.bundle.manifest
 
         // 1. Encode canvas (or reuse cached memory between Phase 1 Greedy & Phase 2 Beam+R2L)
-        let fp = fingerprintStrokes(strokes)
+        let fp = fingerprintStrokes(
+            strokes,
+            profileDigest: runtime.activeProfileDigest,
+            adapterDigest: runtime.activeAdapterDigest
+        )
         let encoded: EncodedMemoryCache
         let encodeMs: Double
         let encoderCacheHit: Bool
@@ -514,17 +775,24 @@ public final class InkTeXEngine: ObservableObject {
             encoderCacheHit = true
         } else {
             let encodeStart = CFAbsoluteTimeGetCurrent()
-            encoded = try encodeCanvas(runtime: runtime, strokes: strokes, modality: modality, fingerprint: fp)
+            if runtime.isV2 {
+                encoded = try encodeCanvasV2(runtime: runtime, strokes: strokes, modality: modality, fingerprint: fp)
+            } else {
+                encoded = try encodeCanvasV1(runtime: runtime, strokes: strokes, modality: modality, fingerprint: fp)
+            }
             encodeMs = (CFAbsoluteTimeGetCurrent() - encodeStart) * 1000.0
             runtime.lastEncoded = encoded
             encoderCacheHit = false
         }
 
-        // 2. Decode (Static-KV v3 / Dynamic-KV v2 / Legacy v1)
+        // 2. Decode (InkTeX v2 Shared Static-KV / v1 Static-KV / Legacy)
         let decodeStart = CFAbsoluteTimeGetCurrent()
         let kvCap = (runtime.staticKvLen ?? manifest.maxTokens) - 1
         let tokenLimit = min(maxTokens, kvCap)
-        let specialSet: Set<Int> = [manifest.padId, manifest.bosId, manifest.eosId, manifest.unkId]
+        var specialSet: Set<Int> = [manifest.padId, manifest.resolvedBosL2RId, manifest.eosId, manifest.unkId]
+        if let r2lBos = manifest.resolvedBosR2LId {
+            specialSet.insert(r2lBos)
+        }
 
         struct CandidateSeq {
             var bodyIds: [Int]
@@ -599,50 +867,66 @@ public final class InkTeXEngine: ObservableObject {
         }
         let decodeMs = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1000.0
 
-        // 3. Optional R2L Bidirectional Reranking (1 batched pass)
+        // 3. Optional R2L Bidirectional Reranking (1 batched parallel pass!)
         var r2lMs: Double = 0
         var r2lScores: [Double]? = nil
         var r2lUsed = false
 
-        if decodingMode == .beamR2L, let r2lSession = runtime.r2lScorerSession, !uniqueCandidates.isEmpty {
-            let r2lStart = CFAbsoluteTimeGetCurrent()
-            let r2lSeqs: [[Int64]] = uniqueCandidates.map { c in
-                var seq: [Int64] = [Int64(manifest.bosId)]
-                seq.reserveCapacity(c.bodyIds.count + 2)
-                for id in c.bodyIds.reversed() {
-                    seq.append(Int64(id))
+        if decodingMode == .beamR2L, !uniqueCandidates.isEmpty {
+            if runtime.hasSharedR2L, let bosR2L = manifest.resolvedBosR2LId {
+                // InkTeX v2 unified shared bidirectional decoder: scores ALL beams in ONE forward pass with zero extra RAM!
+                let r2lStart = CFAbsoluteTimeGetCurrent()
+                r2lScores = try scoreR2LSharedDecoderV2(
+                    runtime: runtime,
+                    encoded: encoded,
+                    candidates: uniqueCandidates.map(\.bodyIds),
+                    bosR2LId: bosR2L,
+                    eosId: manifest.eosId,
+                    padId: manifest.padId,
+                    maxStepLen: kvCap
+                )
+                r2lUsed = (r2lScores != nil)
+                r2lMs = (CFAbsoluteTimeGetCurrent() - r2lStart) * 1000.0
+            } else if let r2lSession = runtime.r2lScorerSession {
+                let r2lStart = CFAbsoluteTimeGetCurrent()
+                let r2lSeqs: [[Int64]] = uniqueCandidates.map { c in
+                    var seq: [Int64] = [Int64(manifest.resolvedBosL2RId)]
+                    seq.reserveCapacity(c.bodyIds.count + 2)
+                    for id in c.bodyIds.reversed() {
+                        seq.append(Int64(id))
+                    }
+                    seq.append(Int64(manifest.eosId))
+                    return seq
                 }
-                seq.append(Int64(manifest.eosId))
-                return seq
-            }
-            let maxLen = max(2, r2lSeqs.map(\.count).max() ?? 2)
-            let batchCount = r2lSeqs.count
-            var tokFlat = [Int64](repeating: Int64(manifest.padId), count: batchCount * maxLen)
-            var padFlat = [UInt8](repeating: 1, count: batchCount * maxLen)
-            for (row, seq) in r2lSeqs.enumerated() {
-                let base = row * maxLen
-                for (col, id) in seq.enumerated() {
-                    tokFlat[base + col] = id
-                    padFlat[base + col] = 0
+                let maxLen = max(2, r2lSeqs.map(\.count).max() ?? 2)
+                let batchCount = r2lSeqs.count
+                var tokFlat = [Int64](repeating: Int64(manifest.padId), count: batchCount * maxLen)
+                var padFlat = [UInt8](repeating: 1, count: batchCount * maxLen)
+                for (row, seq) in r2lSeqs.enumerated() {
+                    let base = row * maxLen
+                    for (col, id) in seq.enumerated() {
+                        tokFlat[base + col] = id
+                        padFlat[base + col] = 0
+                    }
                 }
+                let tokTensor = try makeInt64Tensor(tokFlat, shape: [batchCount, maxLen])
+                let padTensor = try makeUInt8Tensor(padFlat, shape: [batchCount, maxLen])
+                let r2lOut = try r2lSession.run(
+                    withInputs: [
+                        "r2l_tokens": tokTensor,
+                        "r2l_padding_mask": padTensor,
+                        "memory": encoded.memTensor,
+                        "memory_mask": encoded.memMaskVal,
+                    ],
+                    outputNames: ["seq_log_prob", "avg_log_prob"],
+                    runOptions: nil
+                )
+                if let avgVal = r2lOut["avg_log_prob"] {
+                    r2lScores = try extractFloats(avgVal).map { Double($0) }
+                    r2lUsed = true
+                }
+                r2lMs = (CFAbsoluteTimeGetCurrent() - r2lStart) * 1000.0
             }
-            let tokTensor = try makeInt64Tensor(tokFlat, shape: [batchCount, maxLen])
-            let padTensor = try makeUInt8Tensor(padFlat, shape: [batchCount, maxLen])
-            let r2lOut = try r2lSession.run(
-                withInputs: [
-                    "r2l_tokens": tokTensor,
-                    "r2l_padding_mask": padTensor,
-                    "memory": encoded.memTensor,
-                    "memory_mask": encoded.memMaskVal,
-                ],
-                outputNames: ["seq_log_prob", "avg_log_prob"],
-                runOptions: nil
-            )
-            if let avgVal = r2lOut["avg_log_prob"] {
-                r2lScores = try extractFloats(avgVal).map { Double($0) }
-                r2lUsed = true
-            }
-            r2lMs = (CFAbsoluteTimeGetCurrent() - r2lStart) * 1000.0
         }
 
         // 4. Rank & pick winner
@@ -683,7 +967,8 @@ public final class InkTeXEngine: ObservableObject {
             overallConf = Float(exp(meanLog))
         }
 
-        let gridH = encoded.visionMemLen > 0 ? max(1, encoded.strip.height / 16) : 0
+        let vStride = manifest.vision.verticalStride ?? (runtime.isV2 ? 8 : 16)
+        let gridH = encoded.visionMemLen > 0 ? max(1, encoded.strip.height / vStride) : 0
         let gridW = gridH > 0 ? (encoded.visionMemLen / gridH) : 0
 
         return RecognitionResult(
@@ -709,13 +994,271 @@ public final class InkTeXEngine: ObservableObject {
             prefixVerifiedCount: prefixVerifiedCount,
             encoderCacheHit: encoderCacheHit,
             beams: beamSummaries,
-            truncated: !winner.isFinished
+            truncated: !winner.isFinished,
+            isV2Model: runtime.isV2,
+            chunkBucket: encoded.chunkBucket,
+            activeProfileName: encoded.activeProfileName,
+            usedWriterStyle: encoded.usedWriterStyle,
+            usedLoRAAdapter: encoded.usedLoRAAdapter,
+            matchedCorrectionCache: false
         )
     }
 
-    // MARK: - Canvas Encoding
+    // MARK: - InkTeX v2 Canvas Encoding + Cached Personalization
 
-    private static func encodeCanvas(
+    private static func resolveWriterStyleTensor(runtime: LoadedRuntime) throws -> (ORTValue, Bool) {
+        let p = runtime.personalization
+        guard p.styleEnabled, !p.calibrationStrokes.isEmpty else {
+            guard let zero = runtime.zeroStyleTensor else {
+                throw inferenceError("Missing pre-allocated zero writer_style tensor.")
+            }
+            return (zero, false)
+        }
+        if runtime.cachedStyleDigest == p.profileDigest, let cached = runtime.cachedStyleTensor {
+            return (cached, true)
+        }
+        if let vec = p.cachedStyleVector,
+           vec.count == runtime.styleDim,
+           p.cachedStyleModelSha == runtime.writerStyleSha {
+            let tensor = try makeFloatTensor(vec, shape: [1, runtime.styleDim])
+            runtime.cachedStyleDigest = p.profileDigest
+            runtime.cachedStyleTensor = tensor
+            return (tensor, true)
+        }
+        guard let styleSess = runtime.writerStyleSession else {
+            guard let zero = runtime.zeroStyleTensor else {
+                throw inferenceError("Missing writer_style session and zero fallback.")
+            }
+            return (zero, false)
+        }
+        let pers = runtime.bundle.manifest.personalization
+        let maxStrokes = pers?.styleMaxStrokes ?? InkPreprocessorV2.styleMaxStrokes
+        let ptsPerStroke = pers?.stylePoints ?? InkPreprocessorV2.stylePoints
+        let styleIn = InkPreprocessorV2.extractStyleStrokes(
+            strokes: p.calibrationStrokes,
+            maxStrokes: maxStrokes,
+            pointsPerStroke: ptsPerStroke
+        )
+        let ptsVal = try makeFloatTensor(
+            styleIn.stylePoints,
+            shape: [1, maxStrokes, ptsPerStroke, InkPreprocessorV2.stylePointDim]
+        )
+        let aspVal = try makeFloatTensor(styleIn.styleAspect, shape: [1, maxStrokes, 4])
+        let maskVal = try makeUInt8Tensor(styleIn.styleMask, shape: [1, maxStrokes])
+        let out = try styleSess.run(
+            withInputs: [
+                "style_points": ptsVal,
+                "style_aspect": aspVal,
+                "style_mask": maskVal,
+            ],
+            outputNames: ["writer_style"],
+            runOptions: nil
+        )
+        guard let wsVal = out["writer_style"] else {
+            throw inferenceError("Missing 'writer_style' output from writer_style_v2.onnx")
+        }
+        runtime.cachedStyleDigest = p.profileDigest
+        runtime.cachedStyleTensor = wsVal
+        return (wsVal, true)
+    }
+
+    private static func resolveLoRATensors(runtime: LoadedRuntime) throws -> (ORTValue, ORTValue, Bool) {
+        guard let zeroA = runtime.zeroLoraATensor, let zeroB = runtime.zeroLoraBTensor else {
+            throw inferenceError("Missing pre-allocated zero LoRA tensors.")
+        }
+        let p = runtime.personalization
+        guard p.loraEnabled, let weights = p.loraWeights else {
+            return (zeroA, zeroB, false)
+        }
+        guard weights.metadata.loraAShape == runtime.loraShapeA,
+              weights.metadata.loraBShape == runtime.loraShapeB else {
+            // Incompatible adapter dimensions for this model preset -> fail safely to base weights
+            return (zeroA, zeroB, false)
+        }
+        if runtime.cachedAdapterDigest == p.adapterDigest,
+           let ca = runtime.cachedLoraATensor,
+           let cb = runtime.cachedLoraBTensor {
+            return (ca, cb, true)
+        }
+        let aVal = try makeFloatTensor(weights.loraA, shape: runtime.loraShapeA)
+        let bVal = try makeFloatTensor(weights.loraB, shape: runtime.loraShapeB)
+        runtime.cachedAdapterDigest = p.adapterDigest
+        runtime.cachedLoraATensor = aVal
+        runtime.cachedLoraBTensor = bVal
+        return (aVal, bVal, true)
+    }
+
+    private static func encodeCanvasV2(
+        runtime: LoadedRuntime,
+        strokes: [RawStroke],
+        modality: ModalityMode,
+        fingerprint: UInt64
+    ) throws -> EncodedMemoryCache {
+        let manifest = runtime.bundle.manifest
+        let staticChunkBucket: Int? = runtime.staticShapes ? manifest.preprocessing.resolvedChunkBuckets.first : nil
+        let staticWidthBucket: Int? = runtime.staticShapes ? manifest.vision.resolvedWidthBuckets.first : nil
+
+        let strip = StripRasterizer.renderV2(
+            strokes: strokes,
+            config: manifest.vision,
+            bucketOverride: staticWidthBucket
+        )
+
+        var strokeMemVal: ORTValue
+        var strokeMaskVal: ORTValue
+        var strokeMemLen = 0
+        var strokeCount = strokes.count
+        var pointCount = 0
+        var chunkBucketUsed: Int? = nil
+        var usedWriterStyle = false
+        var usedLoRA = false
+
+        if modality == .bimodal || modality == .stroke {
+            let chunked = InkPreprocessorV2.chunkInk(
+                strokes: strokes,
+                config: manifest.preprocessing,
+                bucketOverride: staticChunkBucket
+            )
+            strokeCount = chunked.strokeCount
+            pointCount = chunked.pointCount
+            chunkBucketUsed = chunked.bucket
+            strokeMemLen = chunked.bucket
+
+            let (styleVal, styleActive) = try resolveWriterStyleTensor(runtime: runtime)
+            usedWriterStyle = styleActive
+
+            let cpVal = try makeFloatTensor(
+                chunked.chunkPoints,
+                shape: [1, chunked.bucket, chunked.chunkSize, InkPreprocessorV2.pointFeatureDim]
+            )
+            let cpmVal = try makeUInt8Tensor(
+                chunked.chunkPointMask,
+                shape: [1, chunked.bucket, chunked.chunkSize]
+            )
+            let cmVal = try makeFloatTensor(
+                chunked.chunkMeta,
+                shape: [1, chunked.bucket, InkPreprocessorV2.chunkMetaDim]
+            )
+            let ckVal = try makeUInt8Tensor(chunked.chunkMask, shape: [1, chunked.bucket])
+
+            var inputs: [String: ORTValue] = [
+                "chunk_points": cpVal,
+                "chunk_point_mask": cpmVal,
+                "chunk_meta": cmVal,
+                "chunk_mask": ckVal,
+                "writer_style": styleVal,
+            ]
+            if runtime.supportsDynamicLoRA {
+                let (la, lb, loraActive) = try resolveLoRATensors(runtime: runtime)
+                inputs["lora_a"] = la
+                inputs["lora_b"] = lb
+                usedLoRA = loraActive
+            }
+            let stOut = try runtime.strokeSession.run(
+                withInputs: inputs,
+                outputNames: ["stroke_memory"],
+                runOptions: nil
+            )
+            guard let sm = stOut["stroke_memory"] else {
+                throw inferenceError("Missing 'stroke_memory' output from stroke_encoder_v2.onnx")
+            }
+            strokeMemVal = sm
+            strokeMaskVal = ckVal
+        } else {
+            // Vision-only: skip stroke encoder completely and pass minimal all-masked placeholder to fusion
+            let dummyChunks = staticChunkBucket ?? 1
+            strokeMemLen = dummyChunks
+            strokeMemVal = try makeFloatTensor(
+                [Float](repeating: 0, count: dummyChunks * manifest.dModel),
+                shape: [1, dummyChunks, manifest.dModel]
+            )
+            strokeMaskVal = try makeUInt8Tensor([UInt8](repeating: 1, count: dummyChunks), shape: [1, dummyChunks])
+        }
+
+        var visionMemVal: ORTValue
+        var visionMaskVal: ORTValue
+        var visionMemLen = 0
+
+        if modality == .bimodal || modality == .vision {
+            let imgVal = try makeFloatTensor(
+                strip.tensor,
+                shape: [1, manifest.vision.channels, strip.height, strip.width]
+            )
+            let widthVal = try makeInt64Tensor([Int64(strip.usedWidth)], shape: [1])
+            let visOut = try runtime.visionSession.run(
+                withInputs: [
+                    "images": imgVal,
+                    "image_widths": widthVal,
+                ],
+                outputNames: ["vision_memory", "vision_mask"],
+                runOptions: nil
+            )
+            guard let vm = visOut["vision_memory"], let vmask = visOut["vision_mask"] else {
+                throw inferenceError("Missing outputs from vision_encoder_v2.onnx")
+            }
+            let vmShape = try vm.tensorTypeAndShapeInfo().shape.map(\.intValue)
+            visionMemLen = vmShape[1]
+            visionMemVal = vm
+            visionMaskVal = vmask
+        } else {
+            // Stroke-only: skip vision encoder completely and pass minimal all-masked placeholder (vision_avail == 0 -> exact no-op in fusion!)
+            let hRows = max(1, manifest.vision.height / (manifest.vision.verticalStride ?? 8))
+            let dummyVisTokens: Int
+            if let sw = staticWidthBucket {
+                dummyVisTokens = hRows * max(1, sw / (manifest.vision.horizontalStride ?? 16))
+            } else {
+                dummyVisTokens = hRows
+            }
+            visionMemLen = 0
+            visionMemVal = try makeFloatTensor(
+                [Float](repeating: 0, count: dummyVisTokens * manifest.dModel),
+                shape: [1, dummyVisTokens, manifest.dModel]
+            )
+            visionMaskVal = try makeUInt8Tensor([UInt8](repeating: 1, count: dummyVisTokens), shape: [1, dummyVisTokens])
+        }
+
+        let fusionOut = try runtime.memoryProjSession.run(
+            withInputs: [
+                "stroke_memory": strokeMemVal,
+                "stroke_mask": strokeMaskVal,
+                "vision_memory": visionMemVal,
+                "vision_mask": visionMaskVal,
+            ],
+            outputNames: ["memory", "memory_mask", "mk", "mv"],
+            runOptions: nil
+        )
+        guard let memVal = fusionOut["memory"],
+              let memMaskVal = fusionOut["memory_mask"],
+              let mkVal = fusionOut["mk"],
+              let mvVal = fusionOut["mv"] else {
+            throw inferenceError("Missing outputs from fusion_memproj_v2.onnx")
+        }
+        let memShape = try memVal.tensorTypeAndShapeInfo().shape.map(\.intValue)
+        let totalMemLen = memShape[1]
+
+        return EncodedMemoryCache(
+            fingerprint: fingerprint,
+            modality: modality,
+            strip: strip,
+            strokeCount: strokeCount,
+            pointCount: pointCount,
+            strokeMemLen: strokeMemLen,
+            visionMemLen: visionMemLen,
+            totalMemLen: totalMemLen,
+            chunkBucket: chunkBucketUsed,
+            usedWriterStyle: usedWriterStyle,
+            usedLoRAAdapter: usedLoRA,
+            activeProfileName: runtime.personalization.profileName,
+            memTensor: memVal,
+            memMaskVal: memMaskVal,
+            mkVal: mkVal,
+            mvVal: mvVal
+        )
+    }
+
+    // MARK: - Legacy InkTeX v1 Canvas Encoding
+
+    private static func encodeCanvasV1(
         runtime: LoadedRuntime,
         strokes: [RawStroke],
         modality: ModalityMode,
@@ -818,16 +1361,21 @@ public final class InkTeXEngine: ObservableObject {
         )
     }
 
-    // MARK: - Decoder Feed Helper (v3 Static KV + v2/v1 Dynamic KV)
+    // MARK: - Decoder Feed Helpers (Unified v2 + v1)
+
+    private static func decoderOutputNames(isV2: Bool) -> Set<String> {
+        isV2 ? ["logits", "new_k", "new_v"] : ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"]
+    }
 
     private static func makeDecoderInputs(
+        isV2: Bool,
         token: ORTValue,
         cachePos: Int?,
         pastK: ORTValue,
         pastV: ORTValue,
         encoded: EncodedMemoryCache,
-        coverage: ORTValue,
-        prevWeights: ORTValue
+        coverage: ORTValue?,
+        prevWeights: ORTValue?
     ) throws -> [String: ORTValue] {
         var feed: [String: ORTValue] = [
             "token": token,
@@ -836,16 +1384,102 @@ public final class InkTeXEngine: ObservableObject {
             "mk": encoded.mkVal,
             "mv": encoded.mvVal,
             "memory_mask": encoded.memMaskVal,
-            "coverage": coverage,
-            "prev_weights": prevWeights,
         ]
         if let pos = cachePos {
             feed["cache_pos"] = try makeInt64Tensor([Int64(pos)], shape: [1])
         }
+        if !isV2 {
+            if let coverage { feed["coverage"] = coverage }
+            if let prevWeights { feed["prev_weights"] = prevWeights }
+        }
         return feed
     }
 
-    // MARK: - 1. Prefix-Verified Parallel Greedy Decoding (Zero-Slice KV on v3!)
+    // MARK: - Shared Bidirectional R2L Reranking (InkTeX v2 — Single Batched Pass!)
+
+    private static func scoreR2LSharedDecoderV2(
+        runtime: LoadedRuntime,
+        encoded: EncodedMemoryCache,
+        candidates: [[Int]],
+        bosR2LId: Int,
+        eosId: Int,
+        padId: Int,
+        maxStepLen: Int
+    ) throws -> [Double]? {
+        guard !candidates.isEmpty, let staticKV = runtime.staticKvLen else { return nil }
+        let manifest = runtime.bundle.manifest
+        let L = manifest.decoderLayers
+        let H = manifest.attentionHeads
+        let D = manifest.headDim
+        let V = manifest.vocabSize
+        let B = candidates.count
+
+        var inSeqs: [[Int64]] = []
+        var targetSeqs: [[Int]] = []
+        inSeqs.reserveCapacity(B)
+        targetSeqs.reserveCapacity(B)
+
+        for body in candidates {
+            let rev = Array(body.reversed().prefix(max(0, maxStepLen - 1)))
+            var inp: [Int64] = [Int64(bosR2LId)]
+            inp.reserveCapacity(rev.count + 1)
+            var tgt: [Int] = []
+            tgt.reserveCapacity(rev.count + 1)
+            for id in rev {
+                inp.append(Int64(id))
+                tgt.append(id)
+            }
+            tgt.append(eosId)
+            inSeqs.append(inp)
+            targetSeqs.append(tgt)
+        }
+
+        let maxS = max(1, inSeqs.map(\.count).max() ?? 1)
+        var tokFlat = [Int64](repeating: Int64(padId), count: B * maxS)
+        for (row, seq) in inSeqs.enumerated() {
+            let base = row * maxS
+            for (col, id) in seq.enumerated() {
+                tokFlat[base + col] = id
+            }
+        }
+
+        let zeroKVCount = L * B * H * staticKV * D
+        let initK = try makeFloatTensor([Float](repeating: 0, count: zeroKVCount), shape: [L, B, H, staticKV, D])
+        let initV = try makeFloatTensor([Float](repeating: 0, count: zeroKVCount), shape: [L, B, H, staticKV, D])
+        let feed = try makeDecoderInputs(
+            isV2: true,
+            token: try makeInt64Tensor(tokFlat, shape: [B, maxS]),
+            cachePos: 0,
+            pastK: initK,
+            pastV: initV,
+            encoded: encoded,
+            coverage: nil,
+            prevWeights: nil
+        )
+        let out = try runtime.decoderStepSession.run(
+            withInputs: feed,
+            outputNames: ["logits"],
+            runOptions: nil
+        )
+        guard let logitsVal = out["logits"] else {
+            throw inferenceError("Missing 'logits' output during shared v2 R2L scoring")
+        }
+        let allLogits = try extractFloats(logitsVal)
+
+        var scores = [Double](repeating: 0, count: B)
+        for b in 0..<B {
+            let tgt = targetSeqs[b]
+            var sumLP = 0.0
+            for t in 0..<tgt.count {
+                let offset = (b * maxS + t) * V
+                sumLP += logSoftmaxAt(allLogits, offset: offset, count: V, targetId: tgt[t])
+            }
+            scores[b] = sumLP / Double(max(1, tgt.count))
+        }
+        return scores
+    }
+
+    // MARK: - 1. Prefix-Verified Parallel Greedy Decoding (Zero-Slice Static KV!)
 
     private static func decodePrefixVerifiedGreedy(
         runtime: LoadedRuntime,
@@ -855,26 +1489,29 @@ public final class InkTeXEngine: ObservableObject {
         specialSet: Set<Int>
     ) throws -> (bodyIds: [Int], tokens: [DecodedToken], avgLogProb: Double, isFinished: Bool, verifiedCount: Int) {
         let manifest = runtime.bundle.manifest
+        let isV2 = runtime.isV2
         let L = manifest.decoderLayers
         let H = manifest.attentionHeads
         let D = manifest.headDim
         let M = encoded.totalMemLen
         let V = manifest.vocabSize
+        let bosId = manifest.resolvedBosL2RId
         let staticKV = runtime.staticKvLen
         let initKVLen = staticKV ?? 1
 
         let cappedGuess = Array(prevGuess.prefix(max(1, tokenLimit - 1)))
         let S = cappedGuess.count + 1
-        var inputIds: [Int64] = [Int64(manifest.bosId)]
+        var inputIds: [Int64] = [Int64(bosId)]
         inputIds.reserveCapacity(S)
         for id in cappedGuess { inputIds.append(Int64(id)) }
 
         let initK = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * initKVLen * D), shape: [L, 1, H, initKVLen, D])
         let initV = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * initKVLen * D), shape: [L, 1, H, initKVLen, D])
-        let initCov = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
-        let initPrev = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        let initCov: ORTValue? = isV2 ? nil : try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        let initPrev: ORTValue? = isV2 ? nil : try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
 
         let feed = try makeDecoderInputs(
+            isV2: isV2,
             token: try makeInt64Tensor(inputIds, shape: [1, S]),
             cachePos: staticKV != nil ? 0 : nil,
             pastK: initK,
@@ -885,19 +1522,17 @@ public final class InkTeXEngine: ObservableObject {
         )
         let out = try runtime.decoderStepSession.run(
             withInputs: feed,
-            outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
+            outputNames: decoderOutputNames(isV2: isV2),
             runOptions: nil
         )
         guard let logitsVal = out["logits"],
               let newKVal = out["new_k"],
-              let newVVal = out["new_v"],
-              let newCovVal = out["new_coverage"],
-              let newPrevVal = out["new_prev_weights"] else {
-            throw inferenceError("Missing outputs from decoder_step.onnx during prefix verification")
+              let newVVal = out["new_v"] else {
+            throw inferenceError("Missing outputs from decoder_step during prefix verification")
         }
 
         let allLogits = try extractFloats(logitsVal)
-        let allPrevW = try extractFloats(newPrevVal)
+        let allPrevW: [Float]? = isV2 ? nil : try out["new_prev_weights"].map { try extractFloats($0) }
 
         var bodyIds: [Int] = []
         var decodedTokens: [DecodedToken] = []
@@ -905,7 +1540,7 @@ public final class InkTeXEngine: ObservableObject {
         var stepCount = 0
         var divergeIndex: Int? = nil
         var hitEOS = false
-        var lastPredictedId: Int = manifest.bosId
+        var lastPredictedId: Int = bosId
 
         for i in 0..<S {
             let choice = argmaxLogSoftmax(allLogits, offset: i * V, count: V)
@@ -920,8 +1555,8 @@ public final class InkTeXEngine: ObservableObject {
             }
 
             if !specialSet.contains(choice.id) {
-                let attn = encoded.visionMemLen > 0
-                    ? extractVisionAttentionAtStep(allPrevW, numHeads: H, stepLen: S, stepIdx: i, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
+                let attn: [Float]? = (!isV2 && encoded.visionMemLen > 0 && allPrevW != nil)
+                    ? extractVisionAttentionAtStep(allPrevW!, numHeads: H, stepLen: S, stepIdx: i, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
                     : nil
                 bodyIds.append(choice.id)
                 decodedTokens.append(makeToken(stepIdx: i, tokenId: choice.id, prob: choice.prob, visionAttn: attn, manifest: manifest))
@@ -957,35 +1592,36 @@ public final class InkTeXEngine: ObservableObject {
                     for h in 0..<H {
                         let srcBase = ((l * H + h) * fullT) * D
                         let dstBase = ((l * H + h) * keepT) * D
-                        for j in 0..<copyFloats {
-                            slicedK[dstBase + j] = fullK[srcBase + j]
-                            slicedV[dstBase + j] = fullV[srcBase + j]
-                        }
+                        copyFloatSlice(src: fullK, srcOffset: srcBase, dst: &slicedK, dstOffset: dstBase, count: copyFloats)
+                        copyFloatSlice(src: fullV, srcOffset: srcBase, dst: &slicedV, dstOffset: dstBase, count: copyFloats)
                     }
                 }
                 pastK = try makeFloatTensor(slicedK, shape: [L, 1, H, keepT, D])
                 pastV = try makeFloatTensor(slicedV, shape: [L, 1, H, keepT, D])
             }
 
-            let fullCov = try extractFloats(newCovVal)
-            var slicedCov = [Float](repeating: 0, count: H * M)
-            var slicedPrev = [Float](repeating: 0, count: H * M)
-            for h in 0..<H {
-                let srcBase = (h * S + divI) * M
-                let dstBase = h * M
-                for m in 0..<M {
-                    slicedCov[dstBase + m] = fullCov[srcBase + m]
-                    slicedPrev[dstBase + m] = allPrevW[srcBase + m]
+            var coverage: ORTValue? = nil
+            var prevWeights: ORTValue? = nil
+            if !isV2, let newCovVal = out["new_coverage"], let prevW = allPrevW {
+                let fullCov = try extractFloats(newCovVal)
+                var slicedCov = [Float](repeating: 0, count: H * M)
+                var slicedPrev = [Float](repeating: 0, count: H * M)
+                for h in 0..<H {
+                    let srcBase = (h * S + divI) * M
+                    let dstBase = h * M
+                    copyFloatSlice(src: fullCov, srcOffset: srcBase, dst: &slicedCov, dstOffset: dstBase, count: M)
+                    copyFloatSlice(src: prevW, srcOffset: srcBase, dst: &slicedPrev, dstOffset: dstBase, count: M)
                 }
+                coverage = try makeFloatTensor(slicedCov, shape: [1, H, 1, M])
+                prevWeights = try makeFloatTensor(slicedPrev, shape: [1, H, 1, M])
             }
 
-            var coverage = try makeFloatTensor(slicedCov, shape: [1, H, 1, M])
-            var prevWeights = try makeFloatTensor(slicedPrev, shape: [1, H, 1, M])
             var curTok = Int64(lastPredictedId)
             var nextPos = divI + 1
 
             while stepCount < tokenLimit {
                 let stFeed = try makeDecoderInputs(
+                    isV2: isV2,
                     token: try makeInt64Tensor([curTok], shape: [1, 1]),
                     cachePos: staticKV != nil ? nextPos : nil,
                     pastK: pastK,
@@ -996,15 +1632,13 @@ public final class InkTeXEngine: ObservableObject {
                 )
                 let stepOut = try runtime.decoderStepSession.run(
                     withInputs: stFeed,
-                    outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
+                    outputNames: decoderOutputNames(isV2: isV2),
                     runOptions: nil
                 )
                 guard let lVal = stepOut["logits"],
                       let nk = stepOut["new_k"],
-                      let nv = stepOut["new_v"],
-                      let nc = stepOut["new_coverage"],
-                      let np = stepOut["new_prev_weights"] else {
-                    throw inferenceError("Missing outputs from decoder_step.onnx")
+                      let nv = stepOut["new_v"] else {
+                    throw inferenceError("Missing outputs from decoder_step")
                 }
                 let logits = try extractFloats(lVal)
                 let choice = argmaxLogSoftmax(logits, offset: 0, count: V)
@@ -1018,17 +1652,28 @@ public final class InkTeXEngine: ObservableObject {
                     break
                 }
                 if !specialSet.contains(choice.id) {
-                    let attn = encoded.visionMemLen > 0
-                        ? averageVisionAttention(weights: try extractFloats(np), numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
-                        : nil
+                    let attn: [Float]?
+                    if !isV2, encoded.visionMemLen > 0, let np = stepOut["new_prev_weights"] {
+                        attn = averageVisionAttention(
+                            weights: try extractFloats(np),
+                            numHeads: H,
+                            totalMemLen: M,
+                            visionOffset: encoded.strokeMemLen,
+                            visionLen: encoded.visionMemLen
+                        )
+                    } else {
+                        attn = nil
+                    }
                     bodyIds.append(choice.id)
                     decodedTokens.append(makeToken(stepIdx: idx, tokenId: choice.id, prob: choice.prob, visionAttn: attn, manifest: manifest))
                 }
                 curTok = Int64(choice.id)
                 pastK = nk
                 pastV = nv
-                coverage = nc
-                prevWeights = np
+                if !isV2 {
+                    coverage = stepOut["new_coverage"]
+                    prevWeights = stepOut["new_prev_weights"]
+                }
             }
         }
 
@@ -1044,20 +1689,22 @@ public final class InkTeXEngine: ObservableObject {
         specialSet: Set<Int>
     ) throws -> (bodyIds: [Int], tokens: [DecodedToken], avgLogProb: Double, isFinished: Bool) {
         let manifest = runtime.bundle.manifest
+        let isV2 = runtime.isV2
         let L = manifest.decoderLayers
         let H = manifest.attentionHeads
         let D = manifest.headDim
         let M = encoded.totalMemLen
         let V = manifest.vocabSize
+        let bosId = manifest.resolvedBosL2RId
         let staticKV = runtime.staticKvLen
         let initKVLen = staticKV ?? 1
 
         var pastK = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * initKVLen * D), shape: [L, 1, H, initKVLen, D])
         var pastV = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * initKVLen * D), shape: [L, 1, H, initKVLen, D])
-        var coverage = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
-        var prevWeights = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        var coverage: ORTValue? = isV2 ? nil : try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        var prevWeights: ORTValue? = isV2 ? nil : try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
 
-        var curTok = Int64(manifest.bosId)
+        var curTok = Int64(bosId)
         var bodyIds: [Int] = []
         var decodedTokens: [DecodedToken] = []
         var sumLogProb: Double = 0
@@ -1066,6 +1713,7 @@ public final class InkTeXEngine: ObservableObject {
 
         for stepIdx in 0..<tokenLimit {
             let feed = try makeDecoderInputs(
+                isV2: isV2,
                 token: try makeInt64Tensor([curTok], shape: [1, 1]),
                 cachePos: staticKV != nil ? stepIdx : nil,
                 pastK: pastK,
@@ -1076,15 +1724,13 @@ public final class InkTeXEngine: ObservableObject {
             )
             let out = try runtime.decoderStepSession.run(
                 withInputs: feed,
-                outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
+                outputNames: decoderOutputNames(isV2: isV2),
                 runOptions: nil
             )
             guard let lVal = out["logits"],
                   let nk = out["new_k"],
-                  let nv = out["new_v"],
-                  let nc = out["new_coverage"],
-                  let np = out["new_prev_weights"] else {
-                throw inferenceError("Missing outputs from decoder_step.onnx")
+                  let nv = out["new_v"] else {
+                throw inferenceError("Missing outputs from decoder_step")
             }
             let logits = try extractFloats(lVal)
             let choice = argmaxLogSoftmax(logits, offset: 0, count: V)
@@ -1096,23 +1742,34 @@ public final class InkTeXEngine: ObservableObject {
                 break
             }
             if !specialSet.contains(choice.id) {
-                let attn = encoded.visionMemLen > 0
-                    ? averageVisionAttention(weights: try extractFloats(np), numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
-                    : nil
+                let attn: [Float]?
+                if !isV2, encoded.visionMemLen > 0, let np = out["new_prev_weights"] {
+                    attn = averageVisionAttention(
+                        weights: try extractFloats(np),
+                        numHeads: H,
+                        totalMemLen: M,
+                        visionOffset: encoded.strokeMemLen,
+                        visionLen: encoded.visionMemLen
+                    )
+                } else {
+                    attn = nil
+                }
                 bodyIds.append(choice.id)
                 decodedTokens.append(makeToken(stepIdx: stepIdx, tokenId: choice.id, prob: choice.prob, visionAttn: attn, manifest: manifest))
             }
             curTok = Int64(choice.id)
             pastK = nk
             pastV = nv
-            coverage = nc
-            prevWeights = np
+            if !isV2 {
+                coverage = out["new_coverage"]
+                prevWeights = out["new_prev_weights"]
+            }
         }
 
         return (bodyIds, decodedTokens, sumLogProb / Double(max(1, stepCount)), hitEOS)
     }
 
-    // MARK: - 3. Batched Beam Search (Static KV v3 or Dynamic KV v2)
+    // MARK: - 3. Optimized Batched Beam Search (Active-Slot memcpy + Reusable Scratch Buffers)
 
     private static func decodeBatchedBeam(
         runtime: LoadedRuntime,
@@ -1122,21 +1779,24 @@ public final class InkTeXEngine: ObservableObject {
         specialSet: Set<Int>
     ) throws -> [BatchedBeam] {
         let manifest = runtime.bundle.manifest
+        let isV2 = runtime.isV2
         let L = manifest.decoderLayers
         let H = manifest.attentionHeads
         let D = manifest.headDim
         let M = encoded.totalMemLen
         let V = manifest.vocabSize
+        let bosId = manifest.resolvedBosL2RId
         let staticKV = runtime.staticKvLen
         let initKVLen = staticKV ?? 1
 
         let initK = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * initKVLen * D), shape: [L, 1, H, initKVLen, D])
         let initV = try makeFloatTensor([Float](repeating: 0, count: L * 1 * H * initKVLen * D), shape: [L, 1, H, initKVLen, D])
-        let initCov = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
-        let initPrev = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        let initCov: ORTValue? = isV2 ? nil : try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
+        let initPrev: ORTValue? = isV2 ? nil : try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
 
         let feed0 = try makeDecoderInputs(
-            token: try makeInt64Tensor([Int64(manifest.bosId)], shape: [1, 1]),
+            isV2: isV2,
+            token: try makeInt64Tensor([Int64(bosId)], shape: [1, 1]),
             cachePos: staticKV != nil ? 0 : nil,
             pastK: initK,
             pastV: initV,
@@ -1146,23 +1806,21 @@ public final class InkTeXEngine: ObservableObject {
         )
         let out0 = try runtime.decoderStepSession.run(
             withInputs: feed0,
-            outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
+            outputNames: decoderOutputNames(isV2: isV2),
             runOptions: nil
         )
         guard let l0Val = out0["logits"],
               let k0Val = out0["new_k"],
-              let v0Val = out0["new_v"],
-              let c0Val = out0["new_coverage"],
-              let p0Val = out0["new_prev_weights"] else {
-            throw inferenceError("Missing outputs from decoder_step.onnx")
+              let v0Val = out0["new_v"] else {
+            throw inferenceError("Missing outputs from decoder_step")
         }
 
         let logits0 = try extractFloats(l0Val)
         let k0 = try extractFloats(k0Val)
         let v0 = try extractFloats(v0Val)
-        let c0 = try extractFloats(c0Val)
-        let p0 = try extractFloats(p0Val)
-        let attn0 = encoded.visionMemLen > 0
+        let c0: [Float] = isV2 ? [] : (try out0["new_coverage"].map { try extractFloats($0) } ?? [])
+        let p0: [Float] = isV2 ? [] : (try out0["new_prev_weights"].map { try extractFloats($0) } ?? [])
+        let attn0: [Float]? = (!isV2 && encoded.visionMemLen > 0)
             ? averageVisionAttention(weights: p0, numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
             : nil
 
@@ -1191,6 +1849,12 @@ public final class InkTeXEngine: ObservableObject {
             )
         }
 
+        // Reusable scratch buffers across beam steps (eliminates ~19 MB/step malloc churn on static KV!)
+        var kBatchScratch: [Float] = []
+        var vBatchScratch: [Float] = []
+        var covBatchScratch: [Float] = []
+        var prevBatchScratch: [Float] = []
+
         if tokenLimit > 1 {
             for stepIdx in 1..<tokenLimit {
                 let active = beams.filter { !$0.isFinished }
@@ -1198,61 +1862,102 @@ public final class InkTeXEngine: ObservableObject {
 
                 let B = active.count
                 let T = active[0].kvLen
-                let perLayerBeamKV = H * T * D
+                let perHeadKV = T * D
+                let perLayerBeamKV = H * perHeadKV
+                let neededKV = L * B * perLayerBeamKV
+                if kBatchScratch.count != neededKV {
+                    kBatchScratch = [Float](repeating: 0, count: neededKV)
+                    vBatchScratch = [Float](repeating: 0, count: neededKV)
+                }
 
                 var tokBatch = [Int64](repeating: 0, count: B)
-                var kBatch = [Float](repeating: 0, count: L * B * perLayerBeamKV)
-                var vBatch = [Float](repeating: 0, count: L * B * perLayerBeamKV)
-                var covBatch = [Float](repeating: 0, count: B * H * M)
-                var prevBatch = [Float](repeating: 0, count: B * H * M)
+                // With static KV, only slots 0..<activeSlots have valid keys/values; causal mask ignores > stepIdx!
+                let activeSlots = staticKV != nil ? min(T, stepIdx) : T
+                let copyFloatsPerHead = activeSlots * D
 
-                for (b, beam) in active.enumerated() {
-                    tokBatch[b] = beam.lastTokenId
-                    for l in 0..<L {
-                        let srcOff = l * perLayerBeamKV
-                        let dstOff = (l * B + b) * perLayerBeamKV
-                        for j in 0..<perLayerBeamKV {
-                            kBatch[dstOff + j] = beam.kData[srcOff + j]
-                            vBatch[dstOff + j] = beam.vData[srcOff + j]
+                kBatchScratch.withUnsafeMutableBufferPointer { kDstBuf in
+                    vBatchScratch.withUnsafeMutableBufferPointer { vDstBuf in
+                        guard let kDst = kDstBuf.baseAddress, let vDst = vDstBuf.baseAddress else { return }
+                        for (b, beam) in active.enumerated() {
+                            tokBatch[b] = beam.lastTokenId
+                            beam.kData.withUnsafeBufferPointer { bkBuf in
+                                beam.vData.withUnsafeBufferPointer { bvBuf in
+                                    guard let kSrc = bkBuf.baseAddress, let vSrc = bvBuf.baseAddress else { return }
+                                    if activeSlots == T {
+                                        let bytes = perLayerBeamKV * MemoryLayout<Float>.stride
+                                        for l in 0..<L {
+                                            let srcOff = l * perLayerBeamKV
+                                            let dstOff = (l * B + b) * perLayerBeamKV
+                                            memcpy(kDst.advanced(by: dstOff), kSrc.advanced(by: srcOff), bytes)
+                                            memcpy(vDst.advanced(by: dstOff), vSrc.advanced(by: srcOff), bytes)
+                                        }
+                                    } else {
+                                        let headBytes = copyFloatsPerHead * MemoryLayout<Float>.stride
+                                        for l in 0..<L {
+                                            let srcLayer = l * perLayerBeamKV
+                                            let dstLayer = (l * B + b) * perLayerBeamKV
+                                            for h in 0..<H {
+                                                let hOff = h * perHeadKV
+                                                memcpy(kDst.advanced(by: dstLayer + hOff), kSrc.advanced(by: srcLayer + hOff), headBytes)
+                                                memcpy(vDst.advanced(by: dstLayer + hOff), vSrc.advanced(by: srcLayer + hOff), headBytes)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    }
-                    let covOff = b * H * M
-                    for j in 0..<(H * M) {
-                        covBatch[covOff + j] = beam.coverageData[j]
-                        prevBatch[covOff + j] = beam.prevWeightsData[j]
                     }
                 }
 
+                var covVal: ORTValue? = nil
+                var prevVal: ORTValue? = nil
+                if !isV2 {
+                    let neededCov = B * H * M
+                    if covBatchScratch.count != neededCov {
+                        covBatchScratch = [Float](repeating: 0, count: neededCov)
+                        prevBatchScratch = [Float](repeating: 0, count: neededCov)
+                    }
+                    let beamCovCount = H * M
+                    for (b, beam) in active.enumerated() {
+                        let covOff = b * beamCovCount
+                        copyFloatSlice(src: beam.coverageData, srcOffset: 0, dst: &covBatchScratch, dstOffset: covOff, count: beamCovCount)
+                        copyFloatSlice(src: beam.prevWeightsData, srcOffset: 0, dst: &prevBatchScratch, dstOffset: covOff, count: beamCovCount)
+                    }
+                    covVal = try makeFloatTensor(covBatchScratch, shape: [B, H, 1, M])
+                    prevVal = try makeFloatTensor(prevBatchScratch, shape: [B, H, 1, M])
+                }
+
                 let feed = try makeDecoderInputs(
+                    isV2: isV2,
                     token: try makeInt64Tensor(tokBatch, shape: [B, 1]),
                     cachePos: staticKV != nil ? stepIdx : nil,
-                    pastK: try makeFloatTensor(kBatch, shape: [L, B, H, T, D]),
-                    pastV: try makeFloatTensor(vBatch, shape: [L, B, H, T, D]),
+                    pastK: try makeFloatTensor(kBatchScratch, shape: [L, B, H, T, D]),
+                    pastV: try makeFloatTensor(vBatchScratch, shape: [L, B, H, T, D]),
                     encoded: encoded,
-                    coverage: try makeFloatTensor(covBatch, shape: [B, H, 1, M]),
-                    prevWeights: try makeFloatTensor(prevBatch, shape: [B, H, 1, M])
+                    coverage: covVal,
+                    prevWeights: prevVal
                 )
                 let stepOut = try runtime.decoderStepSession.run(
                     withInputs: feed,
-                    outputNames: ["logits", "new_k", "new_v", "new_coverage", "new_prev_weights"],
+                    outputNames: decoderOutputNames(isV2: isV2),
                     runOptions: nil
                 )
                 guard let lVal = stepOut["logits"],
                       let nkVal = stepOut["new_k"],
-                      let nvVal = stepOut["new_v"],
-                      let ncVal = stepOut["new_coverage"],
-                      let npVal = stepOut["new_prev_weights"] else {
-                    throw inferenceError("Missing outputs from batched decoder_step.onnx")
+                      let nvVal = stepOut["new_v"] else {
+                    throw inferenceError("Missing outputs from batched decoder_step")
                 }
 
                 let allLogits = try extractFloats(lVal)
                 let allK = try extractFloats(nkVal)
                 let allV = try extractFloats(nvVal)
-                let allCov = try extractFloats(ncVal)
-                let allPrev = try extractFloats(npVal)
+                let allCov: [Float] = isV2 ? [] : (try stepOut["new_coverage"].map { try extractFloats($0) } ?? [])
+                let allPrev: [Float] = isV2 ? [] : (try stepOut["new_prev_weights"].map { try extractFloats($0) } ?? [])
 
                 let nextT = staticKV ?? (T + 1)
-                let nextPerLayerBeamKV = H * nextT * D
+                let nextPerHeadKV = nextT * D
+                let nextPerLayerBeamKV = H * nextPerHeadKV
+                let nextActiveSlots = staticKV != nil ? min(nextT, stepIdx + 1) : nextT
 
                 struct PendingCandidate {
                     let isAlreadyFinished: Bool
@@ -1303,7 +2008,7 @@ public final class InkTeXEngine: ObservableObject {
                     let parent = active[bIdx]
                     let fin = (item.tokenId == manifest.eosId)
 
-                    if extractedAttn[bIdx] == nil {
+                    if !isV2 && extractedAttn[bIdx] == nil {
                         let covOff = bIdx * H * M
                         let prevSlice = Array(allPrev[covOff ..< (covOff + H * M)])
                         extractedPrev[bIdx] = prevSlice
@@ -1315,12 +2020,34 @@ public final class InkTeXEngine: ObservableObject {
                     if !fin && extractedK[bIdx] == nil {
                         var bk = [Float](repeating: 0, count: L * nextPerLayerBeamKV)
                         var bv = [Float](repeating: 0, count: L * nextPerLayerBeamKV)
-                        for l in 0..<L {
-                            let srcOff = (l * B + bIdx) * nextPerLayerBeamKV
-                            let dstOff = l * nextPerLayerBeamKV
-                            for j in 0..<nextPerLayerBeamKV {
-                                bk[dstOff + j] = allK[srcOff + j]
-                                bv[dstOff + j] = allV[srcOff + j]
+                        let copyHeadBytes = nextActiveSlots * D * MemoryLayout<Float>.stride
+                        allK.withUnsafeBufferPointer { akBuf in
+                            allV.withUnsafeBufferPointer { avBuf in
+                                bk.withUnsafeMutableBufferPointer { bkBuf in
+                                    bv.withUnsafeMutableBufferPointer { bvBuf in
+                                        guard let ak = akBuf.baseAddress, let av = avBuf.baseAddress,
+                                              let bkP = bkBuf.baseAddress, let bvP = bvBuf.baseAddress else { return }
+                                        if nextActiveSlots == nextT {
+                                            let layerBytes = nextPerLayerBeamKV * MemoryLayout<Float>.stride
+                                            for l in 0..<L {
+                                                let srcOff = (l * B + bIdx) * nextPerLayerBeamKV
+                                                let dstOff = l * nextPerLayerBeamKV
+                                                memcpy(bkP.advanced(by: dstOff), ak.advanced(by: srcOff), layerBytes)
+                                                memcpy(bvP.advanced(by: dstOff), av.advanced(by: srcOff), layerBytes)
+                                            }
+                                        } else {
+                                            for l in 0..<L {
+                                                let srcLayer = (l * B + bIdx) * nextPerLayerBeamKV
+                                                let dstLayer = l * nextPerLayerBeamKV
+                                                for h in 0..<H {
+                                                    let hOff = h * nextPerHeadKV
+                                                    memcpy(bkP.advanced(by: dstLayer + hOff), ak.advanced(by: srcLayer + hOff), copyHeadBytes)
+                                                    memcpy(bvP.advanced(by: dstLayer + hOff), av.advanced(by: srcLayer + hOff), copyHeadBytes)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         extractedK[bIdx] = bk
@@ -1344,8 +2071,8 @@ public final class InkTeXEngine: ObservableObject {
                         kvLen: nextT,
                         kData: fin ? [] : (extractedK[bIdx] ?? []),
                         vData: fin ? [] : (extractedV[bIdx] ?? []),
-                        coverageData: fin ? [] : (extractedCov[bIdx] ?? []),
-                        prevWeightsData: fin ? [] : (extractedPrev[bIdx] ?? [])
+                        coverageData: (fin || isV2) ? [] : (extractedCov[bIdx] ?? []),
+                        prevWeightsData: (fin || isV2) ? [] : (extractedPrev[bIdx] ?? [])
                     ))
                 }
                 beams = nextBeams
@@ -1391,7 +2118,7 @@ public final class InkTeXEngine: ObservableObject {
         let initCov = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
         let initPrev = try makeFloatTensor([Float](repeating: 0, count: 1 * H * 1 * M), shape: [1, H, 1, M])
 
-        let (l0, k0, v0, c0, p0) = try runStep(Int64(manifest.bosId), initK, initV, initCov, initPrev)
+        let (l0, k0, v0, c0, p0) = try runStep(Int64(manifest.resolvedBosL2RId), initK, initV, initCov, initPrev)
         let attn0 = encoded.visionMemLen > 0
             ? averageVisionAttention(weights: try extractFloats(p0), numHeads: H, totalMemLen: M, visionOffset: encoded.strokeMemLen, visionLen: encoded.visionMemLen)
             : nil
@@ -1434,6 +2161,16 @@ public final class InkTeXEngine: ObservableObject {
 
     // MARK: - Math & Tensor Helpers
 
+    private static func copyFloatSlice(src: [Float], srcOffset: Int, dst: inout [Float], dstOffset: Int, count: Int) {
+        guard count > 0 else { return }
+        src.withUnsafeBufferPointer { sBuf in
+            dst.withUnsafeMutableBufferPointer { dBuf in
+                guard let s = sBuf.baseAddress, let d = dBuf.baseAddress else { return }
+                memcpy(d.advanced(by: dstOffset), s.advanced(by: srcOffset), count * MemoryLayout<Float>.stride)
+            }
+        }
+    }
+
     private static func makeToken(stepIdx: Int, tokenId: Int, prob: Float, visionAttn: [Float]?, manifest: ModelManifest) -> DecodedToken {
         let text = (tokenId >= 0 && tokenId < manifest.tokens.count) ? manifest.tokens[tokenId] : "<UNK>"
         return DecodedToken(
@@ -1446,13 +2183,19 @@ public final class InkTeXEngine: ObservableObject {
         )
     }
 
-    private static func fingerprintStrokes(_ strokes: [RawStroke]) -> UInt64 {
+    private static func fingerprintStrokes(
+        _ strokes: [RawStroke],
+        profileDigest: UInt64 = 0,
+        adapterDigest: UInt64 = 0
+    ) -> UInt64 {
         var h: UInt64 = 14695981039346656037
         let prime: UInt64 = 1099511628211
         func mix(_ v: UInt64) {
             h ^= v
             h = h &* prime
         }
+        mix(profileDigest)
+        mix(adapterDigest)
         mix(UInt64(strokes.count))
         for s in strokes {
             mix(UInt64(s.points.count))
@@ -1463,6 +2206,21 @@ public final class InkTeXEngine: ObservableObject {
             }
         }
         return h
+    }
+
+    private static func logSoftmaxAt(_ logits: [Float], offset: Int, count: Int, targetId: Int) -> Double {
+        guard count > 0, targetId >= 0, targetId < count else { return -20.0 }
+        var maxVal = -Float.greatestFiniteMagnitude
+        for i in 0..<count {
+            let v = logits[offset + i]
+            if v > maxVal { maxVal = v }
+        }
+        var sumExp: Double = 0
+        for i in 0..<count {
+            sumExp += exp(Double(logits[offset + i] - maxVal))
+        }
+        let logZ = Double(maxVal) + log(max(sumExp, 1e-30))
+        return Double(logits[offset + targetId]) - logZ
     }
 
     private static func argmaxLogSoftmax(_ logits: [Float], offset: Int, count: Int) -> (id: Int, logProb: Double, prob: Float) {

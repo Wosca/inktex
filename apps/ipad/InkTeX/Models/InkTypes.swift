@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 import UIKit
 
-public struct RawStrokePoint: Sendable {
+public struct RawStrokePoint: Codable, Sendable, Equatable {
     public let x: Double
     public let y: Double
     public let timeMs: Double?
@@ -14,7 +14,7 @@ public struct RawStrokePoint: Sendable {
     }
 }
 
-public struct RawStroke: Sendable {
+public struct RawStroke: Codable, Sendable, Equatable {
     public let points: [RawStrokePoint]
 
     public init(points: [RawStrokePoint]) {
@@ -211,17 +211,36 @@ public struct ModelManifest: Codable, Sendable {
         public let height: Int
         public let minWidth: Int
         public let maxWidth: Int
+        public let widthBuckets: [Int]?
         public let padding: Int
         public let widthMultiple: Int
         public let channels: Int
+        public let targetGlyphPx: Double?
+        public let verticalStride: Int?
+        public let horizontalStride: Int?
+
+        public var resolvedWidthBuckets: [Int] {
+            if let widthBuckets, !widthBuckets.isEmpty {
+                return widthBuckets.sorted()
+            }
+            return [256, 512, 768, 1024].filter { $0 >= minWidth && $0 <= maxWidth }
+        }
+
+        public var resolvedTargetGlyphPx: Double {
+            targetGlyphPx ?? 38.0
+        }
 
         enum CodingKeys: String, CodingKey {
             case height
             case minWidth = "min_width"
             case maxWidth = "max_width"
+            case widthBuckets = "width_buckets"
             case padding
             case widthMultiple = "width_multiple"
             case channels
+            case targetGlyphPx = "target_glyph_px"
+            case verticalStride = "vertical_stride"
+            case horizontalStride = "horizontal_stride"
         }
     }
 
@@ -237,6 +256,28 @@ public struct ModelManifest: Codable, Sendable {
         public let normalization: String
         public let maxPointsPerStroke: Int
 
+        // InkTeX v2 sub-stroke chunking parameters (optional for v1 backward compatibility)
+        public let chunkSize: Int?
+        public let chunkHop: Int?
+        public let chunkBuckets: [Int]?
+        public let maxChunks: Int?
+        public let dedupeEps: Double?
+        public let coordClip: Double?
+        public let pointFeatureDim: Int?
+        public let chunkMetaDim: Int?
+
+        public var resolvedChunkSize: Int { chunkSize ?? 8 }
+        public var resolvedChunkHop: Int { chunkHop ?? 7 }
+        public var resolvedChunkBuckets: [Int] {
+            if let chunkBuckets, !chunkBuckets.isEmpty {
+                return chunkBuckets.sorted()
+            }
+            return [128, 256, 512, 768]
+        }
+        public var resolvedMaxChunks: Int { maxChunks ?? (resolvedChunkBuckets.last ?? 768) }
+        public var resolvedDedupeEps: Double { dedupeEps ?? 1e-3 }
+        public var resolvedCoordClip: Double { coordClip ?? 32.0 }
+
         enum CodingKeys: String, CodingKey {
             case maxPoints = "max_points"
             case minPointsPerStroke = "min_points_per_stroke"
@@ -248,6 +289,40 @@ public struct ModelManifest: Codable, Sendable {
             case maxDeltaMs = "max_delta_ms"
             case normalization
             case maxPointsPerStroke = "max_points_per_stroke"
+            case chunkSize = "chunk_size"
+            case chunkHop = "chunk_hop"
+            case chunkBuckets = "chunk_buckets"
+            case maxChunks = "max_chunks"
+            case dedupeEps = "dedupe_eps"
+            case coordClip = "coord_clip"
+            case pointFeatureDim = "point_feature_dim"
+            case chunkMetaDim = "chunk_meta_dim"
+        }
+    }
+
+    public struct PersonalizationManifest: Codable, Sendable {
+        public let styleDim: Int
+        public let styleMaxStrokes: Int
+        public let stylePoints: Int
+        public let stylePointDim: Int
+        public let filmLayers: [Int]
+        public let dynamicLora: Bool
+        public let loraLayers: [Int]
+        public let loraRank: Int
+        public let loraAlpha: Double
+        public let strokeDim: Int
+
+        enum CodingKeys: String, CodingKey {
+            case styleDim = "style_dim"
+            case styleMaxStrokes = "style_max_strokes"
+            case stylePoints = "style_points"
+            case stylePointDim = "style_point_dim"
+            case filmLayers = "film_layers"
+            case dynamicLora = "dynamic_lora"
+            case loraLayers = "lora_layers"
+            case loraRank = "lora_rank"
+            case loraAlpha = "lora_alpha"
+            case strokeDim = "stroke_dim"
         }
     }
 
@@ -263,6 +338,12 @@ public struct ModelManifest: Codable, Sendable {
         }
     }
 
+    public struct FileMetadata: Codable, Sendable {
+        public let file: String
+        public let bytes: Int
+        public let sha256: String
+    }
+
     public let format: String
     public let modelName: String
     public let preset: String
@@ -270,16 +351,22 @@ public struct ModelManifest: Codable, Sendable {
     public let epoch: Int?
     public let quantization: String?
     public let hasR2L: Bool?
+    public let sharedR2LDecoder: Bool?
     public let supportsBatchedDecoder: Bool?
     public let supportsPrefixVerify: Bool?
     public let staticKvLen: Int?
+    public let staticShapes: Bool?
     public let r2lDecoderLayers: Int?
     public let dModel: Int
     public let decoderLayers: Int
     public let attentionHeads: Int
     public let headDim: Int
+    public let strokeLayers: Int?
+    public let strokeDim: Int?
     public let vocabSize: Int
     public let bosId: Int
+    public let bosL2RId: Int?
+    public let bosR2LId: Int?
     public let eosId: Int
     public let padId: Int
     public let unkId: Int
@@ -288,8 +375,24 @@ public struct ModelManifest: Codable, Sendable {
     public let inputDim: Int
     public let vision: VisionConfig
     public let preprocessing: PreprocessingManifest
+    public let personalization: PersonalizationManifest?
     public let tokens: [String]
     public let metrics: MetricsSummary?
+    public let files: [String: FileMetadata]?
+
+    public var isV2Architecture: Bool {
+        format == "inktex-onnx-v2"
+    }
+
+    public var resolvedBosL2RId: Int {
+        bosL2RId ?? bosId
+    }
+
+    public var resolvedBosR2LId: Int? {
+        if let bosR2LId { return bosR2LId }
+        if isV2Architecture { return 2 }
+        return nil
+    }
 
     enum CodingKeys: String, CodingKey {
         case format
@@ -299,16 +402,22 @@ public struct ModelManifest: Codable, Sendable {
         case epoch
         case quantization
         case hasR2L = "has_r2l"
+        case sharedR2LDecoder = "shared_r2l_decoder"
         case supportsBatchedDecoder = "supports_batched_decoder"
         case supportsPrefixVerify = "supports_prefix_verify"
         case staticKvLen = "static_kv_len"
+        case staticShapes = "static_shapes"
         case r2lDecoderLayers = "r2l_decoder_layers"
         case dModel = "d_model"
         case decoderLayers = "decoder_layers"
         case attentionHeads = "attention_heads"
         case headDim = "head_dim"
+        case strokeLayers = "stroke_layers"
+        case strokeDim = "stroke_dim"
         case vocabSize = "vocab_size"
         case bosId = "bos_id"
+        case bosL2RId = "bos_l2r_id"
+        case bosR2LId = "bos_r2l_id"
         case eosId = "eos_id"
         case padId = "pad_id"
         case unkId = "unk_id"
@@ -317,8 +426,10 @@ public struct ModelManifest: Codable, Sendable {
         case inputDim = "input_dim"
         case vision
         case preprocessing
+        case personalization
         case tokens
         case metrics
+        case files
     }
 }
 
@@ -389,6 +500,12 @@ public struct RecognitionResult: Sendable {
     public let encoderCacheHit: Bool
     public let beams: [BeamCandidate]
     public let truncated: Bool
+    public let isV2Model: Bool
+    public let chunkBucket: Int?
+    public let activeProfileName: String?
+    public let usedWriterStyle: Bool
+    public let usedLoRAAdapter: Bool
+    public let matchedCorrectionCache: Bool
 
     public var tokens: [String] { decodedTokens.map(\.text) }
 }

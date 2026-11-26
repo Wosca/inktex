@@ -26,6 +26,12 @@ struct ModelSetupSheet: View {
                 Section("Active Model") {
                     if let bundle = engine.loadedBundle {
                         LabeledContent("Model", value: bundle.manifest.modelName)
+                        LabeledContent(
+                            "Architecture",
+                            value: bundle.isV2
+                                ? "InkTeX v2 (\(bundle.manifest.preset))"
+                                : "InkTeX v1 (\(bundle.manifest.preset))"
+                        )
                         if let stage = bundle.manifest.stage, let epoch = bundle.manifest.epoch {
                             LabeledContent("Checkpoint", value: "Stage \(stage) · Epoch \(epoch)")
                         }
@@ -33,12 +39,25 @@ struct ModelSetupSheet: View {
                             LabeledContent("Val Exact", value: String(format: "%.2f%%", exact * 100))
                         }
                         LabeledContent("Quantization", value: (bundle.manifest.quantization ?? "fp32").uppercased())
-                        LabeledContent("R2L Reranker", value: engine.hasR2LScorer ? "Active (3-layer)" : "Not in bundle")
+                        LabeledContent(
+                            "R2L Reranker",
+                            value: engine.hasSharedR2L
+                                ? "Shared Bidirectional (0 extra RAM)"
+                                : (engine.hasR2LScorer ? "Active (3-layer)" : "Not in bundle")
+                        )
+                        if let pers = bundle.manifest.personalization {
+                            LabeledContent(
+                                "Personalization",
+                                value: pers.dynamicLora
+                                    ? "FiLM (\(pers.styleDim)-d) + Dynamic LoRA (r=\(pers.loraRank))"
+                                    : "FiLM (\(pers.styleDim)-d)"
+                            )
+                        }
                         LabeledContent(
                             "Decoder Engine",
                             value: engine.staticKvLen != nil
-                                ? "v3 Static KV (\(engine.staticKvLen!)) + Prefix Verify"
-                                : (engine.supportsV2FastDecode ? "v2 Prefix Verify + Batched Beam" : "Legacy v1")
+                                ? "Static KV (\(engine.staticKvLen!)) + Prefix Verify"
+                                : (engine.supportsV2FastDecode ? "Prefix Verify + Batched Beam" : "Legacy v1")
                         )
                         LabeledContent("Source", value: bundle.sourceDescription)
                     } else {
@@ -394,6 +413,17 @@ struct InspectorSheet: View {
                         }
                         metricTile(title: "Confidence", value: String(format: "%.1f%%", result.overallConfidence * 100))
                         metricTile(title: "RAM Used", value: String(format: "%.0f MB", memorySnapshot.currentFootprintMB))
+                        if let bucket = result.chunkBucket {
+                            metricTile(title: "Ink Bucket", value: "\(bucket) chunks")
+                        }
+                        if result.usedWriterStyle || result.usedLoRAAdapter {
+                            metricTile(
+                                title: "Personalization",
+                                value: result.usedWriterStyle && result.usedLoRAAdapter
+                                    ? "FiLM + LoRA"
+                                    : (result.usedLoRAAdapter ? "LoRA Only" : "FiLM Style")
+                            )
+                        }
                     }
 
                     // 3. Wrapping Token Breakdown

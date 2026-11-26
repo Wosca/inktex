@@ -1,19 +1,21 @@
 import Foundation
 
-/// Exact Swift port of `LatexTokenizer.decode` and `detokenize_latex`.
+/// Exact Swift port of `LatexTokenizer.decode` / `LatexTokenizerV2.decode` and `detokenize_latex`.
 public struct LatexTokenizer: Sendable {
     public let tokens: [String]
     public let padId: Int
     public let bosId: Int
+    public let bosR2LId: Int?
     public let eosId: Int
     public let unkId: Int
 
-    private static let specialTokens: Set<String> = ["<PAD>", "<BOS>", "<EOS>", "<UNK>"]
+    private static let specialTokens: Set<String> = ["<PAD>", "<BOS>", "<BOS_L2R>", "<BOS_R2L>", "<EOS>", "<UNK>"]
 
     public init(manifest: ModelManifest) {
         self.tokens = manifest.tokens
         self.padId = manifest.padId
-        self.bosId = manifest.bosId
+        self.bosId = manifest.resolvedBosL2RId
+        self.bosR2LId = manifest.resolvedBosR2LId
         self.eosId = manifest.eosId
         self.unkId = manifest.unkId
     }

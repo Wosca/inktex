@@ -163,6 +163,203 @@ public enum StripRasterizer {
         )
     }
 
+    /// Exact Swift port of `ml/v2/vision_raster.py` (`render_strokes_to_strip_v2`):
+    ///   - Fixed height `H = 192` -> 24 vertical feature rows at stride-8 FPN
+    ///   - Glyph-referenced scaling: `min(target_glyph_px / g_hat, inner_h / h_box, inner_w / w_box)`
+    ///   - Static CoreML-friendly width buckets `{256, 512, 768, 1024}`
+    public static func renderV2(
+        strokes: [RawStroke],
+        config: ModelManifest.VisionConfig,
+        bucketOverride: Int? = nil
+    ) -> Output {
+        let height = config.height
+        let widthBuckets = config.resolvedWidthBuckets
+        let padding = config.padding
+        let widthMultiple = config.widthMultiple
+        let targetGlyphPx = config.resolvedTargetGlyphPx
+        let maxWidth = bucketOverride ?? (widthBuckets.last ?? config.maxWidth)
+        let ss = 3
+
+        let clean = strokes.map(\.points).filter { !$0.isEmpty }
+        guard !clean.isEmpty else {
+            let b = bucketOverride ?? (widthBuckets.first ?? config.minWidth)
+            let planeSize = height * b
+            return Output(
+                tensor: [Float](repeating: 0, count: 2 * planeSize),
+                lumBytes: [UInt8](repeating: 0, count: planeSize),
+                orderBytes: [UInt8](repeating: 0, count: planeSize),
+                height: height,
+                width: b,
+                usedWidth: max(widthMultiple, 2 * padding)
+            )
+        }
+
+        var minX = Double.greatestFiniteMagnitude
+        var maxX = -Double.greatestFiniteMagnitude
+        var minY = Double.greatestFiniteMagnitude
+        var maxY = -Double.greatestFiniteMagnitude
+        var totalPoints = 0
+
+        for stroke in clean {
+            totalPoints += stroke.count
+            for pt in stroke {
+                if pt.x < minX { minX = pt.x }
+                if pt.x > maxX { maxX = pt.x }
+                if pt.y < minY { minY = pt.y }
+                if pt.y > maxY { maxY = pt.y }
+            }
+        }
+
+        let extentX = maxX - minX
+        let extentY = maxY - minY
+        let innerH = Double(height - 2 * padding)
+        let innerW = Double(maxWidth - 2 * padding)
+
+        let gHat = InkPreprocessorV2.estimateGlyphScale(strokes: strokes)
+        let sGlyph = targetGlyphPx / max(gHat, 1e-6)
+        let sH = extentY > 1e-9 ? (innerH / extentY) : sGlyph
+        let sW = extentX > 1e-9 ? (innerW / extentX) : sGlyph
+        let scale = min(sGlyph, min(sH, sW))
+
+        let contentW = extentX * scale
+        let contentH = extentY * scale
+        let usedW = Int(ceil(contentW + Double(2 * padding)))
+        let bucketW: Int
+        if let bucketOverride {
+            bucketW = bucketOverride
+        } else {
+            var chosen = widthBuckets.last ?? maxWidth
+            for b in widthBuckets {
+                if usedW <= b {
+                    chosen = b
+                    break
+                }
+            }
+            bucketW = chosen
+        }
+        let imageWidth = min(bucketW, max(widthMultiple, usedW))
+        let offsetX = Double(padding) - minX * scale
+        let offsetY = (Double(height) - contentH) / 2.0 - minY * scale
+
+        let defaultSW = max(1.6, min(3.6, targetGlyphPx / 14.0))
+        let linePx = max(1, Int(Foundation.round(defaultSW * Double(ss))))
+        let radius = Double(linePx) / 2.0
+        let radiusSq = radius * radius
+
+        let hiW = bucketW * ss
+        let hiH = height * ss
+        var hiInk = [UInt8](repeating: 0, count: hiW * hiH)
+        var hiOrder = [UInt8](repeating: 0, count: hiW * hiH)
+
+        let denominator = Double(max(totalPoints - 1, 1))
+        var globalStart = 0
+
+        for stroke in clean {
+            let scaledPts: [(Double, Double)] = stroke.map { pt in
+                ((pt.x * scale + offsetX) * Double(ss), (pt.y * scale + offsetY) * Double(ss))
+            }
+            var keep: [Int] = [0]
+            keep.reserveCapacity(scaledPts.count)
+            for i in 1..<scaledPts.count {
+                let prev = scaledPts[keep[keep.count - 1]]
+                let curr = scaledPts[i]
+                if i == scaledPts.count - 1 || max(abs(curr.0 - prev.0), abs(curr.1 - prev.1)) >= 1.0 {
+                    keep.append(i)
+                }
+            }
+
+            var prevPt: (Double, Double)? = nil
+            for idx in keep {
+                let pt = scaledPts[idx]
+                let prog = UInt8(min(255, max(1, 1 + Int(Foundation.rint(254.0 * Double(globalStart + idx) / denominator)))))
+                if let p0 = prevPt {
+                    drawCapsule(
+                        x0: p0.0, y0: p0.1, x1: pt.0, y1: pt.1,
+                        radius: radius, radiusSq: radiusSq,
+                        width: hiW, height: hiH,
+                        orderValue: prog,
+                        ink: &hiInk, order: &hiOrder
+                    )
+                } else {
+                    drawDisc(
+                        cx: pt.0, cy: pt.1,
+                        radius: radius, radiusSq: radiusSq,
+                        width: hiW, height: hiH,
+                        orderValue: prog,
+                        ink: &hiInk, order: &hiOrder
+                    )
+                }
+                prevPt = pt
+            }
+            globalStart += stroke.count
+        }
+
+        // Pointer-accelerated 3x3 downsample (BOX average for ink, MAX for stroke order)
+        let planeSize = height * bucketW
+        var tensor = [Float](repeating: 0, count: 2 * planeSize)
+        var lumBytes = [UInt8](repeating: 0, count: planeSize)
+        var orderBytes = [UInt8](repeating: 0, count: planeSize)
+        let inv255: Float = 1.0 / 255.0
+
+        hiInk.withUnsafeBufferPointer { inkBuf in
+            hiOrder.withUnsafeBufferPointer { ordBuf in
+                lumBytes.withUnsafeMutableBufferPointer { lumOut in
+                    orderBytes.withUnsafeMutableBufferPointer { ordOut in
+                        tensor.withUnsafeMutableBufferPointer { tenOut in
+                            guard let inkP = inkBuf.baseAddress,
+                                  let ordP = ordBuf.baseAddress,
+                                  let lumP = lumOut.baseAddress,
+                                  let ordOutP = ordOut.baseAddress,
+                                  let tenP = tenOut.baseAddress else { return }
+                            for y in 0..<height {
+                                let row0 = (y * 3) * hiW
+                                let row1 = row0 + hiW
+                                let row2 = row1 + hiW
+                                let dstRow = y * bucketW
+                                for x in 0..<bucketW {
+                                    let hx = x * 3
+                                    let i0 = row0 + hx
+                                    let i1 = row1 + hx
+                                    let i2 = row2 + hx
+                                    let inkSum =
+                                        Int(inkP[i0]) + Int(inkP[i0 + 1]) + Int(inkP[i0 + 2]) +
+                                        Int(inkP[i1]) + Int(inkP[i1 + 1]) + Int(inkP[i1 + 2]) +
+                                        Int(inkP[i2]) + Int(inkP[i2 + 1]) + Int(inkP[i2 + 2])
+                                    if inkSum == 0 { continue }
+                                    let lumByte = UInt8(min(255, (inkSum + 4) / 9))
+                                    var oMax = ordP[i0]
+                                    if ordP[i0 + 1] > oMax { oMax = ordP[i0 + 1] }
+                                    if ordP[i0 + 2] > oMax { oMax = ordP[i0 + 2] }
+                                    if ordP[i1] > oMax { oMax = ordP[i1] }
+                                    if ordP[i1 + 1] > oMax { oMax = ordP[i1 + 1] }
+                                    if ordP[i1 + 2] > oMax { oMax = ordP[i1 + 2] }
+                                    if ordP[i2] > oMax { oMax = ordP[i2] }
+                                    if ordP[i2 + 1] > oMax { oMax = ordP[i2 + 1] }
+                                    if ordP[i2 + 2] > oMax { oMax = ordP[i2 + 2] }
+                                    let ordByte: UInt8 = lumByte > 0 ? max(oMax, 1) : 0
+                                    let dst = dstRow + x
+                                    lumP[dst] = lumByte
+                                    ordOutP[dst] = ordByte
+                                    tenP[dst] = Float(lumByte) * inv255
+                                    tenP[planeSize + dst] = Float(ordByte) * inv255
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return Output(
+            tensor: tensor,
+            lumBytes: lumBytes,
+            orderBytes: orderBytes,
+            height: height,
+            width: bucketW,
+            usedWidth: imageWidth
+        )
+    }
+
     /// Render a colorized visualization of the vision strip in < 1ms using decoder cross-attention.
     public static func renderVisualization(
         result: RecognitionResult,

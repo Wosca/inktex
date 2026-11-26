@@ -18,6 +18,9 @@
 		B10000090000000000000009 /* KaTeXWebView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000090000000000000009 /* KaTeXWebView.swift */; };
 		B10000100000000000000010 /* ModelSetupSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000100000000000000010 /* ModelSetupSheet.swift */; };
 		B10000110000000000000011 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000110000000000000011 /* ContentView.swift */; };
+		B10000150000000000000015 /* InkPreprocessorV2.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000150000000000000015 /* InkPreprocessorV2.swift */; };
+		B10000160000000000000016 /* PersonalizationStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000160000000000000016 /* PersonalizationStore.swift */; };
+		B10000170000000000000017 /* PersonalizationSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = F10000170000000000000017 /* PersonalizationSheet.swift */; };
 		B10000120000000000000012 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F10000120000000000000012 /* Assets.xcassets */; };
 		B10000130000000000000013 /* katex in Resources */ = {isa = PBXBuildFile; fileRef = F10000130000000000000013 /* katex */; };
 		B10000140000000000000014 /* onnxruntime in Frameworks */ = {isa = PBXBuildFile; productRef = E10000010000000000000001 /* onnxruntime */; };
@@ -39,6 +42,9 @@
 		F10000120000000000000012 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		F10000130000000000000013 /* katex */ = {isa = PBXFileReference; lastKnownFileType = folder; path = katex; sourceTree = "<group>"; };
 		F10000140000000000000014 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		F10000150000000000000015 /* InkPreprocessorV2.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkPreprocessorV2.swift; sourceTree = "<group>"; };
+		F10000160000000000000016 /* PersonalizationStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersonalizationStore.swift; sourceTree = "<group>"; };
+		F10000170000000000000017 /* PersonalizationSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersonalizationSheet.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -67,6 +73,7 @@
 				F10000010000000000000001 /* InkTeXApp.swift */,
 				010000040000000000000004 /* Models */,
 				010000050000000000000005 /* Preprocessing */,
+				010000090000000000000009 /* Personalization */,
 				010000060000000000000006 /* Inference */,
 				010000070000000000000007 /* UI */,
 				010000080000000000000008 /* Resources */,
@@ -96,9 +103,18 @@
 			isa = PBXGroup;
 			children = (
 				F10000030000000000000003 /* StrokePreprocessor.swift */,
+				F10000150000000000000015 /* InkPreprocessorV2.swift */,
 				F10000040000000000000004 /* StripRasterizer.swift */,
 			);
 			path = Preprocessing;
+			sourceTree = "<group>";
+		};
+		010000090000000000000009 /* Personalization */ = {
+			isa = PBXGroup;
+			children = (
+				F10000160000000000000016 /* PersonalizationStore.swift */,
+			);
+			path = Personalization;
 			sourceTree = "<group>";
 		};
 		010000060000000000000006 /* Inference */ = {
@@ -117,6 +133,7 @@
 				F10000080000000000000008 /* PencilCanvasView.swift */,
 				F10000090000000000000009 /* KaTeXWebView.swift */,
 				F10000100000000000000010 /* ModelSetupSheet.swift */,
+				F10000170000000000000017 /* PersonalizationSheet.swift */,
 				F10000110000000000000011 /* ContentView.swift */,
 			);
 			path = UI;
@@ -209,13 +226,16 @@
 				B10000010000000000000001 /* InkTeXApp.swift in Sources */,
 				B10000020000000000000002 /* InkTypes.swift in Sources */,
 				B10000030000000000000003 /* StrokePreprocessor.swift in Sources */,
+				B10000150000000000000015 /* InkPreprocessorV2.swift in Sources */,
 				B10000040000000000000004 /* StripRasterizer.swift in Sources */,
+				B10000160000000000000016 /* PersonalizationStore.swift in Sources */,
 				B10000050000000000000005 /* LatexTokenizer.swift in Sources */,
 				B10000060000000000000006 /* ModelBundleLocator.swift in Sources */,
 				B10000070000000000000007 /* InkTeXEngine.swift in Sources */,
 				B10000080000000000000008 /* PencilCanvasView.swift in Sources */,
 				B10000090000000000000009 /* KaTeXWebView.swift in Sources */,
 				B10000100000000000000010 /* ModelSetupSheet.swift in Sources */,
+				B10000170000000000000017 /* PersonalizationSheet.swift in Sources */,
 				B10000110000000000000011 /* ContentView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

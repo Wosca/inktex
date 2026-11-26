@@ -6,17 +6,53 @@ public struct LocatedModelBundle: Sendable, Identifiable, Equatable {
     public let sourceDescription: String
     public let manifest: ModelManifest
 
-    public var visionEncoderURL: URL { directory.appendingPathComponent("vision_encoder.onnx") }
-    public var strokeEncoderURL: URL { directory.appendingPathComponent("stroke_encoder.onnx") }
-    public var memoryProjURL: URL { directory.appendingPathComponent("memory_proj.onnx") }
-    public var decoderStepURL: URL { directory.appendingPathComponent("decoder_step.onnx") }
+    public var isV2: Bool { manifest.isV2Architecture }
+
+    public var writerStyleURL: URL? {
+        guard isV2 else { return nil }
+        let url = directory.appendingPathComponent(manifest.files?["writer_style"]?.file ?? "writer_style_v2.onnx")
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    public var visionEncoderURL: URL {
+        if isV2 {
+            return directory.appendingPathComponent(manifest.files?["vision_encoder"]?.file ?? "vision_encoder_v2.onnx")
+        }
+        return directory.appendingPathComponent(manifest.files?["vision_encoder"]?.file ?? "vision_encoder.onnx")
+    }
+
+    public var strokeEncoderURL: URL {
+        if isV2 {
+            return directory.appendingPathComponent(manifest.files?["stroke_encoder"]?.file ?? "stroke_encoder_v2.onnx")
+        }
+        return directory.appendingPathComponent(manifest.files?["stroke_encoder"]?.file ?? "stroke_encoder.onnx")
+    }
+
+    public var memoryProjURL: URL {
+        if isV2 {
+            return directory.appendingPathComponent(manifest.files?["fusion_memproj"]?.file ?? "fusion_memproj_v2.onnx")
+        }
+        return directory.appendingPathComponent(manifest.files?["memory_proj"]?.file ?? "memory_proj.onnx")
+    }
+
+    public var decoderStepURL: URL {
+        if isV2 {
+            return directory.appendingPathComponent(manifest.files?["decoder_step"]?.file ?? "decoder_step_v2.onnx")
+        }
+        return directory.appendingPathComponent(manifest.files?["decoder_step"]?.file ?? "decoder_step.onnx")
+    }
+
     public var r2lScorerURL: URL? {
-        let url = directory.appendingPathComponent("r2l_scorer.onnx")
+        let filename = manifest.files?["r2l_scorer"]?.file ?? "r2l_scorer.onnx"
+        let url = directory.appendingPathComponent(filename)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
     public var displayTitle: String {
         var parts: [String] = [manifest.modelName]
+        if isV2 && !manifest.modelName.lowercased().contains("v2") {
+            parts.append("v2")
+        }
         if let stage = manifest.stage, let epoch = manifest.epoch {
             if !manifest.modelName.contains("E\(epoch)") {
                 parts.append("S\(stage)·E\(epoch)")
@@ -34,16 +70,30 @@ public struct LocatedModelBundle: Sendable, Identifiable, Equatable {
 }
 
 public enum ModelBundleLocator {
-    public static let requiredFiles = [
+    public static let requiredFilesV1 = [
         "manifest.json",
         "vision_encoder.onnx",
         "stroke_encoder.onnx",
         "memory_proj.onnx",
         "decoder_step.onnx",
     ]
-    public static let optionalFiles = [
+    public static let optionalFilesV1 = [
         "r2l_scorer.onnx",
     ]
+    public static let requiredFilesV2 = [
+        "manifest.json",
+        "writer_style_v2.onnx",
+        "stroke_encoder_v2.onnx",
+        "vision_encoder_v2.onnx",
+        "fusion_memproj_v2.onnx",
+        "decoder_step_v2.onnx",
+    ]
+    public static let optionalFilesV2 = [
+        "r2l_scorer.onnx",
+    ]
+    /// Kept for legacy references.
+    public static let requiredFiles = requiredFilesV1
+    public static let optionalFiles = optionalFilesV1
 
     public static var documentsDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -100,8 +150,11 @@ public enum ModelBundleLocator {
             }
         }
 
-        // Sort: highest stage, highest normalized_exact, highest epoch, v3 static KV, then FP16 preference
+        // Sort: InkTeX v2 first, then highest stage, highest normalized_exact, highest epoch, static KV, then FP16 preference
         found.sort { a, b in
+            let v2A = a.isV2 ? 1 : 0
+            let v2B = b.isV2 ? 1 : 0
+            if v2A != v2B { return v2A > v2B }
             let sA = a.manifest.stage ?? 0
             let sB = b.manifest.stage ?? 0
             if sA != sB { return sA > sB }
@@ -135,17 +188,34 @@ public enum ModelBundleLocator {
         guard fm.fileExists(atPath: directory.path, isDirectory: &isDir), isDir.boolValue else {
             return nil
         }
-        for filename in requiredFiles {
-            if !fm.fileExists(atPath: directory.appendingPathComponent(filename).path) {
-                return nil
-            }
-        }
         let manifestURL = directory.appendingPathComponent("manifest.json")
-        guard let data = try? Data(contentsOf: manifestURL),
+        guard fm.fileExists(atPath: manifestURL.path),
+              let data = try? Data(contentsOf: manifestURL),
               let manifest = try? JSONDecoder().decode(ModelManifest.self, from: data) else {
             return nil
         }
-        return LocatedModelBundle(directory: directory, sourceDescription: sourceDescription, manifest: manifest)
+        let bundle = LocatedModelBundle(directory: directory, sourceDescription: sourceDescription, manifest: manifest)
+        if bundle.isV2 {
+            guard let styleURL = bundle.writerStyleURL, fm.fileExists(atPath: styleURL.path) else {
+                return nil
+            }
+            let requiredURLs = [
+                bundle.strokeEncoderURL,
+                bundle.visionEncoderURL,
+                bundle.memoryProjURL,
+                bundle.decoderStepURL,
+            ]
+            for url in requiredURLs where !fm.fileExists(atPath: url.path) {
+                return nil
+            }
+        } else {
+            for filename in requiredFilesV1 {
+                if !fm.fileExists(atPath: directory.appendingPathComponent(filename).path) {
+                    return nil
+                }
+            }
+        }
+        return bundle
     }
 
     public static func importBundle(from securityScopedFolder: URL) throws -> LocatedModelBundle {
@@ -162,7 +232,7 @@ public enum ModelBundleLocator {
                 code: 1,
                 userInfo: [
                     NSLocalizedDescriptionKey:
-                        "Selected folder is missing one or more required files: \(requiredFiles.joined(separator: ", "))"
+                        "Selected folder is missing manifest.json or required v1/v2 ONNX files."
                 ]
             )
         }
@@ -176,16 +246,29 @@ public enum ModelBundleLocator {
         }
         try fm.createDirectory(at: dest, withIntermediateDirectories: true)
 
-        for filename in requiredFiles {
-            try fm.copyItem(
-                at: validated.directory.appendingPathComponent(filename),
-                to: dest.appendingPathComponent(filename)
-            )
+        var filesToCopy: [URL] = [validated.directory.appendingPathComponent("manifest.json")]
+        if validated.isV2 {
+            if let ws = validated.writerStyleURL { filesToCopy.append(ws) }
+            filesToCopy.append(contentsOf: [
+                validated.strokeEncoderURL,
+                validated.visionEncoderURL,
+                validated.memoryProjURL,
+                validated.decoderStepURL,
+            ])
+        } else {
+            for filename in requiredFilesV1 where filename != "manifest.json" {
+                filesToCopy.append(validated.directory.appendingPathComponent(filename))
+            }
         }
-        for filename in optionalFiles {
-            let srcFile = validated.directory.appendingPathComponent(filename)
-            if fm.fileExists(atPath: srcFile.path) {
-                try fm.copyItem(at: srcFile, to: dest.appendingPathComponent(filename))
+        if let r2l = validated.r2lScorerURL {
+            filesToCopy.append(r2l)
+        }
+
+        var copiedNames: Set<String> = []
+        for srcFile in filesToCopy {
+            let name = srcFile.lastPathComponent
+            if copiedNames.insert(name).inserted && fm.fileExists(atPath: srcFile.path) {
+                try fm.copyItem(at: srcFile, to: dest.appendingPathComponent(name))
             }
         }
 
