@@ -37,6 +37,7 @@ public struct WriterProfile: Codable, Sendable, Identifiable, Equatable {
     public var cachedStyleModelSha: String?
     public var styleDigest: UInt64
     public var loraAdapter: LoRAAdapterMetadata?
+    public var lastOnboardingAt: Date?
 
     public var calibrationStrokeCount: Int { calibrationStrokes.count }
 
@@ -44,6 +45,49 @@ public struct WriterProfile: Codable, Sendable, Identifiable, Equatable {
     public var styleConfidenceWeight: Double {
         let n = Double(min(calibrationStrokes.count, InkPreprocessorV2.styleMaxStrokes))
         return n > 0 ? (n / (n + 10.0)) : 0.0
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, createdAt, updatedAt, calibrationStrokes
+        case cachedStyleVector, cachedStyleModelSha, styleDigest, loraAdapter, lastOnboardingAt
+    }
+
+    public init(
+        id: UUID,
+        name: String,
+        createdAt: Date,
+        updatedAt: Date,
+        calibrationStrokes: [RawStroke],
+        cachedStyleVector: [Float]?,
+        cachedStyleModelSha: String?,
+        styleDigest: UInt64,
+        loraAdapter: LoRAAdapterMetadata?,
+        lastOnboardingAt: Date? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.calibrationStrokes = calibrationStrokes
+        self.cachedStyleVector = cachedStyleVector
+        self.cachedStyleModelSha = cachedStyleModelSha
+        self.styleDigest = styleDigest
+        self.loraAdapter = loraAdapter
+        self.lastOnboardingAt = lastOnboardingAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        calibrationStrokes = try c.decode([RawStroke].self, forKey: .calibrationStrokes)
+        cachedStyleVector = try c.decodeIfPresent([Float].self, forKey: .cachedStyleVector)
+        cachedStyleModelSha = try c.decodeIfPresent(String.self, forKey: .cachedStyleModelSha)
+        styleDigest = try c.decode(UInt64.self, forKey: .styleDigest)
+        loraAdapter = try c.decodeIfPresent(LoRAAdapterMetadata.self, forKey: .loraAdapter)
+        lastOnboardingAt = try c.decodeIfPresent(Date.self, forKey: .lastOnboardingAt)
     }
 }
 
@@ -55,6 +99,53 @@ public struct CorrectionSample: Codable, Sendable, Identifiable, Equatable {
     public let predictedLatex: String
     public let correctedLatex: String
     public let geometryHash: UInt64
+    /// `"correction"` (manual edit on canvas) or `"onboarding"` (adaptive onboarding prompt).
+    public let source: String
+    public let category: String?
+    public let wasExactMatch: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case id, profileId, timestamp, strokes, predictedLatex, correctedLatex, geometryHash
+        case source, category, wasExactMatch
+    }
+
+    public init(
+        id: UUID,
+        profileId: UUID,
+        timestamp: Date,
+        strokes: [RawStroke],
+        predictedLatex: String,
+        correctedLatex: String,
+        geometryHash: UInt64,
+        source: String = "correction",
+        category: String? = nil,
+        wasExactMatch: Bool? = nil
+    ) {
+        self.id = id
+        self.profileId = profileId
+        self.timestamp = timestamp
+        self.strokes = strokes
+        self.predictedLatex = predictedLatex
+        self.correctedLatex = correctedLatex
+        self.geometryHash = geometryHash
+        self.source = source
+        self.category = category
+        self.wasExactMatch = wasExactMatch
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        profileId = try c.decode(UUID.self, forKey: .profileId)
+        timestamp = try c.decode(Date.self, forKey: .timestamp)
+        strokes = try c.decode([RawStroke].self, forKey: .strokes)
+        predictedLatex = try c.decode(String.self, forKey: .predictedLatex)
+        correctedLatex = try c.decode(String.self, forKey: .correctedLatex)
+        geometryHash = try c.decode(UInt64.self, forKey: .geometryHash)
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? "correction"
+        category = try c.decodeIfPresent(String.self, forKey: .category)
+        wasExactMatch = try c.decodeIfPresent(Bool.self, forKey: .wasExactMatch)
+    }
 }
 
 /// Immutable snapshot handed to `InkTeXEngine` on every personalization state change.
@@ -182,11 +273,24 @@ public final class PersonalizationStore: ObservableObject {
         return corrections.filter { $0.profileId == id }
     }
 
+    public var activeOnboardingSampleCount: Int {
+        activeCorrections.filter { $0.source == "onboarding" }.count
+    }
+
+    public var activeManualCorrectionCount: Int {
+        activeCorrections.filter { $0.source != "onboarding" }.count
+    }
+
     public var isAnyPersonalizationActive: Bool {
         guard let p = activeProfile else { return false }
         let styleActive = styleProfileEnabled && !p.calibrationStrokes.isEmpty
         let loraActive = loraAdapterEnabled && p.loraAdapter != nil
         return styleActive || loraActive
+    }
+
+    public var needsOnboardingSuggestion: Bool {
+        guard let p = activeProfile else { return false }
+        return p.lastOnboardingAt == nil && p.calibrationStrokes.isEmpty && activeCorrections.count < 5
     }
 
     public init() {
@@ -397,11 +501,51 @@ public final class PersonalizationStore: ObservableObject {
             strokes: strokes,
             predictedLatex: predictedLatex,
             correctedLatex: cleaned,
-            geometryHash: geomHash
+            geometryHash: geomHash,
+            source: "correction",
+            category: nil,
+            wasExactMatch: nil
         )
         // Replace existing exact-geometry correction for this profile if present so latest edit wins
         corrections.removeAll { $0.profileId == profileId && $0.geometryHash == geomHash }
         corrections.insert(sample, at: 0)
+        saveToDisk()
+    }
+
+    /// Saves a ground-truth labeled sample captured during adaptive onboarding (feeds Tier 2 LoRA export).
+    @discardableResult
+    public func recordOnboardingSample(
+        strokes: [RawStroke],
+        targetLatex: String,
+        predictedLatex: String,
+        category: OnboardingCategory,
+        wasExactMatch: Bool
+    ) -> UUID? {
+        guard let profileId = activeProfileId else { return nil }
+        let cleaned = targetLatex.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty, !strokes.isEmpty else { return nil }
+        let geomHash = InkPreprocessorV2.inkGeometryHash(strokes)
+        let sample = CorrectionSample(
+            id: UUID(),
+            profileId: profileId,
+            timestamp: Date(),
+            strokes: strokes,
+            predictedLatex: predictedLatex,
+            correctedLatex: cleaned,
+            geometryHash: geomHash,
+            source: "onboarding",
+            category: category.rawValue,
+            wasExactMatch: wasExactMatch
+        )
+        corrections.insert(sample, at: 0)
+        saveToDisk()
+        return sample.id
+    }
+
+    public func markOnboardingCompleted(for profileId: UUID) {
+        guard let idx = profiles.firstIndex(where: { $0.id == profileId }) else { return }
+        profiles[idx].lastOnboardingAt = Date()
+        profiles[idx].updatedAt = Date()
         saveToDisk()
     }
 
@@ -462,8 +606,9 @@ public final class PersonalizationStore: ObservableObject {
         }
 
         for sample in samples {
-            let row: [String: Any] = [
+            var row: [String: Any] = [
                 "record_type": "correction_sample",
+                "source": sample.source,
                 "id": sample.id.uuidString.lowercased(),
                 "writer_id": "ipad:\(profile.id.uuidString.lowercased())",
                 "profile_name": profile.name,
@@ -472,6 +617,12 @@ public final class PersonalizationStore: ObservableObject {
                 "predicted_latex": sample.predictedLatex,
                 "strokes": serializeStrokes(sample.strokes),
             ]
+            if let cat = sample.category {
+                row["category"] = cat
+            }
+            if let exact = sample.wasExactMatch {
+                row["was_exact_match"] = exact
+            }
             let rowData = try JSONSerialization.data(withJSONObject: row, options: [.sortedKeys])
             if let line = String(data: rowData, encoding: .utf8) {
                 lines.append(line)

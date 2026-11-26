@@ -16,6 +16,8 @@ struct ContentView: View {
     @State private var showInspectorSheet: Bool = false
     @State private var showModelSheet: Bool = false
     @State private var showPersonalizationSheet: Bool = false
+    @State private var showOnboardingCover: Bool = false
+    @AppStorage("inktex.dismissedOnboardingBanner") private var dismissedOnboardingBanner: Bool = false
     @State private var showCorrectionSheet: Bool = false
     @State private var savedCorrectionFeedback: Bool = false
 
@@ -35,6 +37,8 @@ struct ContentView: View {
                     errorBanner("Model load failed: \(msg)")
                 } else if let errorMessage {
                     errorBanner(errorMessage)
+                } else if engine.status == .ready && personalization.needsOnboardingSuggestion && !dismissedOnboardingBanner {
+                    onboardingNudgeBanner
                 }
 
                 // Scrollable Rendered LaTeX + Raw LaTeX Card
@@ -154,6 +158,9 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showPersonalizationSheet) {
                 PersonalizationSheet(store: personalization, engine: engine)
+            }
+            .fullScreenCover(isPresented: $showOnboardingCover) {
+                PersonalizationOnboardingView(store: personalization, engine: engine)
             }
             .sheet(isPresented: $showCorrectionSheet) {
                 let strokes = canvasController.extractRawStrokes()
@@ -436,6 +443,32 @@ struct ContentView: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(Color.secondary.opacity(0.15), lineWidth: 1)
         )
+    }
+
+    private var onboardingNudgeBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "wand.and.stars")
+                .foregroundStyle(Color.accentColor)
+            Text("Personalize InkTeX to your handwriting (~2 min guided session for FiLM + LoRA).")
+                .font(.subheadline)
+            Spacer()
+            Button("Start") {
+                showOnboardingCover = true
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            Button {
+                dismissedOnboardingBanner = true
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 9)
+        .background(Color.accentColor.opacity(0.11))
     }
 
     private var missingModelBanner: some View {

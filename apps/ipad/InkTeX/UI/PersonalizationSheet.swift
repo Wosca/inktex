@@ -25,6 +25,7 @@ struct PersonalizationSheet: View {
     @State private var newProfileName = ""
     @State private var exportedJSONLURL: URL?
     @State private var exportError: String?
+    @State private var showOnboarding = false
 
     private static let samplePrompts = [
         "x^2 + \\alpha y = \\frac{1}{\\sqrt{2}}",
@@ -50,6 +51,42 @@ struct PersonalizationSheet: View {
                         }
                         .padding(.vertical, 2)
                     }
+                }
+
+                // 0. Guided Adaptive Onboarding Hero
+                Section {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "wand.and.stars")
+                                .font(.title2.weight(.semibold))
+                                .foregroundStyle(Color.accentColor)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Guided Handwriting Onboarding")
+                                    .font(.headline)
+                                Text("Evaluates your writing across 8 math categories, auto-calibrates Tier 1 FiLM, drills missed symbols, and builds your Tier 2 LoRA dataset.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        Button {
+                            showOnboarding = true
+                        } label: {
+                            Label(
+                                (store.activeProfile?.calibrationStrokeCount ?? 0) > 0
+                                    ? "Run Adaptive Drill / Re-Calibrate"
+                                    : "Start Guided Onboarding (~2–5 min)",
+                                systemImage: "pencil.tip.crop.circle.badge.plus"
+                            )
+                            .font(.subheadline.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.regular)
+                    }
+                    .padding(.vertical, 4)
+                } header: {
+                    Text("Recommended Setup")
                 }
 
                 // 1. Writer Profile Switcher
@@ -269,7 +306,12 @@ struct PersonalizationSheet: View {
                     if let profile = store.activeProfile {
                         let items = store.activeCorrections
                         HStack {
-                            Text("Saved Personal Corrections")
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Saved Training Samples")
+                                Text("\(store.activeOnboardingSampleCount) onboarding · \(store.activeManualCorrectionCount) manual corrections")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                             Spacer()
                             Text("\(items.count)")
                                 .font(.callout.monospacedDigit().weight(.semibold))
@@ -342,6 +384,9 @@ struct PersonalizationSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .fullScreenCover(isPresented: $showOnboarding) {
+                PersonalizationOnboardingView(store: store, engine: engine)
             }
             .alert("New Writer Profile", isPresented: $showNewProfileAlert) {
                 TextField("Profile Name", text: $newProfileName)
