@@ -266,7 +266,11 @@ struct ContentView: View {
                     }
 
                     if result.usedWriterStyle || result.usedLoRAAdapter {
-                        Text(result.usedLoRAAdapter ? "LoRA" : "Style")
+                        Text(
+                            result.usedWriterStyle && result.usedLoRAAdapter
+                                ? "Style+LoRA"
+                                : (result.usedLoRAAdapter ? "LoRA" : "Style")
+                        )
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
