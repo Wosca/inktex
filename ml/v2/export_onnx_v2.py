@@ -982,6 +982,7 @@ def _cli() -> None:
     parser.add_argument("--no-dynamic-lora", action="store_true", help="Disable dynamic LoRA inputs (merge into base weights instead)")
     parser.add_argument("--static-kv-len", type=int, default=STATIC_KV_LEN)
     parser.add_argument("--export-lora", type=Path, default=None, help="Optional path to also export `.inktexlora` adapter file")
+    parser.add_argument("--stage", type=int, default=None, help="Override integer stage in manifest.json (1=A, 2=B, 3=C)")
     args = parser.parse_args()
 
     if args.checkpoint is None:
@@ -997,7 +998,10 @@ def _cli() -> None:
         return
 
     payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = InkTeXV2Config.from_dict(payload["config"])
+    raw_cfg = payload.get("model_config") or payload.get("config")
+    if raw_cfg is None:
+        raise KeyError("Checkpoint missing model_config / config")
+    cfg = InkTeXV2Config.from_dict(raw_cfg)
     cfg.vision_pretrained = False
     model = InkTeXV2Model(cfg)
     state = payload.get("ema_state_dict") or payload.get("model_state_dict") or payload.get("model")
@@ -1006,7 +1010,39 @@ def _cli() -> None:
     model.load_state_dict(state, strict=False)
     model.eval()
     tokens = payload.get("tokenizer", {}).get("tokens") or [f"<TOK_{i}>" for i in range(cfg.vocab_size)]
-    metrics = payload.get("metrics")
+
+    # Normalize stage to Optional[int] (iPad ModelManifest decodes `stage: Int?`)
+    stage_int = args.stage
+    if stage_int is None:
+        raw_stage = payload.get("stage")
+        if isinstance(raw_stage, int):
+            stage_int = raw_stage
+        elif isinstance(raw_stage, str):
+            s_low = raw_stage.lower()
+            if "stage_c" in s_low or "cooldown" in s_low:
+                stage_int = 3
+            elif "stage_b" in s_low or "joint" in s_low:
+                stage_int = 2
+            elif "stage_a" in s_low or "stroke" in s_low:
+                stage_int = 1
+
+    # Normalize metrics to flat MetricsSummary keys expected by Swift ModelManifest
+    raw_metrics = payload.get("metrics")
+    norm_metrics: dict[str, float] | None = None
+    if isinstance(raw_metrics, dict):
+        norm_metrics = {}
+        if isinstance(raw_metrics.get("normalized_exact"), (int, float)):
+            norm_metrics["normalized_exact"] = float(raw_metrics["normalized_exact"])
+        elif isinstance(raw_metrics.get("avg"), (int, float)):
+            norm_metrics["normalized_exact"] = float(raw_metrics["avg"])
+        elif isinstance(raw_metrics.get("val_crohme_exact"), (int, float)):
+            norm_metrics["normalized_exact"] = float(raw_metrics["val_crohme_exact"])
+        if isinstance(raw_metrics.get("strict_exact"), (int, float)):
+            norm_metrics["strict_exact"] = float(raw_metrics["strict_exact"])
+        if isinstance(raw_metrics.get("token_cer"), (int, float)):
+            norm_metrics["token_cer"] = float(raw_metrics["token_cer"])
+        if not norm_metrics:
+            norm_metrics = None
 
     if args.no_dynamic_lora:
         model.merge_lora_()
@@ -1016,15 +1052,15 @@ def _cli() -> None:
         tokens,
         args.output,
         model_name=args.name,
-        stage=payload.get("stage"),
-        epoch=payload.get("epoch"),
+        stage=stage_int,
+        epoch=payload.get("epoch") if isinstance(payload.get("epoch"), int) else None,
         quantize=args.quantize,
         dynamic_lora=not args.no_dynamic_lora,
         dynamic_buckets=not args.static_buckets,
         static_kv_len=args.static_kv_len,
         chunk_buckets=(args.chunk_bucket,) if args.static_buckets else CHUNK_BUCKETS,
         width_buckets=(args.vision_width,) if args.static_buckets else WIDTH_BUCKETS_V2,
-        metrics=metrics,
+        metrics=norm_metrics,
     )
     print("Exported v2 bundle:", json.dumps(report, indent=2))
     if args.export_lora is not None:
