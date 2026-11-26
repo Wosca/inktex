@@ -15,7 +15,7 @@
 
 ## Benchmark Results
 
-### InkTeX v2 (Stage C Soup, Beam-5 + R2L `α=0.4`, Unmodified Ground Truth)
+### InkTeX v2 (Stage C Soup, GitHub Release [`v0.2.0-models`](https://github.com/Wosca/inktex/releases/tag/v0.2.0-models), Beam-5 + R2L `α=0.4`, Unmodified Ground Truth)
 
 | Benchmark | Metric | Score |
 |---|---|---:|
@@ -47,11 +47,11 @@ inktex/
 
 ## Quick Start (iPad App in Xcode)
 
-1. **Export a v2 ONNX bundle** (or copy your pre-exported `ipad-bundle-v2/` folder):
+1. **Download the pre-exported FP16 iPad bundle** from GitHub Release [`v0.2.0-models`](https://github.com/Wosca/inktex/releases/tag/v0.2.0-models) (`inktex-v2-ipad-bundle-fp16.zip`, or via `python ml/download_checkpoints.py --model ipad-v2`), or export from a PyTorch checkpoint:
    ```bash
    cd ml
    python -m v2.export_onnx_v2 \
-     --checkpoint /path/to/inktex_v2_release.pt \
+     --checkpoint ../checkpoints/inktex_v2_release.pt \
      --output ./ipad-bundle-v2 \
      --name "InkTeX v2 (Stage C)" \
      --quantize fp16 --stage 3

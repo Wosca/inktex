@@ -4,6 +4,14 @@ Self-contained training, dataset packing, LaTeX canonicalization, evaluation, ON
 
 ## InkTeX v2 Pipeline (`ml/v2/`)
 
+Download the pre-trained **InkTeX v2** PyTorch checkpoint (`inktex_v2_release.pt`) or ready-to-use iPad FP16 ONNX bundle (`inktex-v2-ipad-bundle-fp16.zip`) from GitHub Release [`v0.2.0-models`](https://github.com/Wosca/inktex/releases/tag/v0.2.0-models):
+
+```bash
+pip install -r requirements.txt
+python download_checkpoints.py --model v2       # -> ../checkpoints/inktex_v2_release.pt
+python download_checkpoints.py --model ipad-v2  # -> ../checkpoints/ipad-bundle-v2/
+```
+
 ### 1. Shard Packing & Training
 - **Shard Packing (`v2/pack_v2.py`):** Builds leakage-audited `inktex-shards-v2` tars (`train_online`, `train_offline`, `val_crohme`, `val_mw`).
 - **Stage A (`configs/v2_stage_a_stroke.yaml`):** Online sub-stroke chunk encoder + shared bidirectional decoder pretraining.
@@ -70,7 +78,7 @@ Download the v1 checkpoint from GitHub Release [`v0.1.0-models`](https://github.
 
 ```bash
 pip install -r requirements.txt
-python download_checkpoints.py
+python download_checkpoints.py --model v1
 
 # Online handwriting (.inkml) or offline math images (.png/.jpg)
 python infer.py --checkpoint ../checkpoints/inktex-75m-stage26-best.pt --inkml path/to/file_or_dir --show-nbest

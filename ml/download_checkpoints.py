@@ -1,15 +1,34 @@
-"""Download the verified InkTeX-75M checkpoint from the GitHub Release (zero extra deps)."""
+"""Download verified InkTeX model checkpoints and iPad ONNX bundles from GitHub Releases (zero extra deps)."""
 from __future__ import annotations
 
 import argparse
 import hashlib
 from pathlib import Path
 import urllib.request
+import zipfile
 
 REPO = "Wosca/inktex"
-RELEASE_TAG = "v0.1.0-models"
-FILENAME = "inktex-75m-stage26-best.pt"
-EXPECTED_SHA256 = "d55df173d3d40205fea272fb4f874cbb7bd7cadf4587af91f09dd7d03b871528"
+
+ARTIFACTS: dict[str, dict[str, str]] = {
+    "v2": {
+        "tag": "v0.2.0-models",
+        "filename": "inktex_v2_release.pt",
+        "sha256": "58445f26faeb02187df72786afafca6fee7e344e71b050b8d7834ea21ee5e20a",
+        "description": "InkTeX v2 Stage C Soup + Tier 1 WriterStyleEncoder PyTorch checkpoint (375.7 MB)",
+    },
+    "ipad-v2": {
+        "tag": "v0.2.0-models",
+        "filename": "inktex-v2-ipad-bundle-fp16.zip",
+        "sha256": "062f72cf8fcfa69c4890bf177495873178840bab2a0f25017f7063159c1720f3",
+        "description": "InkTeX v2 5-graph FP16 ONNX bundle for iPadOS (173.0 MB zip / 199 MB unzipped)",
+    },
+    "v1": {
+        "tag": "v0.1.0-models",
+        "filename": "inktex-75m-stage26-best.pt",
+        "sha256": "d55df173d3d40205fea272fb4f874cbb7bd7cadf4587af91f09dd7d03b871528",
+        "description": "Legacy InkTeX v1 Stage 2.6 PyTorch checkpoint (319.9 MB)",
+    },
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -20,18 +39,23 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download(out_dir: Path) -> Path:
-    dest = out_dir / FILENAME
+def download(out_dir: Path, *, artifact: str = "v2", extract_zip: bool = True) -> Path:
+    spec = ARTIFACTS[artifact]
+    tag = spec["tag"]
+    filename = spec["filename"]
+    expected_sha = spec["sha256"]
+
+    dest = out_dir / filename
     out_dir.mkdir(parents=True, exist_ok=True)
     if dest.is_file():
         actual = sha256_file(dest)
-        if actual == EXPECTED_SHA256:
+        if actual == expected_sha:
             print(f"[ok] {dest} already exists and matches SHA-256")
-            return dest
-        print(f"[re-downloading] {dest} checksum mismatch ({actual[:12]} != {EXPECTED_SHA256[:12]})")
+            return _maybe_extract(dest, out_dir, extract_zip)
+        print(f"[re-downloading] {dest} checksum mismatch ({actual[:12]} != {expected_sha[:12]})")
 
-    url = f"https://github.com/{REPO}/releases/download/{RELEASE_TAG}/{FILENAME}"
-    tmp = dest.with_suffix(".pt.part")
+    url = f"https://github.com/{REPO}/releases/download/{tag}/{filename}"
+    tmp = dest.with_suffix(dest.suffix + ".part")
     print(f"Downloading {url} -> {dest}")
 
     def progress(blocks: int, block_size: int, total: int) -> None:
@@ -47,29 +71,52 @@ def download(out_dir: Path) -> Path:
     except Exception as exc:
         tmp.unlink(missing_ok=True)
         raise SystemExit(
-            f"Download failed ({exc}). If the repo is still private, use:\n"
-            f"  gh release download {RELEASE_TAG} -R {REPO} -p {FILENAME} -D {out_dir}"
+            f"Download failed ({exc}). You can also fetch via GitHub CLI:\n"
+            f"  gh release download {tag} -R {REPO} -p {filename} -D {out_dir}"
         ) from exc
 
     actual = sha256_file(tmp)
-    if actual != EXPECTED_SHA256:
+    if actual != expected_sha:
         tmp.unlink(missing_ok=True)
-        raise SystemExit(f"SHA-256 mismatch for {FILENAME}: got {actual}, expected {EXPECTED_SHA256}")
+        raise SystemExit(f"SHA-256 mismatch for {filename}: got {actual}, expected {expected_sha}")
     tmp.replace(dest)
     print(f"[verified] {dest} (sha256={actual[:16]}...)")
-    return dest
+    return _maybe_extract(dest, out_dir, extract_zip)
+
+
+def _maybe_extract(path: Path, out_dir: Path, extract_zip: bool) -> Path:
+    if extract_zip and path.suffix.lower() == ".zip":
+        print(f"Extracting {path} -> {out_dir}")
+        with zipfile.ZipFile(path, "r") as zf:
+            zf.extractall(out_dir)
+        extracted = out_dir / "ipad-bundle-v2"
+        if extracted.is_dir():
+            print(f"[ready] {extracted}")
+            return extracted
+    return path
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        choices=tuple(ARTIFACTS.keys()),
+        default="v2",
+        help="Artifact to download: v2 (PyTorch checkpoint), ipad-v2 (FP16 ONNX bundle), or v1 (legacy checkpoint)",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parents[1] / "checkpoints",
         help="Destination folder (default: <repo>/checkpoints)",
     )
+    parser.add_argument(
+        "--no-extract",
+        action="store_true",
+        help="Keep .zip archives compressed instead of extracting automatically",
+    )
     args = parser.parse_args()
-    download(args.output_dir)
+    download(args.output_dir, artifact=args.model, extract_zip=not args.no_extract)
 
 
 if __name__ == "__main__":
