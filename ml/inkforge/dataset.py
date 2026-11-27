@@ -54,9 +54,20 @@ DEFAULT_IAMONDO_TRAIN = DATASETS_ROOT / "canonical" / "iamondo-v1" / "train.json
 DEFAULT_DETEXIFY = DATASETS_ROOT / "external" / "detexify" / "samples.jsonl"
 DEFAULT_MATHWRITING_TRAIN = Path(r"E:\mathwriting-2024\train")
 DEFAULT_MATHWRITING_SYMBOLS = Path(r"E:\mathwriting-2024\symbols")
+DEFAULT_MATHWRITING_SYNTHETIC = Path(r"E:\mathwriting-2024\synthetic")
 DEFAULT_CACHE_DIR = Path(r"E:\math-recogniser-training\inkforge_data")
+DEFAULT_V2_CACHE_DIR = Path(r"E:\math-recogniser-training\inkforge_data_v2")
 
-SOURCE_NAMES = ("mathwriting", "crohme", "iamondo", "hwrt", "detexify", "mw_symbols")
+SOURCE_NAMES = (
+    "mathwriting",
+    "crohme",
+    "iamondo",
+    "hwrt",
+    "detexify",
+    "mw_symbols",
+    "mw_synthetic",
+    "composed",
+)
 SOURCE_TO_ID = {name: i for i, name in enumerate(SOURCE_NAMES)}
 
 
@@ -640,6 +651,508 @@ def prepare_inkforge_cache(
     return output_dir
 
 
+# ---------------------------------------------------------------------------
+# Targeted Weak-Structure 2D Composed Math Synthesizer (Strictly from Train Donors)
+# ---------------------------------------------------------------------------
+
+def _normalize_donor_glyph(strokes: Sequence[np.ndarray]) -> tuple[list[np.ndarray], float, float]:
+    """Shift a symbol donor so its bbox starts at (0, 0) and scale height to ~1.0 (preserving width ratio)."""
+    pts = [np.asarray(s, dtype=np.float64)[:, :2] for s in strokes if len(s) > 0]
+    all_xy = np.concatenate(pts, axis=0)
+    x0, y0 = float(all_xy[:, 0].min()), float(all_xy[:, 1].min())
+    x1, y1 = float(all_xy[:, 0].max()), float(all_xy[:, 1].max())
+    w = max(x1 - x0, 1e-3)
+    h = max(y1 - y0, 1e-3)
+    scale = 1.0 / max(h, 0.35 * w)
+    out = [np.stack([(s[:, 0] - x0) * scale, (s[:, 1] - y0) * scale], axis=-1) for s in pts]
+    return out, w * scale, h * scale
+
+
+def _place_glyph(
+    glyph_strokes: Sequence[np.ndarray],
+    x_offset: float,
+    y_offset: float,
+    scale: float,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    sx = scale * float(rng.uniform(0.92, 1.08))
+    sy = scale * float(rng.uniform(0.92, 1.08))
+    jitter_y = float(rng.uniform(-0.04, 0.04)) * scale
+    return [
+        np.stack([s[:, 0] * sx + x_offset, s[:, 1] * sy + y_offset + jitter_y], axis=-1)
+        for s in glyph_strokes
+    ]
+
+
+def _draw_radical_sign(
+    x_rad_left: float,
+    x_rad_right: float,
+    y_top: float,
+    y_bot: float,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Generate a realistic single-stroke hand-drawn square-root radical wrapping `[x_rad_left, x_rad_right]`."""
+    h = max(y_bot - y_top, 0.8)
+    y_roof = y_top - float(rng.uniform(0.14, 0.28)) * h
+    y_v = y_bot + float(rng.uniform(0.02, 0.12)) * h
+    y_mid = y_top + 0.55 * h
+    x_hook = x_rad_left - float(rng.uniform(0.55, 0.80)) * h
+    x_v = x_rad_left - float(rng.uniform(0.28, 0.42)) * h
+    x_corner = x_rad_left - float(rng.uniform(0.05, 0.14)) * h
+    x_end = x_rad_right + float(rng.uniform(0.12, 0.30)) * h
+
+    p0 = np.array([x_hook, y_mid])
+    p1 = np.array([x_v, y_v])
+    p2 = np.array([x_corner, y_roof])
+    p3 = np.array([x_end, y_roof + float(rng.uniform(-0.05, 0.05)) * h])
+
+    seg1 = np.linspace(p0, p1, 6)
+    seg2 = np.linspace(p1, p2, 10)[1:]
+    n_roof = max(8, min(28, int(round((x_end - x_corner) * 5.0))))
+    seg3 = np.linspace(p2, p3, n_roof)[1:]
+    pts = np.concatenate([seg1, seg2, seg3], axis=0)
+    # Mild organic hand tremor
+    ts = np.linspace(0.0, 1.0, len(pts))
+    pts[:, 1] += 0.018 * h * np.sin(ts * math.pi * float(rng.uniform(2.0, 4.0)) + float(rng.uniform(0, 6.28)))
+    return [pts]
+
+
+def _draw_frac_bar(x0: float, x1: float, y: float, rng: np.random.Generator) -> list[np.ndarray]:
+    n = max(6, min(24, int(round((x1 - x0) * 5.0))))
+    xs = np.linspace(x0, x1, n)
+    ys = np.full(n, y) + np.linspace(0.0, float(rng.uniform(-0.04, 0.04)), n)
+    ys += rng.normal(0.0, 0.008, size=n)
+    return [np.stack([xs, ys], axis=-1)]
+
+
+def _draw_vec_arrow(x0: float, x1: float, y: float, rng: np.random.Generator) -> list[np.ndarray]:
+    w = max(x1 - x0, 0.5)
+    shaft = np.linspace([x0, y], [x1, y + float(rng.uniform(-0.03, 0.03))], 7)
+    tip = shaft[-1]
+    head = np.array([
+        [tip[0] - 0.22 * w, tip[1] - 0.14],
+        [tip[0], tip[1]],
+        [tip[0] - 0.22 * w, tip[1] + 0.14],
+    ])
+    return [shaft, head]
+
+
+def _layout_linear_tokens(
+    tokens: Sequence[str],
+    bank: dict[str, list[tuple[list[np.ndarray], float, float]]],
+    rng: np.random.Generator,
+    *,
+    scale: float = 1.0,
+) -> tuple[list[np.ndarray], float, float, float] | None:
+    """Lay out a flat sequence of tokens (supporting single-token `^` and `_` scripts)."""
+    strokes: list[np.ndarray] = []
+    cursor_x = 0.0
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok == "<SPACE>":
+            cursor_x += 0.48 * scale
+            i += 1
+            continue
+        if tok in ("^", "_") and i + 1 < n:
+            script_tok = tokens[i + 1]
+            cands = bank.get(script_tok)
+            if not cands:
+                return None
+            g_st, gw, gh = cands[int(rng.integers(0, len(cands)))]
+            sc = scale * 0.62
+            y_off = (-0.42 * scale) if tok == "^" else (0.58 * scale)
+            strokes.extend(_place_glyph(g_st, cursor_x, y_off, sc, rng))
+            cursor_x += gw * sc + 0.14 * scale
+            i += 2
+            continue
+        cands = bank.get(tok)
+        if not cands:
+            return None
+        g_st, gw, gh = cands[int(rng.integers(0, len(cands)))]
+        # Vertically center short operators (+, -, =, \cdot, \rightarrow, comma)
+        if tok in ("-", "=", "+", r"\cdot", r"\rightarrow", r"\leq", r"\geq", r"\in", r"\cap", r"\cup", ","):
+            y_off = (0.5 * (1.0 - gh) + (0.28 if tok == "," else 0.0)) * scale
+        else:
+            y_off = (1.0 - gh) * 0.5 * scale
+        strokes.extend(_place_glyph(g_st, cursor_x, y_off, scale, rng))
+        cursor_x += gw * scale + float(rng.uniform(0.14, 0.24)) * scale
+        i += 1
+    if not strokes:
+        return None
+    all_xy = np.concatenate(strokes, axis=0)
+    return strokes, float(all_xy[:, 0].max()), float(all_xy[:, 1].min()), float(all_xy[:, 1].max())
+
+
+def _generate_composed_weak_structures(
+    symbol_bank: dict[str, list[tuple[list[np.ndarray], float, float]]],
+    tokenizer: InkForgeTokenizer,
+    *,
+    count: int = 35000,
+    spacing: float = 0.12,
+    max_points: int = 512,
+    max_text_len: int = 160,
+    seed: int = 1337,
+) -> list[tuple[list[int], str, int, np.ndarray, np.ndarray]]:
+    """Synthesize clean 2D training examples targeting InkForge v1's weak structures (strictly train donors)."""
+    rng = np.random.default_rng(seed)
+    vars_pool = ["x", "y", "z", "t", "n", "k", "a", "b", "c", "r", "u", "v", "p", "q"]
+    digits_pool = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    ops_pool = ["+", "-"]
+    greek_pool = [r"\alpha", r"\beta", r"\gamma", r"\theta", r"\lambda", r"\mu", r"\sigma", r"\omega", r"\phi"]
+    words_pool = [
+        "otherwise", "if", "where", "for", "all", "and", "or", "when", "then", "else", "true", "false",
+    ]
+    sid = SOURCE_TO_ID["composed"]
+    out: list[tuple[list[int], str, int, np.ndarray, np.ndarray]] = []
+    attempts = 0
+    max_attempts = count * 5
+
+    def _emit(latex: str, strokes: list[np.ndarray]) -> bool:
+        toks = tokenize_inkforge(latex)
+        if not toks or len(toks) + 2 > max_text_len:
+            return False
+        ids = tokenizer.encode(latex, max_len=max_text_len)
+        if tokenizer.unk_id in ids:
+            return False
+        norm = normalize_and_resample_for_inkforge(strokes, spacing=spacing, max_points=max_points)
+        if norm is None:
+            return False
+        xy, pen = norm
+        out.append((ids, "", sid, xy.astype(np.float16), pen))
+        return True
+
+    while len(out) < count and attempts < max_attempts:
+        attempts += 1
+        u = float(rng.random())
+        try:
+            if u < 0.36:
+                # Category 1: Radicals \sqrt{...} with varied algebraic radicands (fixes v1's #1 failure!)
+                kind = int(rng.integers(0, 5))
+                v1 = vars_pool[int(rng.integers(0, len(vars_pool)))]
+                v2 = vars_pool[int(rng.integers(0, len(vars_pool)))]
+                v3 = vars_pool[int(rng.integers(0, len(vars_pool)))]
+                d1 = digits_pool[int(rng.integers(0, len(digits_pool)))]
+                op = ops_pool[int(rng.integers(0, 2))]
+                if kind == 0:
+                    rad_tex = f"{v1}^2 {op} {d1}{v2}{v3}"
+                    rad_toks = [v1, "^", "2", op, d1, v2, v3]
+                elif kind == 1:
+                    rad_tex = f"{v1}^2 {op} {v2}^2"
+                    rad_toks = [v1, "^", "2", op, v2, "^", "2"]
+                elif kind == 2:
+                    rad_tex = f"{d1} {op} {v1}^2"
+                    rad_toks = [d1, op, v1, "^", "2"]
+                elif kind == 3:
+                    rad_tex = f"{v1} {op} {v2}"
+                    rad_toks = [v1, op, v2]
+                else:
+                    rad_tex = f"{d1}{v1} {op} {digits_pool[int(rng.integers(0, 9))]}"
+                    rad_toks = [d1, v1, op, rad_tex.split()[-1]]
+
+                res = _layout_linear_tokens(rad_toks, symbol_bank, rng, scale=1.0)
+                if res is None:
+                    continue
+                rad_st, rx1, ry0, ry1 = res
+                # Shift radicand right to make room for radical hook
+                shift_x = 0.85
+                rad_shifted = [np.stack([s[:, 0] + shift_x, s[:, 1]], axis=-1) for s in rad_st]
+                rad_sign = _draw_radical_sign(shift_x, rx1 + shift_x, ry0, ry1, rng)
+                # Optionally add prefix/suffix (e.g. y = \sqrt{...} or \sqrt{...} = c)
+                if float(rng.random()) < 0.35:
+                    lhs_v = vars_pool[int(rng.integers(0, len(vars_pool)))]
+                    lhs = _layout_linear_tokens([lhs_v, "="], symbol_bank, rng, scale=1.0)
+                    if lhs is None:
+                        continue
+                    lhs_st, lx1, _, _ = lhs
+                    dx_r = lx1 + 0.35
+                    all_st = lhs_st + [np.stack([s[:, 0] + dx_r, s[:, 1]], axis=-1) for s in (rad_sign + rad_shifted)]
+                    _emit(f"{lhs_v} = \\sqrt{{{rad_tex}}}", all_st)
+                else:
+                    _emit(f"\\sqrt{{{rad_tex}}}", rad_sign + rad_shifted)
+
+            elif u < 0.62:
+                # Category 2: Sums / Products / Limits with stacked sub/sup bounds + fraction
+                sub_kind = int(rng.integers(0, 3))
+                if sub_kind == 0:
+                    # \sum_{i=1}^n expr  or  \prod_{k=1}^n expr
+                    big_op = r"\sum" if float(rng.random()) < 0.78 else r"\prod"
+                    idx_v = "i" if float(rng.random()) < 0.6 else "k"
+                    low_v = "1" if float(rng.random()) < 0.65 else "0"
+                    hi_v = "n" if float(rng.random()) < 0.7 else r"\infty"
+                    body_v = vars_pool[int(rng.integers(0, 8))]
+                    op_cands = symbol_bank.get(big_op)
+                    if not op_cands:
+                        continue
+                    g_op, op_w, op_h = op_cands[int(rng.integers(0, len(op_cands)))]
+                    big_st = _place_glyph(g_op, 0.0, -0.25, 1.55, rng)
+                    low_res = _layout_linear_tokens([idx_v, "=", low_v], symbol_bank, rng, scale=0.58)
+                    hi_res = _layout_linear_tokens([hi_v], symbol_bank, rng, scale=0.62)
+                    body_res = _layout_linear_tokens([body_v, "_", idx_v], symbol_bank, rng, scale=1.0)
+                    if low_res is None or hi_res is None or body_res is None:
+                        continue
+                    low_st, lw, _, _ = low_res
+                    hi_st, hw, _, _ = hi_res
+                    body_st, _, _, _ = body_res
+                    cx = 0.5 * op_w * 1.55
+                    low_placed = [np.stack([s[:, 0] + cx - 0.5 * lw, s[:, 1] + 1.45], axis=-1) for s in low_st]
+                    hi_placed = [np.stack([s[:, 0] + cx - 0.5 * hw, s[:, 1] - 0.95], axis=-1) for s in hi_st]
+                    bx = max(op_w * 1.55, cx + 0.5 * lw) + 0.35
+                    body_placed = [np.stack([s[:, 0] + bx, s[:, 1] + 0.05], axis=-1) for s in body_st]
+                    _emit(f"{big_op}_{{{idx_v}={low_v}}}^{{{hi_v}}} {body_v}_{idx_v}", big_st + low_placed + hi_placed + body_placed)
+                elif sub_kind == 1:
+                    # \lim_{x \rightarrow 0} \frac{num}{den} = val
+                    v = "x" if float(rng.random()) < 0.7 else "n"
+                    tgt = "0" if v == "x" else r"\infty"
+                    lim_res = _layout_linear_tokens(["l", "i", "m"], symbol_bank, rng, scale=0.95)
+                    sub_res = _layout_linear_tokens([v, r"\rightarrow", tgt], symbol_bank, rng, scale=0.58)
+                    num_toks = ["s", "i", "n", v] if float(rng.random()) < 0.5 else ["1"]
+                    num_res = _layout_linear_tokens(num_toks, symbol_bank, rng, scale=0.88)
+                    den_res = _layout_linear_tokens([v], symbol_bank, rng, scale=0.88)
+                    val_tok = "1" if num_toks[0] == "s" else "0"
+                    eq_res = _layout_linear_tokens(["=", val_tok], symbol_bank, rng, scale=1.0)
+                    if None in (lim_res, sub_res, num_res, den_res, eq_res):
+                        continue
+                    lim_st, lim_w, _, _ = lim_res
+                    sub_st, sub_w, _, _ = sub_res
+                    num_st, nw, _, _ = num_res
+                    den_st, dw, _, _ = den_res
+                    eq_st, _, _, _ = eq_res
+                    sub_placed = [np.stack([s[:, 0] + 0.5 * (lim_w - sub_w), s[:, 1] + 1.05], axis=-1) for s in sub_st]
+                    fx = max(lim_w, 0.5 * (lim_w + sub_w)) + 0.42
+                    fw = max(nw, dw) + 0.30
+                    num_p = [np.stack([s[:, 0] + fx + 0.5 * (fw - nw), s[:, 1] - 0.62], axis=-1) for s in num_st]
+                    bar_p = _draw_frac_bar(fx, fx + fw, 0.42, rng)
+                    den_p = [np.stack([s[:, 0] + fx + 0.5 * (fw - dw), s[:, 1] + 0.62], axis=-1) for s in den_st]
+                    eq_p = [np.stack([s[:, 0] + fx + fw + 0.30, s[:, 1]], axis=-1) for s in eq_st]
+                    num_tex = f"\\sin {v}" if num_toks[0] == "s" else "1"
+                    _emit(
+                        f"\\lim_{{{v} \\rightarrow {tgt}}} \\frac{{{num_tex}}}{{{v}}} = {val_tok}",
+                        lim_st + sub_placed + num_p + bar_p + den_p + eq_p,
+                    )
+                else:
+                    # \frac{n(n+1)}{2} style fraction
+                    v = vars_pool[int(rng.integers(0, 6))]
+                    d1 = digits_pool[int(rng.integers(0, 5))]
+                    d2 = digits_pool[int(rng.integers(1, 5))]
+                    num_res = _layout_linear_tokens([v, "(", v, "+", d1, ")"], symbol_bank, rng, scale=0.88)
+                    den_res = _layout_linear_tokens([d2], symbol_bank, rng, scale=0.88)
+                    if num_res is None or den_res is None:
+                        continue
+                    num_st, nw, _, _ = num_res
+                    den_st, dw, _, _ = den_res
+                    fw = max(nw, dw) + 0.30
+                    num_p = [np.stack([s[:, 0] + 0.5 * (fw - nw), s[:, 1] - 0.62], axis=-1) for s in num_st]
+                    bar_p = _draw_frac_bar(0.0, fw, 0.42, rng)
+                    den_p = [np.stack([s[:, 0] + 0.5 * (fw - dw), s[:, 1] + 0.62], axis=-1) for s in den_st]
+                    _emit(f"\\frac{{{v}({v}+{d1})}}{{{d2}}}", num_p + bar_p + den_p)
+
+            elif u < 0.85:
+                # Category 3: \Pr(...), \forall x \in \mathbb{R}, \Delta x = \lambda \mu, \sin^2\theta+\cos^2\theta=1, \vec{u}\cdot\vec{v}=0
+                k3 = int(rng.integers(0, 5))
+                if k3 == 0:
+                    a_c, b_c = ("A", "B") if float(rng.random()) < 0.7 else ("X", "Y")
+                    op_set = r"\cap" if float(rng.random()) < 0.6 else r"\cup"
+                    toks = ["P", "r", "(", a_c, op_set, b_c, ")", "=", "P", "r", "(", a_c, ")", "P", "r", "(", b_c, ")"]
+                    res = _layout_linear_tokens(toks, symbol_bank, rng, scale=1.0)
+                    if res is not None:
+                        _emit(f"\\Pr({a_c} {op_set} {b_c}) = \\Pr({a_c})\\Pr({b_c})", res[0])
+                elif k3 == 1:
+                    g1 = greek_pool[int(rng.integers(0, len(greek_pool)))]
+                    g2 = greek_pool[int(rng.integers(0, len(greek_pool)))]
+                    v = vars_pool[int(rng.integers(0, 5))]
+                    res = _layout_linear_tokens([r"\Delta", v, "=", g1, g2], symbol_bank, rng, scale=1.0)
+                    if res is not None:
+                        _emit(f"\\Delta {v} = {g1} {g2}", res[0])
+                elif k3 == 2:
+                    v = vars_pool[int(rng.integers(0, 4))]
+                    rel = r"\geq" if float(rng.random()) < 0.6 else r"\leq"
+                    res = _layout_linear_tokens([r"\forall", v, r"\in", "R", ",", v, "^", "2", rel, "0"], symbol_bank, rng, scale=1.0)
+                    if res is not None:
+                        _emit(f"\\forall {v} \\in \\mathbb{{R}}, {v}^2 {rel} 0", res[0])
+                elif k3 == 3:
+                    g = r"\theta" if float(rng.random()) < 0.65 else "x"
+                    toks = ["s", "i", "n", "^", "2", g, "+", "c", "o", "s", "^", "2", g, "=", "1"]
+                    res = _layout_linear_tokens(toks, symbol_bank, rng, scale=1.0)
+                    if res is not None:
+                        _emit(f"\\sin^2 {g} + \\cos^2 {g} = 1", res[0])
+                else:
+                    v1, v2 = ("u", "v") if float(rng.random()) < 0.6 else ("a", "b")
+                    r1 = _layout_linear_tokens([v1], symbol_bank, rng, scale=1.0)
+                    rd = _layout_linear_tokens([r"\cdot"], symbol_bank, rng, scale=1.0)
+                    r2 = _layout_linear_tokens([v2], symbol_bank, rng, scale=1.0)
+                    re_ = _layout_linear_tokens(["=", "0"], symbol_bank, rng, scale=1.0)
+                    if None in (r1, rd, r2, re_):
+                        continue
+                    s1, w1, y1t, _ = r1
+                    sd, wd, _, _ = rd
+                    s2, w2, y2t, _ = r2
+                    se, _, _, _ = re_
+                    a1 = _draw_vec_arrow(0.0, max(w1, 0.55), y1t - 0.22, rng)
+                    x_d = w1 + 0.28
+                    sd_p = [np.stack([s[:, 0] + x_d, s[:, 1]], axis=-1) for s in sd]
+                    x_2 = x_d + wd + 0.28
+                    s2_p = [np.stack([s[:, 0] + x_2, s[:, 1]], axis=-1) for s in s2]
+                    a2 = _draw_vec_arrow(x_2, x_2 + max(w2, 0.55), y2t - 0.22, rng)
+                    x_e = x_2 + w2 + 0.30
+                    se_p = [np.stack([s[:, 0] + x_e, s[:, 1]], axis=-1) for s in se]
+                    _emit(f"\\vec{{{v1}}} \\cdot \\vec{{{v2}}} = 0", s1 + a1 + sd_p + s2_p + a2 + se_p)
+
+            else:
+                # Category 4: Clean \text{...} English words & piecewise conditions
+                w = words_pool[int(rng.integers(0, len(words_pool)))]
+                if w == "if" and float(rng.random()) < 0.7:
+                    v = vars_pool[int(rng.integers(0, 4))]
+                    rel = ">" if float(rng.random()) < 0.5 else r"\geq"
+                    res = _layout_linear_tokens(["i", "f", "<SPACE>", v, rel, "0"], symbol_bank, rng, scale=1.0)
+                    if res is not None:
+                        _emit(f"\\text{{if }} {v} {rel} 0", res[0])
+                else:
+                    res = _layout_linear_tokens(list(w), symbol_bank, rng, scale=1.0)
+                    if res is not None:
+                        _emit(f"\\text{{{w}}}", res[0])
+        except Exception:
+            continue
+    return out
+
+
+def prepare_inkforge_v2_cache(
+    base_cache_dir: Path = DEFAULT_CACHE_DIR,
+    output_dir: Path = DEFAULT_V2_CACHE_DIR,
+    *,
+    mw_synthetic_dir: Path = DEFAULT_MATHWRITING_SYNTHETIC,
+    composed_count: int = 35000,
+    spacing: float = 0.12,
+    max_points: int = 512,
+    max_text_len: int = 160,
+    workers: int = 12,
+    seed: int = 42,
+) -> Path:
+    """Build InkForge v2 cache: reuses leak-free real-human base cache + adds MathWriting synthetic (396k)
+    + targeted 2D composed weak-structure math strictly to TRAIN (keeping VAL 100% real-human & identical!).
+    """
+    t0 = time.perf_counter()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer = InkForgeTokenizer.load(base_cache_dir / "tokenizer.json")
+    tokenizer.save(output_dir / "tokenizer.json")
+
+    def _load_split_records(sp_dir: Path) -> list[tuple[list[int], str, int, np.ndarray, np.ndarray]]:
+        pts_xy = np.load(sp_dir / "points_xy.npy")
+        pts_pen = np.load(sp_dir / "points_pen.npy")
+        pt_off = np.load(sp_dir / "pt_offsets.npy")
+        toks = np.load(sp_dir / "tokens.npy")
+        tok_off = np.load(sp_dir / "tok_offsets.npy")
+        sids = np.load(sp_dir / "source_ids.npy")
+        wids = np.load(sp_dir / "writer_ids.npy")
+        wnames = json.loads((sp_dir / "writer_names.json").read_text(encoding="utf-8"))
+        recs: list[tuple[list[int], str, int, np.ndarray, np.ndarray]] = []
+        for i in range(len(sids)):
+            p0, p1 = int(pt_off[i]), int(pt_off[i + 1])
+            t0_i, t1_i = int(tok_off[i]), int(tok_off[i + 1])
+            wkey = wnames[int(wids[i])] if int(wids[i]) < len(wnames) else ""
+            recs.append((toks[t0_i:t1_i].tolist(), wkey, int(sids[i]), pts_xy[p0:p1].copy(), pts_pen[p0:p1].copy()))
+        return recs
+
+    train_records = _load_split_records(base_cache_dir / "train")
+    val_records = _load_split_records(base_cache_dir / "val")
+    val_digests = {_packed_record_digest(r[0], r[3], r[4]) for r in val_records}
+    print(
+        f"[v2-pack] loaded base cache: train={len(train_records):,}, val={len(val_records):,} "
+        f"({time.perf_counter()-t0:.1f}s)",
+        flush=True,
+    )
+
+    # 1. Build train-only real-human symbol donor bank for targeted 2D composition (zero val leakage!)
+    symbol_bank: dict[str, list[tuple[list[np.ndarray], float, float]]] = defaultdict(list)
+    sym_sids = {SOURCE_TO_ID["hwrt"], SOURCE_TO_ID["detexify"], SOURCE_TO_ID["mw_symbols"]}
+    for ids, _wkey, sid, xy16, pen in train_records:
+        if sid not in sym_sids or len(ids) != 3:  # [BOS, tok, EOS]
+            continue
+        tok_str = tokenizer.tokens[ids[1]]
+        if len(symbol_bank[tok_str]) >= 80:
+            continue
+        sts = unpack_points_to_strokes(xy16.astype(np.float64), pen)
+        if sts:
+            symbol_bank[tok_str].append(_normalize_donor_glyph(sts))
+    print(f"[v2-pack] built train-only symbol donor bank: {len(symbol_bank)} unique symbols", flush=True)
+
+    # 2. Parse Google MathWriting official synthetic/ split (~396k full expressions -> TRAIN ONLY!)
+    mw_syn_added = 0
+    if mw_synthetic_dir.is_dir():
+        syn_paths = [str(p) for p in sorted(mw_synthetic_dir.glob("*.inkml"))]
+        print(f"[v2-pack] parsing {len(syn_paths):,} MathWriting synthetic .inkml files ({workers} workers)...", flush=True)
+        chunk_size = 2048
+        batches = [
+            (syn_paths[i : i + chunk_size], spacing, max_points)
+            for i in range(0, len(syn_paths), chunk_size)
+        ]
+        sid_syn = SOURCE_TO_ID["mw_synthetic"]
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for b_i, res_list in enumerate(ex.map(_process_mw_batch, batches)):
+                for latex, _wid, xy16, pen in res_list:
+                    toks = tokenize_inkforge(latex)
+                    if not toks or len(toks) + 2 > max_text_len:
+                        continue
+                    ids = tokenizer.encode(latex, max_len=max_text_len)
+                    if tokenizer.unk_id in ids:
+                        continue
+                    if _packed_record_digest(ids, xy16, pen) in val_digests:
+                        continue
+                    train_records.append((ids, "", sid_syn, xy16, pen))
+                    mw_syn_added += 1
+                if (b_i + 1) % 40 == 0:
+                    print(
+                        f"  [mw_synthetic] batch {b_i+1}/{len(batches)} | kept={mw_syn_added:,} "
+                        f"({time.perf_counter()-t0:.1f}s)",
+                        flush=True,
+                    )
+        print(f"[v2-pack] added mw_synthetic: {mw_syn_added:,} samples ({time.perf_counter()-t0:.1f}s)", flush=True)
+
+    # 3. Synthesize targeted weak-structure 2D composed expressions strictly from train donors
+    composed_recs = _generate_composed_weak_structures(
+        symbol_bank,
+        tokenizer,
+        count=composed_count,
+        spacing=spacing,
+        max_points=max_points,
+        max_text_len=max_text_len,
+        seed=seed,
+    )
+    composed_added = 0
+    for rec in composed_recs:
+        if _packed_record_digest(rec[0], rec[3], rec[4]) not in val_digests:
+            train_records.append(rec)
+            composed_added += 1
+    print(f"[v2-pack] added composed weak-structures: {composed_added:,} samples ({time.perf_counter()-t0:.1f}s)", flush=True)
+
+    rng = random.Random(seed)
+    rng.shuffle(train_records)
+
+    # Count per source for transparency
+    src_counts = Counter(SOURCE_NAMES[r[2]] for r in train_records)
+    _write_packed_split(output_dir / "train", train_records)
+    _write_packed_split(output_dir / "val", val_records)
+
+    meta = {
+        "format": "inkforge-cache-v2",
+        "vocab_size": len(tokenizer),
+        "spacing": spacing,
+        "max_points": max_points,
+        "max_text_len": max_text_len,
+        "train_samples": len(train_records),
+        "val_samples": len(val_records),
+        "sources": list(SOURCE_NAMES),
+        "train_source_counts": dict(src_counts),
+        "leak_free_grouped": True,
+        "val_human_only": True,
+        "elapsed_seconds": round(time.perf_counter() - t0, 1),
+    }
+    (output_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"[v2-pack] DONE in {meta['elapsed_seconds']}s -> {output_dir} | sources={dict(src_counts)}", flush=True)
+    return output_dir
+
+
 def _write_packed_split(split_dir: Path, recs: Sequence[tuple[list[int], str, int, np.ndarray, np.ndarray]]) -> None:
     split_dir.mkdir(parents=True, exist_ok=True)
     n = len(recs)
@@ -739,9 +1252,11 @@ class InkForgeDataset(Dataset):
                 "mathwriting": 1.0,
                 "crohme": 2.5,
                 "iamondo": 1.5,
-                "hwrt": 0.20,
-                "detexify": 0.25,
-                "mw_symbols": 0.30,
+                "hwrt": 0.18,
+                "detexify": 0.22,
+                "mw_symbols": 0.25,
+                "mw_synthetic": 0.45,
+                "composed": 0.85,
             }
         w_table = np.array([source_weights.get(name, 1.0) for name in SOURCE_NAMES], dtype=np.float64)
         self.sample_weights = w_table[self.source_ids]
@@ -917,8 +1432,21 @@ def main() -> None:
     parser.add_argument("--max-points", type=int, default=512)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--resplit-only", action="store_true", help="Fast zero-leakage resplit reusing packed MathWriting/Detexify")
+    parser.add_argument("--build-v2", action="store_true", help="Build v2 cache: base real human + MathWriting synthetic (396k) + targeted composed math")
+    parser.add_argument("--base-cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--composed-count", type=int, default=35000)
     args = parser.parse_args()
-    if args.resplit_only:
+    if args.build_v2:
+        out_dir = DEFAULT_V2_CACHE_DIR if args.output_dir == DEFAULT_CACHE_DIR else args.output_dir
+        prepare_inkforge_v2_cache(
+            base_cache_dir=args.base_cache_dir,
+            output_dir=out_dir,
+            composed_count=args.composed_count,
+            spacing=args.spacing,
+            max_points=args.max_points,
+            workers=args.workers,
+        )
+    elif args.resplit_only:
         resplit_existing_cache_leak_free(
             cache_dir=args.output_dir,
             spacing=args.spacing,

@@ -269,6 +269,8 @@ def render_preview_sheets(
     out_dir: Path,
     step: int,
     device: torch.device,
+    *,
+    cfg_scale: float = 1.0,
 ) -> None:
     model.eval()
     encoded = [tokenizer.encode(p, max_len=model.cfg.max_text_len) for p in PREVIEW_PROMPTS]
@@ -298,6 +300,7 @@ def render_preview_sheets(
                     style_z=z_in,
                     temperature=temp,
                     pen_temperature=1.0,
+                    cfg_scale=cfg_scale,
                     max_steps=512,
                     return_meta=True,
                 )
@@ -433,10 +436,12 @@ def train(args: argparse.Namespace) -> None:
         style_dim=args.style_dim,
         mdn_components=args.mdn_components,
         dropout=args.dropout,
+        sigma_min=args.sigma_min,
     )
 
-    model = InkForgeModel(cfg).to(device)
+    model = InkForgeModel(cfg, grad_checkpoint=args.grad_checkpoint).to(device)
     ema_model = copy.deepcopy(model).to(device)
+    ema_model.grad_checkpoint = False
     ema_model.eval()
     for p in ema_model.parameters():
         p.requires_grad_(False)
@@ -565,6 +570,7 @@ def train(args: argparse.Namespace) -> None:
                     kl_weight=kl_w,
                     free_bits=args.free_bits,
                     style_drop_prob=args.style_drop_prob,
+                    text_drop_prob=args.text_drop_prob,
                     guided_attn_weight=args.guided_attn_weight,
                     guided_attn_sigma=args.guided_attn_sigma,
                     transition_weight=args.transition_weight,
@@ -678,7 +684,9 @@ def train(args: argparse.Namespace) -> None:
             if improved and step >= args.eval_every:
                 export_writer_style_bank(ema_model, train_ds, out_dir / "writer_styles.npz", device)
 
-            render_preview_sheets(ema_model, tokenizer, train_ds, out_dir, step, device)
+            render_preview_sheets(
+                ema_model, tokenizer, train_ds, out_dir, step, device, cfg_scale=args.preview_cfg_scale
+            )
 
     # Export style bank strictly from best.pt's EMA weights if available!
     best_path = out_dir / "best.pt"
@@ -713,6 +721,10 @@ def main() -> None:
     parser.add_argument("--kl-weight", type=float, default=0.025)
     parser.add_argument("--free-bits", type=float, default=0.15)
     parser.add_argument("--style-drop-prob", type=float, default=0.30)
+    parser.add_argument("--text-drop-prob", type=float, default=0.0)
+    parser.add_argument("--sigma-min", type=float, default=1e-3)
+    parser.add_argument("--preview-cfg-scale", type=float, default=1.0)
+    parser.add_argument("--grad-checkpoint", action="store_true")
     parser.add_argument("--input-noise", type=float, default=0.010)
     parser.add_argument("--guided-attn-weight", type=float, default=4.0)
     parser.add_argument("--guided-attn-sigma", type=float, default=0.24)

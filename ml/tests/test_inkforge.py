@@ -21,6 +21,8 @@ from inkforge.composer import (  # noqa: E402
     synthesize_realistic_times,
 )
 from inkforge.dataset import (  # noqa: E402
+    _generate_composed_weak_structures,
+    _normalize_donor_glyph,
     _packed_record_digest,
     _split_records_leak_free,
     normalize_and_resample_for_inkforge,
@@ -232,3 +234,111 @@ def test_structured_prompt_parsing_and_2d_assembly():
         times = synthesize_realistic_times(smoothed, np_rng)
         assert len(times) == len(smoothed)
         assert passes_geometry_gate(pr.latex, smoothed)
+
+
+def test_v2_sigma_min_text_cfg_grad_checkpoint_and_dpo_logprob():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tok = InkForgeTokenizer.default()
+    cfg = InkForgeConfig(
+        vocab_size=len(tok),
+        d_model=128,
+        n_heads=4,
+        d_ff=384,
+        enc_layers=2,
+        dec_layers=2,
+        style_dim=32,
+        mdn_components=8,
+        max_stroke_points=64,
+        sigma_min=0.008,
+    )
+    model = InkForgeModel(cfg, grad_checkpoint=True).to(device)
+    b, l, t = 4, 14, 20
+    token_ids = torch.randint(5, len(tok), (b, l), device=device)
+    token_ids[:, 0] = tok.bos_id
+    token_ids[:, -1] = tok.eos_id
+    stroke_inputs = torch.randn((b, t, 7), device=device)
+    target_dx = torch.randn((b, t), device=device) * 0.2
+    target_dy = torch.randn((b, t), device=device) * 0.2
+    target_pen = torch.randint(0, 3, (b, t), device=device)
+    stroke_mask = torch.ones((b, t), dtype=torch.bool, device=device)
+    style_points = torch.randn((b, cfg.style_max_strokes, cfg.style_points, 8), device=device)
+    style_aspect = torch.randn((b, cfg.style_max_strokes, 4), device=device)
+    style_mask = torch.zeros((b, cfg.style_max_strokes), dtype=torch.bool, device=device)
+
+    # 1. Verify sigma_min floor enforcement
+    raw_neg = torch.full((b, t, cfg.mdn_components * 6 + 3), -30.0, device=device)
+    _, _, _, sx, sy, _, _ = model.split_mdn_params(raw_neg)
+    assert float(sx.min().item()) >= 0.008 - 1e-6
+    assert float(sy.min().item()) >= 0.008 - 1e-6
+
+    # 2. Verify text_drop_prob=1.0 (all rows dropped) stays finite & cleanly zeroes guided/cursor loss
+    model.train()
+    out_drop = model.compute_loss(
+        token_ids=token_ids,
+        stroke_inputs=stroke_inputs,
+        target_dx=target_dx,
+        target_dy=target_dy,
+        target_pen=target_pen,
+        stroke_mask=stroke_mask,
+        style_points=style_points,
+        style_aspect=style_aspect,
+        style_mask=style_mask,
+        text_drop_prob=1.0,
+    )
+    assert torch.isfinite(out_drop["loss"])
+    assert float(out_drop["guided_loss"].item()) == 0.0
+    assert float(out_drop["cursor_end_loss"].item()) == 0.0
+    out_drop["loss"].backward()
+
+    # 3. Verify sequence_log_prob supports STaR / DPO gradients cleanly
+    model.zero_grad(set_to_none=True)
+    z0 = torch.zeros((b, cfg.style_dim), device=device)
+    logp = model.sequence_log_prob(
+        token_ids=token_ids,
+        stroke_inputs=stroke_inputs,
+        target_dx=target_dx,
+        target_dy=target_dy,
+        target_pen=target_pen,
+        stroke_mask=stroke_mask,
+        style_z=z0,
+    )
+    assert logp.shape == (b,) and torch.isfinite(logp).all()
+    (-logp.mean()).backward()
+
+    # 4. Verify CFG generation (cfg_scale=1.6) runs cleanly with KV-cache
+    model.eval()
+    gen_cfg, meta_cfg = model.generate_batch(
+        token_ids, style_z=z0, temperature=0.40, cfg_scale=1.6, max_steps=24, return_meta=True
+    )
+    assert len(gen_cfg) == b and len(meta_cfg) == b
+    assert all(len(st) >= 1 for st in gen_cfg)
+
+
+def test_composed_weak_structure_generator():
+    tok = InkForgeTokenizer.default()
+    # Build minimal dummy donor bank covering all ASCII + core tokens used by composer
+    dummy_st = [np.array([[0.0, 0.0], [0.25, 0.45], [0.5, 0.9]], dtype=np.float64)]
+    norm_glyph = _normalize_donor_glyph(dummy_st)
+    bank = {t: [norm_glyph] for t in tok.tokens if t not in ("<PAD>", "<BOS>", "<EOS>", "<UNK>", "<SPACE>")}
+    recs = _generate_composed_weak_structures(bank, tok, count=40, seed=7)
+    assert len(recs) == 40
+    decoded = [tok.decode(r[0]) for r in recs]
+    assert any(r"\sqrt" in d for d in decoded)
+    assert any(r"\sum" in d or r"\lim" in d or r"\frac" in d for d in decoded)
+
+
+def test_star_dpo_rollout_collation_and_prompt_pool():
+    from inkforge.star_dpo import build_hard_prompt_pool, collate_rollout_items, strokes_to_inkforge_item
+
+    tok = InkForgeTokenizer.default()
+    cfg = InkForgeConfig(vocab_size=len(tok), d_model=128, n_heads=4, d_ff=384, enc_layers=2, dec_layers=2, style_dim=16)
+    pool = build_hard_prompt_pool(tok, unimer_path=Path("__nonexistent__.jsonl"), seed=7)
+    assert len(pool) > 50
+    assert any(r"\sqrt" in p for p in pool)
+
+    st = [np.array([[0.0, 0.0], [0.2, 0.1], [0.4, 0.3]], dtype=np.float64)]
+    it = strokes_to_inkforge_item(st, tok.encode(r"x^2+1"), np.zeros((16,), dtype=np.float32), cfg)
+    assert it is not None
+    batch = collate_rollout_items([it, it], pad_id=tok.pad_id)
+    assert batch["token_ids"].shape[0] == 2
+    assert batch["style_z"].shape == (2, 16)

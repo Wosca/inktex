@@ -51,6 +51,7 @@ class InkForgeConfig:
     coord_clip: float = 18.0
     abs_x_clip: float = 24.0
     abs_y_clip: float = 12.0
+    sigma_min: float = 1e-3
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -439,9 +440,10 @@ class InkForgeModel(nn.Module):
 
     INPUT_DIM = 7  # [dx, dy, abs_x, abs_y, pen_down, pen_lift, is_bos]
 
-    def __init__(self, cfg: InkForgeConfig):
+    def __init__(self, cfg: InkForgeConfig, *, grad_checkpoint: bool = False):
         super().__init__()
         self.cfg = cfg
+        self.grad_checkpoint = bool(grad_checkpoint)
         self.style_encoder = InkForgeStyleEncoder(cfg)
         self.text_encoder = LatexTextEncoder(cfg)
 
@@ -506,7 +508,26 @@ class InkForgeModel(nn.Module):
         active_kappa_seq: Tensor | None = None
         for idx, blk in enumerate(self.dec_blocks):
             want = return_guided_attns and (idx >= guide_start)
-            x, _, attn_w = blk(x, memory, mem_mask, style_z, cos, sin, need_cross_attn=want)
+            if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+                def _blk_fn(
+                    _x: Tensor,
+                    _mem: Tensor,
+                    _mm: Tensor,
+                    _sz: Tensor,
+                    _blk: StrokeDecoderBlock = blk,
+                    _want: bool = want,
+                ) -> tuple[Tensor, Tensor]:
+                    y, _, aw = _blk(_x, _mem, _mm, _sz, cos, sin, need_cross_attn=_want)
+                    if aw is None:
+                        aw = _x.new_zeros((1,))
+                    return y, aw
+
+                x, attn_maybe = torch.utils.checkpoint.checkpoint(
+                    _blk_fn, x, memory, mem_mask, style_z, use_reentrant=False
+                )
+                attn_w = attn_maybe if want else None
+            else:
+                x, _, attn_w = blk(x, memory, mem_mask, style_z, cos, sin, need_cross_attn=want)
             if idx == 0:
                 x, _, _, active_kappa_seq = self.monotonic_window(x, memory, mem_mask, prev_kappa=None)
             if attn_w is not None:
@@ -557,15 +578,73 @@ class InkForgeModel(nn.Module):
     def split_mdn_params(self, raw: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Split raw head output `[B, T, 6M+3]` strictly in float32 for numerical stability."""
         m = self.cfg.mdn_components
+        smin = float(self.cfg.sigma_min)
         raw_f = raw.float()
         pi_logits = raw_f[..., :m]
         mu_x = raw_f[..., m : 2 * m]
         mu_y = raw_f[..., 2 * m : 3 * m]
-        sigma_x = F.softplus(raw_f[..., 3 * m : 4 * m]).clamp(min=1e-3, max=10.0)
-        sigma_y = F.softplus(raw_f[..., 4 * m : 5 * m]).clamp(min=1e-3, max=10.0)
+        sigma_x = F.softplus(raw_f[..., 3 * m : 4 * m]).clamp(min=smin, max=10.0)
+        sigma_y = F.softplus(raw_f[..., 4 * m : 5 * m]).clamp(min=smin, max=10.0)
         rho = 0.95 * torch.tanh(raw_f[..., 5 * m : 6 * m])
         pen_logits = raw_f[..., 6 * m : 6 * m + 3]
         return pi_logits, mu_x, mu_y, sigma_x, sigma_y, rho, pen_logits
+
+    def _make_uncond_tokens(self, token_ids: Tensor) -> Tensor:
+        """Build null-text prompt `[BOS, EOS, PAD, ...]` for Classifier-Free Guidance."""
+        uncond = torch.full_like(token_ids, self.cfg.pad_id)
+        uncond[:, 0] = self.cfg.bos_id
+        if uncond.shape[1] > 1:
+            uncond[:, 1] = self.cfg.eos_id
+        return uncond
+
+    def sequence_log_prob(
+        self,
+        *,
+        token_ids: Tensor,
+        stroke_inputs: Tensor,
+        target_dx: Tensor,
+        target_dy: Tensor,
+        target_pen: Tensor,
+        stroke_mask: Tensor,
+        style_z: Tensor,
+        pen_weight: float = 2.0,
+        length_normalize: bool = True,
+    ) -> Tensor:
+        """Compute per-sequence MDN + pen log-probability `[B]` in float32 (used for STaR / DPO)."""
+        memory, mem_mask = self.encode_memory(token_ids)
+        raw, _, _ = self.decode_features(
+            stroke_inputs, memory, mem_mask, style_z, return_guided_attns=False
+        )
+        pi_logits, mu_x, mu_y, sx, sy, rho, pen_logits = self.split_mdn_params(raw)
+        dx = target_dx.float().unsqueeze(-1)
+        dy = target_dy.float().unsqueeze(-1)
+        nx = (dx - mu_x) / sx
+        ny = (dy - mu_y) / sy
+        one_minus_rho2 = (1.0 - rho * rho).clamp(min=1e-4)
+        z_quad = (nx * nx + ny * ny - 2.0 * rho * nx * ny) / one_minus_rho2
+        log_norm = (
+            math.log(2.0 * math.pi)
+            + torch.log(sx)
+            + torch.log(sy)
+            + 0.5 * torch.log(one_minus_rho2)
+        )
+        log_comp = -0.5 * z_quad - log_norm
+        log_pi = F.log_softmax(pi_logits, dim=-1)
+        mdn_logp = torch.logsumexp(log_pi + log_comp, dim=-1)  # [B, T]
+
+        coord_mask = (stroke_mask & target_pen.ne(2)).float()
+        valid_f = stroke_mask.float()
+        pen_logp = -F.cross_entropy(
+            pen_logits.reshape(-1, 3),
+            target_pen.reshape(-1),
+            reduction="none",
+        ).view_as(valid_f)
+
+        step_logp = mdn_logp * coord_mask + pen_weight * pen_logp * valid_f
+        seq_sum = step_logp.sum(dim=1)
+        if length_normalize:
+            return seq_sum / valid_f.sum(dim=1).clamp(min=1.0)
+        return seq_sum
 
     def compute_loss(
         self,
@@ -582,6 +661,7 @@ class InkForgeModel(nn.Module):
         kl_weight: float = 0.025,
         free_bits: float = 0.15,
         style_drop_prob: float = 0.30,
+        text_drop_prob: float = 0.0,
         guided_attn_weight: float = 4.0,
         guided_attn_sigma: float = 0.24,
         transition_weight: float = 4.0,
@@ -594,6 +674,15 @@ class InkForgeModel(nn.Module):
         if self.training and style_drop_prob > 0:
             keep = (torch.rand((z.shape[0], 1), device=z.device) >= style_drop_prob).to(z.dtype)
             z = z * keep
+
+        # Classifier-free text dropout: replace text with [BOS, EOS] on dropped rows
+        # and exclude dropped rows from diagonal guidance & cursor-end supervision!
+        text_dropped = torch.zeros((token_ids.shape[0],), device=token_ids.device, dtype=torch.bool)
+        if self.training and text_drop_prob > 0:
+            text_dropped = torch.rand((token_ids.shape[0],), device=token_ids.device) < text_drop_prob
+            if text_dropped.any():
+                uncond_toks = self._make_uncond_tokens(token_ids)
+                token_ids = torch.where(text_dropped[:, None], uncond_toks, token_ids)
 
         memory, mem_mask = self.encode_memory(token_ids)
         raw, guided_attns, active_kappa_seq = self.decode_features(
@@ -657,18 +746,29 @@ class InkForgeModel(nn.Module):
         valid_count = valid_f.sum()
         pen_loss = (pen_ce * valid_f).sum() / valid_count.clamp(min=1.0)
 
-        # Guided diagonal cross-attention loss strictly over the L LaTeX tokens
-        guided_loss, attn_max_txt = self._guided_diagonal_attn_loss(
-            guided_attns, stroke_mask, mem_mask, sigma=guided_attn_sigma
-        )
+        # Guided diagonal cross-attention loss strictly over conditioned rows (exclude text-dropped CFG rows)
+        keep_text = ~text_dropped
+        guided_stroke_mask = stroke_mask & keep_text[:, None]
+        if guided_stroke_mask.any():
+            guided_loss, attn_max_txt = self._guided_diagonal_attn_loss(
+                guided_attns, guided_stroke_mask, mem_mask, sigma=guided_attn_sigma
+            )
+        else:
+            guided_loss = torch.zeros((), device=mdn_loss.device, dtype=torch.float32)
+            attn_max_txt = torch.zeros((), device=mdn_loss.device, dtype=torch.float32)
 
-        # End-of-sequence active cursor supervision: encourage active weighted kappa to reach L-1 at EOS
+        # End-of-sequence active cursor supervision strictly over conditioned rows
         last_t = (stroke_mask.long().sum(dim=1) - 1).clamp(min=0)  # [B]
         ar = torch.arange(token_ids.shape[0], device=token_ids.device)
         end_kappa = active_kappa_seq[ar, last_t]  # [B]
         target_end = ((~mem_mask).float().sum(dim=1) - 1.0).clamp(min=1.0)
         cursor_ratio = end_kappa / target_end
-        cursor_end_loss = F.smooth_l1_loss(cursor_ratio, torch.ones_like(target_end))
+        if keep_text.any():
+            cursor_end_loss = F.smooth_l1_loss(
+                cursor_ratio[keep_text], torch.ones_like(target_end[keep_text])
+            )
+        else:
+            cursor_end_loss = torch.zeros((), device=mdn_loss.device, dtype=torch.float32)
 
         # Free-bits KL divergence strictly over rows that actually have real peer writer strokes
         if has_style.any():
@@ -694,17 +794,18 @@ class InkForgeModel(nn.Module):
             pen_pred = pen_logits.argmax(dim=-1)
             pen_correct = ((pen_pred == target_pen) & stroke_mask).float().sum()
             pen_acc = pen_correct / valid_count.clamp(min=1.0)
-            cursor_progress = cursor_ratio.mean()
+            cursor_progress = cursor_ratio[keep_text].mean() if keep_text.any() else torch.ones((), device=mdn_loss.device)
             cursor_overshoot = (
-                ((active_kappa_seq > (target_end[:, None] + 1.0)) & stroke_mask).float().sum()
-                / valid_count.clamp(min=1.0)
+                ((active_kappa_seq > (target_end[:, None] + 1.0)) & guided_stroke_mask).float().sum()
+                / guided_stroke_mask.float().sum().clamp(min=1.0)
             )
             cursor_gate = self.monotonic_window.gate.detach().abs().float()
             # Sigma-floor occupancy on dominant mixture component
+            floor_thresh = max(2e-3, float(self.cfg.sigma_min) * 1.25)
             top_comp = pi_logits.argmax(dim=-1, keepdim=True)
             top_sx = sx.gather(-1, top_comp).squeeze(-1)
             top_sy = sy.gather(-1, top_comp).squeeze(-1)
-            sigma_floor = (((top_sx <= 2e-3) | (top_sy <= 2e-3)) & (coord_mask > 0.5)).float().sum()
+            sigma_floor = (((top_sx <= floor_thresh) | (top_sy <= floor_thresh)) & (coord_mask > 0.5)).float().sum()
             sigma_floor_frac = sigma_floor / coord_count.clamp(min=1.0)
             val_score = mdn_loss + 2.0 * pen_loss
 
@@ -745,11 +846,17 @@ class InkForgeModel(nn.Module):
         *,
         temperature: float | Tensor = 0.40,
         pen_temperature: float = 1.0,
+        cfg_scale: float = 1.0,
         max_steps: int = 512,
         min_steps: int = 1,
         return_meta: bool = False,
     ) -> list[list[np.ndarray]] | tuple[list[list[np.ndarray]], list[dict[str, Any]]]:
-        """Generate batched handwritten 2D strokes in glyph-normalized units (h = 1.0)."""
+        """Generate batched handwritten 2D strokes in glyph-normalized units (h = 1.0).
+
+        When `cfg_scale != 1.0`, performs fused 2B Classifier-Free Guidance on the normalized
+        pre-MDN decoder hidden state (`h = h_uncond + cfg_scale * (h_cond - h_uncond)`),
+        which is invariant to MDN component permutation and preserves writer style `z`.
+        """
         device = token_ids.device
         b = token_ids.shape[0]
         if style_z is None:
@@ -762,11 +869,21 @@ class InkForgeModel(nn.Module):
         else:
             temp = temperature.to(device=device, dtype=torch.float32).view(b)
 
-        memory, mem_mask = self.encode_memory(token_ids)
+        use_cfg = abs(float(cfg_scale) - 1.0) > 1e-4
+        if use_cfg:
+            uncond_ids = self._make_uncond_tokens(token_ids)
+            tok_run = torch.cat([token_ids, uncond_ids], dim=0)
+            z_run = torch.cat([style_z, style_z], dim=0)
+        else:
+            tok_run = token_ids
+            z_run = style_z
+
+        b_run = tok_run.shape[0]
+        memory, mem_mask = self.encode_memory(tok_run)
         # Precompute cross-attention K/V once per batch (massive speedup!)
         cross_kvs = [blk.project_cross_kv(memory) for blk in self.dec_blocks]
         past_kvs: list[tuple[Tensor, Tensor] | None] = [None] * len(self.dec_blocks)
-        kappa_state = torch.zeros((b, self.monotonic_window.num_windows), device=device, dtype=torch.float32)
+        kappa_state = torch.zeros((b_run, self.monotonic_window.num_windows), device=device, dtype=torch.float32)
 
         # Initial BOS stroke token: (dx=0, dy=0, abs_x=0, abs_y=0, down=0, lift=0, is_bos=1)
         cur_feat = torch.zeros((b, 1, self.INPUT_DIM), device=device, dtype=memory.dtype)
@@ -786,14 +903,15 @@ class InkForgeModel(nn.Module):
         pen_hist = torch.full((b, max_steps), 2, device=device, dtype=torch.long)
 
         for step in range(max_steps):
-            x = self.stroke_in(cur_feat)
+            feat_in = torch.cat([cur_feat, cur_feat], dim=0) if use_cfg else cur_feat
+            x = self.stroke_in(feat_in)
             cos, sin = self.dec_rope(1, offset=step)
             for idx, blk in enumerate(self.dec_blocks):
                 x, past_kvs[idx], _ = blk(
                     x,
                     memory,
                     mem_mask,
-                    style_z,
+                    z_run,
                     cos,
                     sin,
                     past_kv=past_kvs[idx],
@@ -803,7 +921,13 @@ class InkForgeModel(nn.Module):
                 if idx == 0:
                     x, kappa_step, _, _ = self.monotonic_window(x, memory, mem_mask, prev_kappa=kappa_state)
                     kappa_state = kappa_step[:, 0, :]
-            raw = self.mdn_head(self.dec_norm(x))
+            h_norm = self.dec_norm(x)
+            if use_cfg:
+                h_c, h_u = h_norm[:b], h_norm[b:]
+                h_guided = h_u + float(cfg_scale) * (h_c - h_u)
+                raw = self.mdn_head(h_guided)
+            else:
+                raw = self.mdn_head(h_norm)
             pi_logits, mu_x, mu_y, sx, sy, rho, pen_logits = self.split_mdn_params(raw)
             pi_logits = pi_logits[:, 0, :]  # [B, M]
             mu_x = mu_x[:, 0, :]
