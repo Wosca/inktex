@@ -119,15 +119,40 @@ def evaluate_val(
     val_loader: DataLoader,
     device: torch.device,
     *,
-    max_batches: int = 40,
+    max_batches: int = 220,
     guided_attn_weight: float = 4.0,
+    transition_weight: float = 4.0,
 ) -> dict[str, float]:
+    """Population-weighted validation metrics (exact valid-step denominators)."""
     model.eval()
-    totals = {"loss": 0.0, "mdn_loss": 0.0, "pen_loss": 0.0, "guided_loss": 0.0, "kl_raw": 0.0, "pen_acc": 0.0}
-    n = 0
-    for batch in val_loader:
-        if n >= max_batches:
+    sums = {
+        "valid_count": 0.0,
+        "coord_count": 0.0,
+        "weighted_coord_sum": 0.0,
+        "draw_count": 0.0,
+        "jump_count": 0.0,
+        "mdn_num": 0.0,
+        "mdn_w_num": 0.0,
+        "draw_mdn_num": 0.0,
+        "jump_mdn_num": 0.0,
+        "pen_num": 0.0,
+        "pen_acc_num": 0.0,
+        "guided_num": 0.0,
+        "attn_max_num": 0.0,
+        "cursor_overshoot_num": 0.0,
+        "sigma_floor_num": 0.0,
+        "cursor_end_sum": 0.0,
+        "cursor_prog_sum": 0.0,
+        "kl_sum": 0.0,
+        "loss_sum": 0.0,
+        "n_rows": 0.0,
+        "n_batches": 0.0,
+    }
+    cursor_gate = 0.0
+    for n_b, batch in enumerate(val_loader):
+        if n_b >= max_batches:
             break
+        bsz = int(batch["token_ids"].shape[0])
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
             out = model.compute_loss(
@@ -143,11 +168,66 @@ def evaluate_val(
                 kl_weight=0.025,
                 style_drop_prob=0.0,
                 guided_attn_weight=guided_attn_weight,
+                transition_weight=transition_weight,
             )
-        for k in totals:
-            totals[k] += float(out[k].item())
-        n += 1
-    return {k: v / max(1, n) for k, v in totals.items()}
+        vc = float(out["valid_count"].item())
+        cc = float(out["coord_count"].item())
+        wc = float(out["weighted_coord_sum"].item())
+        dc = float(out["draw_count"].item())
+        jc = float(out["jump_count"].item())
+
+        sums["valid_count"] += vc
+        sums["coord_count"] += cc
+        sums["weighted_coord_sum"] += wc
+        sums["draw_count"] += dc
+        sums["jump_count"] += jc
+        sums["mdn_num"] += float(out["mdn_loss"].item()) * cc
+        sums["mdn_w_num"] += float(out["mdn_w_loss"].item()) * wc
+        sums["draw_mdn_num"] += float(out["draw_mdn_loss"].item()) * dc
+        sums["jump_mdn_num"] += float(out["jump_mdn_loss"].item()) * jc
+        sums["pen_num"] += float(out["pen_loss"].item()) * vc
+        sums["pen_acc_num"] += float(out["pen_acc"].item()) * vc
+        sums["guided_num"] += float(out["guided_loss"].item()) * vc
+        sums["attn_max_num"] += float(out["attn_max_txt"].item()) * vc
+        sums["cursor_overshoot_num"] += float(out["cursor_overshoot"].item()) * vc
+        sums["sigma_floor_num"] += float(out["sigma_floor_frac"].item()) * cc
+        sums["cursor_end_sum"] += float(out["cursor_end_loss"].item()) * bsz
+        sums["cursor_prog_sum"] += float(out["cursor_progress"].item()) * bsz
+        sums["kl_sum"] += float(out["kl_raw"].item())
+        sums["loss_sum"] += float(out["loss"].item())
+        sums["n_rows"] += bsz
+        sums["n_batches"] += 1.0
+        cursor_gate = float(out["cursor_gate"].item())
+
+    vc = max(1.0, sums["valid_count"])
+    cc = max(1.0, sums["coord_count"])
+    wc = max(1.0, sums["weighted_coord_sum"])
+    dc = max(1.0, sums["draw_count"])
+    jc = max(1.0, sums["jump_count"])
+    nr = max(1.0, sums["n_rows"])
+    nb = max(1.0, sums["n_batches"])
+
+    mdn_w = sums["mdn_w_num"] / wc
+    pen = sums["pen_num"] / vc
+    return {
+        "loss": sums["loss_sum"] / nb,
+        "val_score": mdn_w + 2.0 * pen,
+        "mdn_loss": sums["mdn_num"] / cc,
+        "mdn_w_loss": mdn_w,
+        "draw_mdn_loss": sums["draw_mdn_num"] / dc,
+        "jump_mdn_loss": sums["jump_mdn_num"] / jc,
+        "pen_loss": pen,
+        "guided_loss": sums["guided_num"] / vc,
+        "attn_max_txt": sums["attn_max_num"] / vc,
+        "cursor_end_loss": sums["cursor_end_sum"] / nr,
+        "cursor_progress": sums["cursor_prog_sum"] / nr,
+        "cursor_overshoot": sums["cursor_overshoot_num"] / vc,
+        "cursor_gate": cursor_gate,
+        "sigma_floor_frac": sums["sigma_floor_num"] / cc,
+        "kl_raw": sums["kl_sum"] / nb,
+        "pen_acc": sums["pen_acc_num"] / vc,
+        "n_rows": sums["n_rows"],
+    }
 
 
 @torch.inference_mode()
@@ -205,24 +285,35 @@ def render_preview_sheets(
         ("writer_neat", writer_z, 0.35),
         ("writer_natural", writer_z, 0.50),
     )
-    for tag, z_in, temp in configs:
-        with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-            strokes_list = model.generate_batch(
-                tok_t,
-                style_z=z_in,
-                temperature=temp,
-                pen_temperature=0.70,
-                max_steps=420,
+    devices = [device] if device.type == "cuda" else []
+    summary_parts: list[str] = []
+    with torch.random.fork_rng(devices=devices):
+        for cfg_i, (tag, z_in, temp) in enumerate(configs):
+            torch.manual_seed(12345 + cfg_i)
+            if device.type == "cuda":
+                torch.cuda.manual_seed_all(12345 + cfg_i)
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                strokes_list, meta_list = model.generate_batch(
+                    tok_t,
+                    style_z=z_in,
+                    temperature=temp,
+                    pen_temperature=1.0,
+                    max_steps=512,
+                    return_meta=True,
+                )
+            done = sum(1 for m in meta_list if m["finished"])
+            avg_steps = sum(m["steps"] for m in meta_list) / max(1, len(meta_list))
+            summary_parts.append(f"{tag}:{done}/{len(meta_list)}(avg={avg_steps:.0f}st)")
+            pairs = list(zip(PREVIEW_PROMPTS, strokes_list))
+            render_contact_sheet(
+                pairs,
+                out_dir / "previews" / f"step_{step:06d}_{tag}.png",
+                cols=3,
+                tile_w=440,
+                tile_h=150,
+                color_by_order=False,
             )
-        pairs = list(zip(PREVIEW_PROMPTS, strokes_list))
-        render_contact_sheet(
-            pairs,
-            out_dir / "previews" / f"step_{step:06d}_{tag}.png",
-            cols=3,
-            tile_w=440,
-            tile_h=150,
-            color_by_order=False,
-        )
+    print(f"  >>> [PREVIEW step {step:6d}] " + " | ".join(summary_parts), flush=True)
 
 
 @torch.inference_mode()
@@ -232,24 +323,34 @@ def export_writer_style_bank(
     out_path: Path,
     device: torch.device,
     *,
-    max_writers: int = 5000,
+    refs_per_writer: int = 5,
     batch_size: int = 128,
 ) -> Path:
-    """Extract real human writer `mu_z` vectors strictly from named multi-sample writers."""
+    """Export ONE aggregated `mu_z` per unique named writer (equal representation across all writers!)."""
     model.eval()
-    rng = np.random.default_rng(2026)
-    peer_wids = set(dataset.writer_peers.keys())
-    eligible = np.array([i for i, wid in enumerate(dataset.writer_ids.tolist()) if wid in peer_wids], dtype=np.int64)
-    if len(eligible) == 0:
-        eligible = np.arange(len(dataset))
-    chosen = rng.choice(eligible, size=min(max_writers, len(eligible)), replace=False)
+    peer_wids = sorted(dataset.writer_peers.keys())
+    if not peer_wids:
+        bank = np.zeros((1, model.cfg.style_dim), dtype=np.float32)
+        np.savez_compressed(out_path, mu_bank=bank, mean=bank.mean(axis=0), std=bank.std(axis=0))
+        return out_path
+
+    # Deterministically pick up to `refs_per_writer` evenly spaced samples for each writer
+    sample_indices: list[int] = []
+    writer_slices: list[tuple[int, int]] = []
+    for wid in peer_wids:
+        idxs = dataset.writer_peers[wid]
+        k = min(refs_per_writer, len(idxs))
+        pick = idxs[np.linspace(0, len(idxs) - 1, num=k, dtype=np.int64)]
+        start_pos = len(sample_indices)
+        sample_indices.extend(int(i) for i in pick.tolist())
+        writer_slices.append((start_pos, len(sample_indices)))
 
     orig_aug = dataset.augment
     dataset.augment = False
     zs: list[np.ndarray] = []
     try:
-        for start in range(0, len(chosen), batch_size):
-            idxs = chosen[start : start + batch_size]
+        for start in range(0, len(sample_indices), batch_size):
+            idxs = sample_indices[start : start + batch_size]
             items = [dataset[int(i)] for i in idxs]
             batch = collate_inkforge_batch(items, pad_id=model.cfg.pad_id)
             sp = batch["style_points"].to(device)
@@ -261,14 +362,20 @@ def export_writer_style_bank(
     finally:
         dataset.augment = orig_aug
 
-    bank = np.concatenate(zs, axis=0).astype(np.float32)
+    all_z = np.concatenate(zs, axis=0).astype(np.float32)
+    writer_bank = np.stack([all_z[a:b].mean(axis=0) for a, b in writer_slices], axis=0).astype(np.float32)
     np.savez_compressed(
         out_path,
-        mu_bank=bank,
-        mean=bank.mean(axis=0),
-        std=bank.std(axis=0),
+        mu_bank=writer_bank,
+        writer_ids=np.asarray(peer_wids, dtype=np.int32),
+        mean=writer_bank.mean(axis=0),
+        std=writer_bank.std(axis=0),
     )
-    print(f"[style-bank] Exported {len(bank):,} real human writer latents -> {out_path}")
+    print(
+        f"[style-bank] Exported {len(writer_bank):,} balanced unique writers "
+        f"(<= {refs_per_writer} refs/writer) -> {out_path}",
+        flush=True,
+    )
     return out_path
 
 
@@ -361,14 +468,24 @@ def train(args: argparse.Namespace) -> None:
         persistent_workers=(args.num_workers > 0),
         collate_fn=collate_fn,
     )
-    val_loader = DataLoader(
-        val_ds,
+    val_expr_idxs = np.where(val_ds.source_ids <= 2)[0].tolist()
+    val_sym_idxs = np.where(val_ds.source_ids >= 3)[0].tolist()
+    val_expr_loader = DataLoader(
+        torch.utils.data.Subset(val_ds, val_expr_idxs),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=min(2, args.num_workers),
         pin_memory=(device.type == "cuda"),
         collate_fn=collate_fn,
-    )
+    ) if val_expr_idxs else None
+    val_sym_loader = DataLoader(
+        torch.utils.data.Subset(val_ds, val_sym_idxs),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=min(2, args.num_workers),
+        pin_memory=(device.type == "cuda"),
+        collate_fn=collate_fn,
+    ) if val_sym_idxs else None
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -402,7 +519,21 @@ def train(args: argparse.Namespace) -> None:
     log_path = out_dir / "metrics.jsonl"
     t0 = time.perf_counter()
     train_iter = iter(train_loader)
-    running = {"loss": 0.0, "mdn_loss": 0.0, "pen_loss": 0.0, "guided_loss": 0.0, "kl_raw": 0.0, "pen_acc": 0.0}
+    running = {
+        "loss": 0.0,
+        "mdn_loss": 0.0,
+        "draw_mdn_loss": 0.0,
+        "jump_mdn_loss": 0.0,
+        "pen_loss": 0.0,
+        "guided_loss": 0.0,
+        "attn_max_txt": 0.0,
+        "cursor_end_loss": 0.0,
+        "cursor_progress": 0.0,
+        "cursor_overshoot": 0.0,
+        "cursor_gate": 0.0,
+        "kl_raw": 0.0,
+        "pen_acc": 0.0,
+    }
     running_n = 0
 
     for step in range(start_step + 1, args.total_steps + 1):
@@ -436,6 +567,7 @@ def train(args: argparse.Namespace) -> None:
                     style_drop_prob=args.style_drop_prob,
                     guided_attn_weight=args.guided_attn_weight,
                     guided_attn_sigma=args.guided_attn_sigma,
+                    transition_weight=args.transition_weight,
                 )
                 loss = out["loss"] / float(args.grad_accum)
             loss.backward()
@@ -456,8 +588,10 @@ def train(args: argparse.Namespace) -> None:
             eta_min = (args.total_steps - step) / max(sps, 1e-6) / 60.0
             print(
                 f"[step {step:6d}/{args.total_steps}] "
-                f"loss={avg['loss']:.3f} mdn={avg['mdn_loss']:.3f} pen={avg['pen_loss']:.3f} "
-                f"guide={avg['guided_loss']:.4f} pen_acc={avg['pen_acc']*100:.1f}% kl={avg['kl_raw']:.1f} "
+                f"loss={avg['loss']:.3f} draw={avg['draw_mdn_loss']:.3f} jump={avg['jump_mdn_loss']:.3f} "
+                f"pen={avg['pen_loss']:.3f} guide={avg['guided_loss']:.4f} max_txt={avg['attn_max_txt']:.3f} "
+                f"cur={avg['cursor_end_loss']:.3f}(p={avg['cursor_progress']:.2f},g={avg['cursor_gate']:.2f}) "
+                f"pen_acc={avg['pen_acc']*100:.1f}% kl={avg['kl_raw']:.1f} "
                 f"lr={lr:.2e} ({sps:.2f} step/s, ETA {eta_min:.1f}m)",
                 flush=True,
             )
@@ -467,35 +601,60 @@ def train(args: argparse.Namespace) -> None:
             running_n = 0
 
         if step == 500 or step % args.eval_every == 0 or step == args.total_steps:
-            val_metrics = evaluate_val(
-                ema_model,
-                val_loader,
-                device,
-                guided_attn_weight=args.guided_attn_weight,
+            val_expr = (
+                evaluate_val(
+                    ema_model,
+                    val_expr_loader,
+                    device,
+                    guided_attn_weight=args.guided_attn_weight,
+                    transition_weight=args.transition_weight,
+                )
+                if val_expr_loader is not None
+                else None
             )
-            print(
-                f"  >>> [VAL step {step:6d}] mdn={val_metrics['mdn_loss']:.4f} "
-                f"pen={val_metrics['pen_loss']:.4f} guide={val_metrics['guided_loss']:.4f} "
-                f"pen_acc={val_metrics['pen_acc']*100:.2f}% kl={val_metrics['kl_raw']:.1f}",
-                flush=True,
+            val_sym = (
+                evaluate_val(
+                    ema_model,
+                    val_sym_loader,
+                    device,
+                    guided_attn_weight=args.guided_attn_weight,
+                    transition_weight=args.transition_weight,
+                )
+                if val_sym_loader is not None
+                else None
             )
+            primary_val = val_expr if val_expr is not None else val_sym
+            assert primary_val is not None
+            if val_expr is not None:
+                print(
+                    f"  >>> [VAL-EXPR step {step:6d}] score={val_expr['val_score']:.4f} "
+                    f"draw={val_expr['draw_mdn_loss']:.4f} jump={val_expr['jump_mdn_loss']:.4f} "
+                    f"pen={val_expr['pen_loss']:.4f} guide={val_expr['guided_loss']:.4f} "
+                    f"max_txt={val_expr['attn_max_txt']:.3f} cur={val_expr['cursor_end_loss']:.3f}"
+                    f"(p={val_expr['cursor_progress']:.2f},ov={val_expr['cursor_overshoot']*100:.1f}%) "
+                    f"pen_acc={val_expr['pen_acc']*100:.2f}% sig_flr={val_expr['sigma_floor_frac']*100:.2f}% "
+                    f"n={int(val_expr['n_rows'])}",
+                    flush=True,
+                )
+            if val_sym is not None:
+                print(
+                    f"  >>> [VAL-SYM  step {step:6d}] score={val_sym['val_score']:.4f} "
+                    f"draw={val_sym['draw_mdn_loss']:.4f} jump={val_sym['jump_mdn_loss']:.4f} "
+                    f"pen={val_sym['pen_loss']:.4f} guide={val_sym['guided_loss']:.4f} "
+                    f"max_txt={val_sym['attn_max_txt']:.3f} pen_acc={val_sym['pen_acc']*100:.2f}% "
+                    f"n={int(val_sym['n_rows'])}",
+                    flush=True,
+                )
             with log_path.open("a", encoding="utf-8") as lf:
-                lf.write(json.dumps({"step": step, "split": "val", **val_metrics}) + "\n")
+                if val_expr is not None:
+                    lf.write(json.dumps({"step": step, "split": "val_expr", **val_expr}) + "\n")
+                if val_sym is not None:
+                    lf.write(json.dumps({"step": step, "split": "val_sym", **val_sym}) + "\n")
 
-            render_preview_sheets(ema_model, tokenizer, train_ds, out_dir, step, device)
-
-            save_checkpoint(
-                out_dir / "latest.pt",
-                step=step,
-                cfg=cfg,
-                tokenizer=tokenizer,
-                model=model,
-                ema_model=ema_model,
-                optimizer=optimizer,
-                best_val=best_val,
-            )
-            if val_metrics["mdn_loss"] < best_val:
-                best_val = val_metrics["mdn_loss"]
+            # Update best score and write checkpoints BEFORE rendering preview sheets!
+            improved = primary_val["val_score"] < best_val
+            if improved:
+                best_val = primary_val["val_score"]
                 save_checkpoint(
                     out_dir / "best.pt",
                     step=step,
@@ -506,9 +665,29 @@ def train(args: argparse.Namespace) -> None:
                     optimizer=optimizer,
                     best_val=best_val,
                 )
+            save_checkpoint(
+                out_dir / "latest.pt",
+                step=step,
+                cfg=cfg,
+                tokenizer=tokenizer,
+                model=model,
+                ema_model=ema_model,
+                optimizer=optimizer,
+                best_val=best_val,
+            )
+            if improved and step >= args.eval_every:
+                export_writer_style_bank(ema_model, train_ds, out_dir / "writer_styles.npz", device)
 
+            render_preview_sheets(ema_model, tokenizer, train_ds, out_dir, step, device)
+
+    # Export style bank strictly from best.pt's EMA weights if available!
+    best_path = out_dir / "best.pt"
+    if best_path.is_file():
+        best_ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+        ema_model.load_state_dict(best_ckpt["ema_state_dict"])
+        print(f"[inkforge] Loaded best.pt (step={best_ckpt.get('step')}) for final writer style bank export", flush=True)
     export_writer_style_bank(ema_model, train_ds, out_dir / "writer_styles.npz", device)
-    print(f"[inkforge] Training finished! Best val MDN={best_val:.4f} | checkpoints in {out_dir}")
+    print(f"[inkforge] Training finished! Best val score={best_val:.4f} | checkpoints in {out_dir}")
 
 
 def main() -> None:
@@ -524,24 +703,25 @@ def main() -> None:
     parser.add_argument("--style-dim", type=int, default=64)
     parser.add_argument("--mdn-components", type=int, default=20)
     parser.add_argument("--dropout", type=float, default=0.10)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--grad-accum", type=int, default=2)
-    parser.add_argument("--total-steps", type=int, default=45000)
-    parser.add_argument("--warmup-steps", type=int, default=1500)
-    parser.add_argument("--kl-warmup-steps", type=int, default=5000)
+    parser.add_argument("--total-steps", type=int, default=40000)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--kl-warmup-steps", type=int, default=4000)
     parser.add_argument("--lr", type=float, default=4.0e-4)
     parser.add_argument("--weight-decay", type=float, default=0.02)
     parser.add_argument("--kl-weight", type=float, default=0.025)
     parser.add_argument("--free-bits", type=float, default=0.15)
     parser.add_argument("--style-drop-prob", type=float, default=0.30)
-    parser.add_argument("--input-noise", type=float, default=0.030)
+    parser.add_argument("--input-noise", type=float, default=0.010)
     parser.add_argument("--guided-attn-weight", type=float, default=4.0)
     parser.add_argument("--guided-attn-sigma", type=float, default=0.24)
+    parser.add_argument("--transition-weight", type=float, default=4.0)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=6)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--eval-every", type=int, default=2500)
+    parser.add_argument("--eval-every", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     train(args)

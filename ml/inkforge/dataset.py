@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -68,7 +69,7 @@ def normalize_and_resample_for_inkforge(
     *,
     spacing: float = 0.12,
     max_points: int = 512,
-    coord_clip: float = 12.0,
+    coord_clip: float = 18.0,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Normalize strokes by glyph scale `h`, anchor first point at `(0, 0)`, resample to `spacing * h`.
 
@@ -260,6 +261,218 @@ def _slice_iamondo_words(
     return [(r"\text{" + inner + "}", strokes)]
 
 
+def _packed_record_digest(ids: Sequence[int], xy16: np.ndarray, pen: np.ndarray) -> bytes:
+    h = hashlib.blake2b(digest_size=16)
+    h.update(np.asarray(ids, dtype=np.uint16).tobytes())
+    h.update(b"|")
+    h.update(np.ascontiguousarray(xy16, dtype=np.float16).tobytes())
+    h.update(b"|")
+    h.update(np.ascontiguousarray(pen, dtype=np.uint8).tobytes())
+    return h.digest()
+
+
+def _split_records_leak_free(
+    records: Sequence[tuple[list[int], str, int, np.ndarray, np.ndarray]],
+    *,
+    val_fraction: float = 0.015,
+    seed: int = 42,
+) -> tuple[list[tuple[list[int], str, int, np.ndarray, np.ndarray]], list[tuple[list[int], str, int, np.ndarray, np.ndarray]]]:
+    """Group exact packed duplicates AND shared named writers before assigning groups to train/val.
+
+    Guarantees:
+      - Zero exact packed `(token_ids, xy16, pen)` overlap between train and val.
+      - Zero named writer overlap between train and val.
+    """
+    n = len(records)
+    if n == 0:
+        return [], []
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    seen_digest: dict[bytes, int] = {}
+    seen_writer: dict[str, int] = {}
+    for i, (ids, wid, _sid, xy16, pen) in enumerate(records):
+        dig = _packed_record_digest(ids, xy16, pen)
+        prev_d = seen_digest.get(dig)
+        if prev_d is not None:
+            union(i, prev_d)
+        else:
+            seen_digest[dig] = i
+
+        if wid:
+            prev_w = seen_writer.get(wid)
+            if prev_w is not None:
+                union(i, prev_w)
+            else:
+                seen_writer[wid] = i
+
+    groups_map: dict[int, list[int]] = defaultdict(list)
+    for i in range(n):
+        groups_map[find(i)].append(i)
+
+    groups = list(groups_map.values())
+    rng = random.Random(seed)
+    rng.shuffle(groups)
+
+    target_val = max(1, int(round(n * val_fraction)))
+    max_single_group = max(64, int(target_val * 0.25))
+    val_idxs: list[int] = []
+    train_idxs: list[int] = []
+
+    for g in groups:
+        if len(val_idxs) < target_val and len(g) <= max_single_group:
+            val_idxs.extend(g)
+        else:
+            train_idxs.extend(g)
+
+    rng.shuffle(val_idxs)
+    rng.shuffle(train_idxs)
+    train_records = [records[i] for i in train_idxs]
+    val_records = [records[i] for i in val_idxs]
+    return train_records, val_records
+
+
+def resplit_existing_cache_leak_free(
+    cache_dir: Path = DEFAULT_CACHE_DIR,
+    *,
+    spacing: float = 0.12,
+    max_points: int = 512,
+    max_text_len: int = 160,
+    hwrt_cap_per_symbol: int = 400,
+    val_fraction: float = 0.015,
+    seed: int = 42,
+) -> Path:
+    """Fast (~20s) zero-leakage split rebuild: reuses packed writerless sources (MathWriting/Detexify/MW-symbols)
+    and reloads true string writer IDs for CROHME/IAMonDo/HWRT, then groups exact duplicates + named writers.
+    """
+    t0 = time.perf_counter()
+    tokenizer = InkForgeTokenizer.load(cache_dir / "tokenizer.json")
+    rng = random.Random(seed)
+    all_records: list[tuple[list[int], str, int, np.ndarray, np.ndarray]] = []
+
+    # 1. Reuse already-packed writerless sources (0=mathwriting, 4=detexify, 5=mw_symbols)
+    writerless_sids = {SOURCE_TO_ID["mathwriting"], SOURCE_TO_ID["detexify"], SOURCE_TO_ID["mw_symbols"]}
+    for sp in ("train", "val"):
+        sp_dir = cache_dir / sp
+        if not (sp_dir / "source_ids.npy").is_file():
+            continue
+        pts_xy = np.load(sp_dir / "points_xy.npy")
+        pts_pen = np.load(sp_dir / "points_pen.npy")
+        pt_off = np.load(sp_dir / "pt_offsets.npy")
+        toks = np.load(sp_dir / "tokens.npy")
+        tok_off = np.load(sp_dir / "tok_offsets.npy")
+        sids = np.load(sp_dir / "source_ids.npy")
+        for i, sid in enumerate(sids.tolist()):
+            if sid not in writerless_sids:
+                continue
+            p0, p1 = int(pt_off[i]), int(pt_off[i + 1])
+            t0_i, t1_i = int(tok_off[i]), int(tok_off[i + 1])
+            all_records.append(
+                (toks[t0_i:t1_i].tolist(), "", int(sid), pts_xy[p0:p1].copy(), pts_pen[p0:p1].copy())
+            )
+    print(f"[resplit] loaded {len(all_records):,} packed writerless samples ({time.perf_counter()-t0:.1f}s)")
+
+    def _add_if_valid(latex: str, wkey: str, sid: int, strokes: list[np.ndarray]) -> bool:
+        toks_str = tokenize_inkforge(latex)
+        if not toks_str or len(toks_str) + 2 > max_text_len:
+            return False
+        ids = tokenizer.encode(latex, max_len=max_text_len)
+        if tokenizer.unk_id in ids:
+            return False
+        norm = normalize_and_resample_for_inkforge(strokes, spacing=spacing, max_points=max_points)
+        if norm is None:
+            return False
+        xy, pen = norm
+        all_records.append((ids, wkey, sid, xy.astype(np.float16), pen))
+        return True
+
+    # 2. Reload named-writer sources with true string writer keys (CROHME, IAMonDo, HWRT)
+    if DEFAULT_CROHME_TRAIN.is_file():
+        n0 = len(all_records)
+        with DEFAULT_CROHME_TRAIN.open("r", encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                if r.get("synthetic"):
+                    continue
+                latex = (r.get("latexNormalized") or r.get("latex") or "").strip()
+                if not latex:
+                    continue
+                wid = str(r.get("writerId") or "")
+                _add_if_valid(latex, f"crohme:{wid}" if wid else "", SOURCE_TO_ID["crohme"], _parse_jsonl_strokes(r.get("strokes")))
+        print(f"[resplit] crohme: {len(all_records)-n0:,} ({time.perf_counter()-t0:.1f}s)")
+
+    if DEFAULT_IAMONDO_TRAIN.is_file():
+        n0 = len(all_records)
+        with DEFAULT_IAMONDO_TRAIN.open("r", encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                latex = (r.get("latexNormalized") or r.get("latex") or "").strip()
+                strokes = _parse_jsonl_strokes(r.get("strokes"))
+                wid = str(r.get("writerId") or "")
+                for sub_tex, sub_st in _slice_iamondo_words(latex, strokes):
+                    _add_if_valid(sub_tex, f"iam:{wid}" if wid else "", SOURCE_TO_ID["iamondo"], sub_st)
+        print(f"[resplit] iamondo: {len(all_records)-n0:,} ({time.perf_counter()-t0:.1f}s)")
+
+    if DEFAULT_HWRT_TRAIN.is_file():
+        n0 = len(all_records)
+        sym_counts: Counter[str] = Counter()
+        with DEFAULT_HWRT_TRAIN.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+        rng.shuffle(lines)
+        for line in lines:
+            r = json.loads(line)
+            latex = (r.get("latexNormalized") or r.get("latex") or "").strip()
+            if not latex or sym_counts[latex] >= hwrt_cap_per_symbol:
+                continue
+            wid = str(r.get("writerId") or "")
+            if _add_if_valid(latex, f"hwrt:{wid}" if wid else "", SOURCE_TO_ID["hwrt"], _parse_jsonl_strokes(r.get("strokes"))):
+                sym_counts[latex] += 1
+        print(f"[resplit] hwrt: {len(all_records)-n0:,} ({time.perf_counter()-t0:.1f}s)")
+
+    train_records, val_records = _split_records_leak_free(all_records, val_fraction=val_fraction, seed=seed)
+
+    # Strict zero-leakage verification BEFORE overwriting!
+    train_digs = {_packed_record_digest(r[0], r[3], r[4]) for r in train_records}
+    val_digs = {_packed_record_digest(r[0], r[3], r[4]) for r in val_records}
+    dup_overlap = len(train_digs & val_digs)
+    train_w = {r[1] for r in train_records if r[1]}
+    val_w = {r[1] for r in val_records if r[1]}
+    writer_overlap = len(train_w & val_w)
+    assert dup_overlap == 0, f"Exact duplicate leakage detected: {dup_overlap}"
+    assert writer_overlap == 0, f"Writer leakage detected: {writer_overlap}"
+    print(f"[resplit] VERIFIED zero leakage: exact_dup_overlap=0, writer_overlap=0 (train_w={len(train_w)}, val_w={len(val_w)})")
+
+    for split_name, split_recs in (("train", train_records), ("val", val_records)):
+        _write_packed_split(cache_dir / split_name, split_recs)
+
+    meta = {
+        "format": "inkforge-cache-v2",
+        "vocab_size": len(tokenizer),
+        "spacing": spacing,
+        "max_points": max_points,
+        "max_text_len": max_text_len,
+        "train_samples": len(train_records),
+        "val_samples": len(val_records),
+        "sources": list(SOURCE_NAMES),
+        "leak_free_grouped": True,
+        "elapsed_seconds": round(time.perf_counter() - t0, 1),
+    }
+    (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print(f"[resplit] DONE in {meta['elapsed_seconds']}s -> {cache_dir}")
+    return cache_dir
+
+
 def prepare_inkforge_cache(
     output_dir: Path = DEFAULT_CACHE_DIR,
     *,
@@ -400,17 +613,18 @@ def prepare_inkforge_cache(
         filtered.append((ids, wid, sid, xy16, pen))
     print(f"[pack] kept {len(filtered):,} / {len(records):,} samples after token filter")
 
-    # Deterministic writer-grouped train/val split (never leak val writers into train)
-    rng.shuffle(filtered)
-    val_count = max(1024, int(len(filtered) * val_fraction))
-    val_records = filtered[:val_count]
-    train_records = filtered[val_count:]
+    # Deterministic exact-duplicate + writer-grouped train/val split (zero leakage!)
+    train_records, val_records = _split_records_leak_free(
+        filtered,
+        val_fraction=val_fraction,
+        seed=seed,
+    )
 
     for split_name, split_recs in (("train", train_records), ("val", val_records)):
         _write_packed_split(output_dir / split_name, split_recs)
 
     meta = {
-        "format": "inkforge-cache-v1",
+        "format": "inkforge-cache-v2",
         "vocab_size": len(tokenizer),
         "spacing": spacing,
         "max_points": max_points,
@@ -418,6 +632,7 @@ def prepare_inkforge_cache(
         "train_samples": len(train_records),
         "val_samples": len(val_records),
         "sources": list(SOURCE_NAMES),
+        "leak_free_grouped": True,
         "elapsed_seconds": round(time.perf_counter() - t0, 1),
     }
     (output_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -465,6 +680,10 @@ def _write_packed_split(split_dir: Path, recs: Sequence[tuple[list[int], str, in
     np.save(split_dir / "tok_offsets.npy", tok_offsets)
     np.save(split_dir / "source_ids.npy", source_ids)
     np.save(split_dir / "writer_ids.npy", writer_ids)
+    writer_names = [""] * len(writer_map)
+    for wkey, wid_int in writer_map.items():
+        writer_names[wid_int] = wkey
+    (split_dir / "writer_names.json").write_text(json.dumps(writer_names), encoding="utf-8")
     print(
         f"  [{split_dir.name}] {n:,} samples | {total_pts:,} pts | "
         f"{len(writer_map)-1:,} named writers"
@@ -485,7 +704,7 @@ class InkForgeDataset(Dataset):
         *,
         cfg: InkForgeConfig | None = None,
         augment: bool = True,
-        input_noise_std: float = 0.030,
+        input_noise_std: float = 0.010,
         source_weights: dict[str, float] | None = None,
     ):
         self.split_dir = Path(cache_dir) / split
@@ -537,7 +756,7 @@ class InkForgeDataset(Dataset):
         return unpack_points_to_strokes(xy, pen)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        rng = np.random.default_rng()
+        rng = np.random.default_rng() if self.augment else np.random.default_rng(int(idx) + 1000003)
         t0, t1 = int(self.tok_offsets[idx]), int(self.tok_offsets[idx + 1])
         tok_ids = np.array(self.tokens[t0:t1], dtype=np.int64)
 
@@ -574,26 +793,31 @@ class InkForgeDataset(Dataset):
         target_pen[:-1] = pen[1:]  # 0=pen_down, 1=pen_lift
 
         # Decoder input at step 0 is BOS; at step t>=1 is previous step's (dx, dy, abs_x, abs_y, pen_onehot)
+        # Built from ONE self-consistent perturbed trajectory `xy_in` so `cumsum(in_dx) == in_ax`!
         stroke_in = np.zeros((n_steps, 7), dtype=np.float32)
         stroke_in[0, 6] = 1.0  # is_bos
         if n_steps > 1:
-            in_dx = target_dx[:-1].copy()
-            in_dy = target_dy[:-1].copy()
-            in_ax = np.clip(xy[1:, 0], -self.cfg.abs_x_clip, self.cfg.abs_x_clip)
-            in_ay = np.clip(xy[1:, 1], -self.cfg.abs_y_clip, self.cfg.abs_y_clip)
-            # Exposure-bias noise injection on decoder inputs during training
-            # (step jitter + small per-stroke cumulative drift so autoregressive generation stays stable!)
+            xy_in = xy.copy()
             if self.augment and self.input_noise_std > 0:
-                noise_x = rng.normal(0.0, self.input_noise_std, size=in_dx.shape).astype(np.float32)
-                noise_y = rng.normal(0.0, self.input_noise_std, size=in_dy.shape).astype(np.float32)
-                # Smooth cumulative position drift across strokes mimics autoregressive drift
-                stroke_starts = (target_pen[:-1] == 1).astype(np.float32)
-                drift_x = np.cumsum(stroke_starts * rng.normal(0.0, self.input_noise_std * 0.75, size=in_dx.shape).astype(np.float32))
-                drift_y = np.cumsum(stroke_starts * rng.normal(0.0, self.input_noise_std * 0.75, size=in_dy.shape).astype(np.float32))
-                in_dx += noise_x
-                in_dy += noise_y
-                in_ax = np.clip(in_ax + noise_x + drift_x, -self.cfg.abs_x_clip, self.cfg.abs_x_clip)
-                in_ay = np.clip(in_ay + noise_y + drift_y, -self.cfg.abs_y_clip, self.cfg.abs_y_clip)
+                # Point i (i>=1) is a stroke start (after an air jump) iff pen[i-1] == 1
+                is_stroke_start = (pen[:-1] == 1).astype(np.float32)
+                is_drawn = 1.0 - is_stroke_start
+                drift_x = np.cumsum(
+                    is_stroke_start * rng.normal(0.0, self.input_noise_std * 1.5, size=(n_steps - 1,)).astype(np.float32)
+                )
+                drift_y = np.cumsum(
+                    is_stroke_start * rng.normal(0.0, self.input_noise_std * 1.5, size=(n_steps - 1,)).astype(np.float32)
+                )
+                jitter_x = is_drawn * rng.normal(0.0, self.input_noise_std, size=(n_steps - 1,)).astype(np.float32)
+                jitter_y = is_drawn * rng.normal(0.0, self.input_noise_std, size=(n_steps - 1,)).astype(np.float32)
+                xy_in[1:, 0] += drift_x + jitter_x
+                xy_in[1:, 1] += drift_y + jitter_y
+
+            in_deltas = np.diff(xy_in, axis=0)
+            in_dx = np.clip(in_deltas[:, 0], -self.cfg.coord_clip, self.cfg.coord_clip)
+            in_dy = np.clip(in_deltas[:, 1], -self.cfg.coord_clip, self.cfg.coord_clip)
+            in_ax = np.clip(xy_in[1:, 0], -self.cfg.abs_x_clip, self.cfg.abs_x_clip)
+            in_ay = np.clip(xy_in[1:, 1], -self.cfg.abs_y_clip, self.cfg.abs_y_clip)
 
             stroke_in[1:, 0] = in_dx
             stroke_in[1:, 1] = in_dy
@@ -641,6 +865,7 @@ class InkForgeDataset(Dataset):
             "style_points": sp,
             "style_aspect": sa,
             "style_mask": sm,
+            "source_id": int(self.source_ids[idx]),
         }
 
 
@@ -659,6 +884,7 @@ def collate_inkforge_batch(items: Sequence[dict[str, Any]], pad_id: int = 0) -> 
     style_points = torch.from_numpy(np.stack([it["style_points"] for it in items], axis=0))
     style_aspect = torch.from_numpy(np.stack([it["style_aspect"] for it in items], axis=0))
     style_mask = torch.from_numpy(np.stack([it["style_mask"] for it in items], axis=0)).bool()
+    source_id = torch.tensor([int(it.get("source_id", 0)) for it in items], dtype=torch.long)
 
     for i, it in enumerate(items):
         l = len(it["token_ids"])
@@ -680,6 +906,7 @@ def collate_inkforge_batch(items: Sequence[dict[str, Any]], pad_id: int = 0) -> 
         "style_points": style_points,
         "style_aspect": style_aspect,
         "style_mask": style_mask,
+        "source_id": source_id,
     }
 
 
@@ -689,13 +916,21 @@ def main() -> None:
     parser.add_argument("--spacing", type=float, default=0.12)
     parser.add_argument("--max-points", type=int, default=512)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--resplit-only", action="store_true", help="Fast zero-leakage resplit reusing packed MathWriting/Detexify")
     args = parser.parse_args()
-    prepare_inkforge_cache(
-        output_dir=args.output_dir,
-        spacing=args.spacing,
-        max_points=args.max_points,
-        workers=args.workers,
-    )
+    if args.resplit_only:
+        resplit_existing_cache_leak_free(
+            cache_dir=args.output_dir,
+            spacing=args.spacing,
+            max_points=args.max_points,
+        )
+    else:
+        prepare_inkforge_cache(
+            output_dir=args.output_dir,
+            spacing=args.spacing,
+            max_points=args.max_points,
+            workers=args.workers,
+        )
 
 
 if __name__ == "__main__":

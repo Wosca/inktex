@@ -171,22 +171,29 @@ def main() -> None:
             cell_temps = torch.from_numpy(prompt_temps[np.asarray(cell_owner)]).to(device)
 
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                cell_strokes_flat = model.generate_batch(
+                cell_strokes_flat, cell_meta_flat = model.generate_batch(
                     tok_t,
                     style_z=cell_zs,
                     temperature=cell_temps,
-                    pen_temperature=0.70,
-                    max_steps=440,
+                    pen_temperature=1.0,
+                    max_steps=512,
+                    return_meta=True,
                 )
 
             # Group generated cells back per prompt and assemble 2D layout
             grouped: list[list[list[np.ndarray]]] = [[] for _ in range(n_prompts)]
-            for c_st, owner in zip(cell_strokes_flat, cell_owner):
+            grouped_ok: list[bool] = [True] * n_prompts
+            for c_st, c_meta, owner in zip(cell_strokes_flat, cell_meta_flat, cell_owner):
                 grouped[owner].append(c_st)
+                if not c_meta["finished"]:
+                    grouped_ok[owner] = False
 
             for p_idx, pr in enumerate(prompts_batch):
                 if generated >= args.target_count:
                     break
+                if not grouped_ok[p_idx]:
+                    rejected += 1
+                    continue
                 assembled = assemble_structured_strokes(pr, grouped[p_idx], np_rng)
                 if not passes_geometry_gate(pr.latex, assembled):
                     rejected += 1
