@@ -1,0 +1,255 @@
+"""Resumable overnight synthetic human-like math handwriting generator for RTX 4070 Ti.
+
+Generates a balanced real-world STEM mix:
+  - ~55% complex single-line STEM formulas mined from UniMER (300k real formulas, long expressions, rare symbols)
+  - ~20% multi-line derivations (`\\` and `\\begin{aligned}`) with consistent single-writer style across lines
+  - ~15% 2x2..3x3 matrices (`bmatrix`, `pmatrix`, `vmatrix`, `matrix`) with hand-drawn brackets
+  - ~10% piecewise functions (`\\begin{cases}`) with real handwritten `\\text{if ...}` / `\\text{otherwise}`
+
+Writes resumable `stroke-latex-v1` JSONL shards to `E:\\math-recogniser-training\\inkforge_synth\\`
+plus crisp PNG contact sheets every 1,000 samples so you can visually inspect quality!
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import random
+import sys
+import time
+from typing import Any
+
+import numpy as np
+import torch
+
+ML_ROOT = Path(__file__).resolve().parents[1]
+if str(ML_ROOT) not in sys.path:
+    sys.path.insert(0, str(ML_ROOT))
+
+from inkforge.composer import (  # noqa: E402
+    DEFAULT_UNIMER_JSONL,
+    StructuredPrompt,
+    assemble_structured_strokes,
+    load_unimer_prompt_pool,
+    passes_geometry_gate,
+    sample_programmatic_structured_prompt,
+    smooth_strokes_catmull_rom,
+    synthesize_realistic_times,
+)
+from inkforge.model import InkForgeConfig, InkForgeModel  # noqa: E402
+from inkforge.render import render_contact_sheet  # noqa: E402
+from inkforge.tokenizer import InkForgeTokenizer  # noqa: E402
+
+
+def sample_writer_latents(
+    n: int,
+    style_dim: int,
+    rng: np.random.Generator,
+    bank: np.ndarray | None = None,
+) -> np.ndarray:
+    """Sample realistic human writer style vectors by interpolating real bank writers + prior noise."""
+    if bank is None or len(bank) < 2:
+        return rng.normal(0.0, 0.9, size=(n, style_dim)).astype(np.float32)
+
+    idx_a = rng.integers(0, len(bank), size=n)
+    idx_b = rng.integers(0, len(bank), size=n)
+    alpha = rng.uniform(0.55, 1.0, size=(n, 1)).astype(np.float32)
+    z = alpha * bank[idx_a] + (1.0 - alpha) * bank[idx_b]
+    z += rng.normal(0.0, 0.12, size=(n, style_dim)).astype(np.float32)
+    return z.astype(np.float32)
+
+
+def strokes_to_v1_schema(strokes: list[np.ndarray], times: list[np.ndarray]) -> list[dict[str, Any]]:
+    out = []
+    for idx, (st, tm) in enumerate(zip(strokes, times)):
+        pts = [
+            {"x": round(float(p[0]), 4), "y": round(float(p[1]), 4), "time": round(float(t), 2)}
+            for p, t in zip(st, tm)
+        ]
+        if pts:
+            out.append({"id": str(idx), "points": pts})
+    return out
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Overnight InkForge synthetic human math handwriting generator")
+    parser.add_argument("--checkpoint", type=Path, required=True, help="Path to trained InkForge best.pt / latest.pt")
+    parser.add_argument("--style-bank", type=Path, default=None, help="Optional writer_styles.npz from training")
+    parser.add_argument("--unimer-jsonl", type=Path, default=DEFAULT_UNIMER_JSONL)
+    parser.add_argument("--out-dir", type=Path, default=Path(r"E:\math-recogniser-training\inkforge_synth"))
+    parser.add_argument("--target-count", type=int, default=200000, help="Total valid samples to generate")
+    parser.add_argument("--shard-size", type=int, default=10000)
+    parser.add_argument("--batch-size", type=int, default=96, help="GPU cell batch size (96-128 fits RTX 4070 Ti easily)")
+    parser.add_argument("--structured-prob", type=float, default=0.45, help="Fraction of multi-line/matrix/cases prompts")
+    parser.add_argument("--temp-min", type=float, default=0.28)
+    parser.add_argument("--temp-max", type=float, default=0.62)
+    parser.add_argument("--preview-every", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=2026)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    cfg = InkForgeConfig.from_dict(ckpt["config"])
+    tokenizer = InkForgeTokenizer.from_dict(ckpt["tokenizer"])
+    model = InkForgeModel(cfg).to(device)
+    state = ckpt.get("ema_state_dict") or ckpt["model_state_dict"]
+    model.load_state_dict(state)
+    model.eval()
+    print(f"[gen] Loaded InkForge ({model.parameter_count()/1e6:.2f}M params, step={ckpt.get('step')}) on {device}")
+
+    style_bank = None
+    bank_path = args.style_bank or (args.checkpoint.parent / "writer_styles.npz")
+    if bank_path.is_file():
+        style_bank = np.load(bank_path)["mu_bank"]
+        print(f"[gen] Loaded {len(style_bank):,} real human writer styles from {bank_path}")
+
+    unimer_prompts = load_unimer_prompt_pool(tokenizer, args.unimer_jsonl, max_prompts=120000, seed=args.seed)
+    print(f"[gen] Loaded {len(unimer_prompts):,} UniMER STEM prompts")
+
+    out_dir: Path = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    preview_dir = out_dir / "previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    # Resume cleanly if shards already exist
+    existing_shards = sorted(out_dir.glob("inkforge_synth_*.jsonl"))
+    generated = 0
+    for sh in existing_shards:
+        with sh.open("rb") as f:
+            generated += sum(1 for _ in f)
+    shard_idx = len(existing_shards)
+    if generated > 0:
+        print(f"[gen] Resuming from {generated:,} existing samples across {shard_idx} shard(s)")
+
+    py_rng = random.Random(args.seed + generated)
+    np_rng = np.random.default_rng(args.seed + generated)
+    unimer_cursor = generated % max(1, len(unimer_prompts))
+
+    t0 = time.perf_counter()
+    start_generated = generated
+    rejected = 0
+    in_shard = 0
+    preview_buf: list[tuple[str, list[np.ndarray]]] = []
+
+    def open_shard(idx: int):
+        return (out_dir / f"inkforge_synth_{idx:05d}.jsonl").open("a", encoding="utf-8")
+
+    shard_f = open_shard(shard_idx)
+    try:
+        while generated < args.target_count:
+            # Build a batch of prompts whose flattened cell count is ~args.batch_size
+            prompts_batch: list[StructuredPrompt] = []
+            flat_cells: list[str] = []
+            cell_owner: list[int] = []
+            while len(flat_cells) < args.batch_size:
+                if unimer_prompts and py_rng.random() >= args.structured_prob:
+                    pr = unimer_prompts[unimer_cursor % len(unimer_prompts)]
+                    unimer_cursor += 1
+                else:
+                    pr = sample_programmatic_structured_prompt(py_rng)
+                p_idx = len(prompts_batch)
+                prompts_batch.append(pr)
+                for c in pr.cells:
+                    flat_cells.append(c)
+                    cell_owner.append(p_idx)
+                if len(prompts_batch) >= args.batch_size:
+                    break
+
+            # Assign ONE consistent writer latent `z` and temperature `tau` per equation (shared by all its cells!)
+            n_prompts = len(prompts_batch)
+            prompt_zs = sample_writer_latents(n_prompts, cfg.style_dim, np_rng, bank=style_bank)
+            prompt_temps = np_rng.uniform(args.temp_min, args.temp_max, size=(n_prompts,)).astype(np.float32)
+
+            # Encode all flattened cells into one GPU batch
+            encoded_cells = [tokenizer.encode(c, max_len=cfg.max_text_len) for c in flat_cells]
+            max_l = max(len(e) for e in encoded_cells)
+            tok_t = torch.full((len(flat_cells), max_l), tokenizer.pad_id, dtype=torch.long, device=device)
+            for i, e in enumerate(encoded_cells):
+                tok_t[i, : len(e)] = torch.tensor(e, dtype=torch.long, device=device)
+
+            cell_zs = torch.from_numpy(prompt_zs[np.asarray(cell_owner)]).to(device)
+            cell_temps = torch.from_numpy(prompt_temps[np.asarray(cell_owner)]).to(device)
+
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                cell_strokes_flat = model.generate_batch(
+                    tok_t,
+                    style_z=cell_zs,
+                    temperature=cell_temps,
+                    pen_temperature=0.70,
+                    max_steps=440,
+                )
+
+            # Group generated cells back per prompt and assemble 2D layout
+            grouped: list[list[list[np.ndarray]]] = [[] for _ in range(n_prompts)]
+            for c_st, owner in zip(cell_strokes_flat, cell_owner):
+                grouped[owner].append(c_st)
+
+            for p_idx, pr in enumerate(prompts_batch):
+                if generated >= args.target_count:
+                    break
+                assembled = assemble_structured_strokes(pr, grouped[p_idx], np_rng)
+                if not passes_geometry_gate(pr.latex, assembled):
+                    rejected += 1
+                    continue
+
+                smoothed = smooth_strokes_catmull_rom(assembled, subdivisions=2)
+                times = synthesize_realistic_times(smoothed, np_rng)
+                rec = {
+                    "schemaVersion": "stroke-latex-v1",
+                    "id": f"inkforge:{generated:07d}",
+                    "source": "synthetic",
+                    "sourceDataset": f"inkforge_{pr.kind}",
+                    "split": "train",
+                    "synthetic": True,
+                    "writerId": f"inkforge_w:{generated:07d}",
+                    "latex": pr.latex,
+                    "latexOriginal": pr.latex,
+                    "latexNormalized": pr.latex,
+                    "strokes": strokes_to_v1_schema(smoothed, times),
+                    "metadata": {
+                        "kind": pr.kind,
+                        "temperature": round(float(prompt_temps[p_idx]), 3),
+                    },
+                }
+                shard_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                generated += 1
+                in_shard += 1
+
+                if len(preview_buf) < 18:
+                    preview_buf.append((f"[{pr.kind}] {pr.latex}", smoothed))
+
+                if generated % args.preview_every == 0 and preview_buf:
+                    render_contact_sheet(
+                        preview_buf,
+                        preview_dir / f"samples_{generated:07d}.png",
+                        cols=3,
+                        tile_w=460,
+                        tile_h=175,
+                    )
+                    preview_buf = []
+
+                if in_shard >= args.shard_size:
+                    shard_f.close()
+                    shard_idx += 1
+                    in_shard = 0
+                    shard_f = open_shard(shard_idx)
+
+            done_now = generated - start_generated
+            if done_now > 0 and done_now % 500 < n_prompts:
+                elapsed = time.perf_counter() - t0
+                rate = done_now / max(elapsed, 1e-3)
+                eta_min = (args.target_count - generated) / max(rate, 1e-6) / 60.0
+                accept_pct = 100.0 * done_now / max(1, done_now + rejected)
+                print(
+                    f"[gen] {generated:,}/{args.target_count:,} "
+                    f"({rate*60:.0f} eq/min | accept={accept_pct:.1f}% | ETA {eta_min:.1f}m)",
+                    flush=True,
+                )
+    finally:
+        shard_f.close()
+
+    print(f"[gen] DONE! Generated {generated:,} samples -> {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
