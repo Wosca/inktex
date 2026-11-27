@@ -15,11 +15,13 @@ round-trip reward judge:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import copy
 from functools import partial
 import json
 from pathlib import Path
 import random
+import re
 import sys
 import time
 from typing import Any, Sequence
@@ -28,7 +30,7 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 ML_ROOT = Path(__file__).resolve().parents[1]
 if str(ML_ROOT) not in sys.path:
@@ -143,6 +145,38 @@ def build_hard_prompt_pool(
     return uniq
 
 
+def raw_trace_to_inkforge_item(
+    raw_trace: dict[str, np.ndarray] | None,
+    token_ids: Sequence[int],
+    style_z: np.ndarray,
+) -> dict[str, Any] | None:
+    """Wrap exact raw rollout actions & pen targets with ZERO resampling or fabricated EOS."""
+    if not raw_trace:
+        return None
+    s_in = np.asarray(raw_trace["stroke_inputs"], dtype=np.float32)
+    t_dx = np.asarray(raw_trace["target_dx"], dtype=np.float32)
+    t_dy = np.asarray(raw_trace["target_dy"], dtype=np.float32)
+    t_pen = np.asarray(raw_trace["target_pen"], dtype=np.int64)
+    if len(t_pen) < 2:
+        return None
+    return {
+        "token_ids": np.asarray(token_ids, dtype=np.int64),
+        "stroke_inputs": s_in,
+        "target_dx": t_dx,
+        "target_dy": t_dy,
+        "target_pen": t_pen,
+        "style_z": np.asarray(style_z, dtype=np.float32),
+    }
+
+
+def _canonicalize_judge_latex(latex: str) -> str:
+    """Fold harmless notation aliases before InkTeX v2 token comparison."""
+    s = latex.strip()
+    s = re.sub(r"\\(?:mathrm|operatorname|text)\s*\{\s*Pr\s*\}", r"\\Pr", s)
+    s = s.replace(r"\dots", r"\ldots")
+    return s
+
+
 def strokes_to_inkforge_item(
     strokes: Sequence[np.ndarray],
     token_ids: Sequence[int],
@@ -226,11 +260,14 @@ def judge_rollouts_with_inktex(
     device: torch.device,
     *,
     batch_size: int = 32,
-) -> list[tuple[bool, str]]:
-    """Run InkTeX v2 bimodal greedy recognition on generated stroke rollouts and return `(exact_ok, pred_latex)`."""
+) -> list[tuple[bool, str, str]]:
+    """Run InkTeX v2 bimodal greedy recognition on rollouts and return `(exact_ok, pred_latex, reason)`.
+
+    Reasons: `"ok"`, `"hit_cap"`, `"geom_fail"`, `"raster_fail"`, `"decode_cap"`, `"wrong_latex"`.
+    """
     judge_model.eval()
     n = len(rollout_rows)
-    out: list[tuple[bool, str]] = [(False, "")] * n
+    out: list[tuple[bool, str, str]] = [(False, "", "unknown")] * n
     if n == 0:
         return out
 
@@ -239,7 +276,11 @@ def judge_rollouts_with_inktex(
     prepared_rows: list[dict[str, Any] | None] = [None] * n
     for i, r in enumerate(rollout_rows):
         strokes = r["strokes"]
-        if not r["finished"] or not passes_geometry_gate(r["latex"], strokes):
+        if not r["finished"]:
+            out[i] = (False, "", "hit_cap")
+            continue
+        if not passes_geometry_gate(r["latex"], strokes):
+            out[i] = (False, "", "geom_fail")
             continue
         smoothed = smooth_strokes_catmull_rom(strokes, subdivisions=2)
         times = synthesize_realistic_times(smoothed, rng)
@@ -252,9 +293,11 @@ def judge_rollouts_with_inktex(
             bk = select_width_bucket(w, WIDTH_BUCKETS_V2)
             bucket_groups.setdefault(bk, []).append(i)
         except Exception:
+            out[i] = (False, "", "raster_fail")
             continue
 
     amp_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    max_dec_tokens = 96
     for bk in sorted(bucket_groups.keys()):
         idxs = bucket_groups[bk]
         for start in range(0, len(idxs), batch_size):
@@ -283,14 +326,124 @@ def judge_rollouts_with_inktex(
                     bos_id=judge_tok.bos_l2r_id,
                     eos_id=judge_tok.eos_id,
                     pad_id=judge_tok.pad_id,
-                    max_tokens=96,
+                    max_tokens=max_dec_tokens,
                 ).cpu().tolist()
             for idx, pred_ids in zip(sub_idxs, pred_ids_list):
                 pred_tex = judge_tok.decode(pred_ids)
-                t_toks = tokenize_latex(_safe_std_v2(rollout_rows[idx]["latex"]))
-                p_toks = tokenize_latex(_safe_std_v2(pred_tex))
-                out[idx] = (bool(t_toks) and p_toks == t_toks, pred_tex)
+                if len(pred_ids) >= max_dec_tokens and judge_tok.eos_id not in pred_ids:
+                    out[idx] = (False, pred_tex, "decode_cap")
+                    continue
+                t_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(rollout_rows[idx]["latex"])))
+                p_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(pred_tex)))
+                if bool(t_toks) and p_toks == t_toks:
+                    out[idx] = (True, pred_tex, "ok")
+                else:
+                    out[idx] = (False, pred_tex, "wrong_latex")
     return out
+
+
+@torch.inference_mode()
+def _generate_rollouts_chunked(
+    ema_model: InkForgeModel,
+    tokenizer: InkForgeTokenizer,
+    exp_enc: Sequence[Sequence[int]],
+    z_np: np.ndarray,
+    device: torch.device,
+    *,
+    temperature: float,
+    cfg_scale: float,
+    max_seqs_per_chunk: int = 32,
+) -> tuple[list[list[np.ndarray]], list[dict[str, Any]]]:
+    """Generate rollouts in OOM-safe chunks with automatic halving backoff on CUDA OOM."""
+    n = len(exp_enc)
+    all_strokes: list[list[np.ndarray]] = []
+    all_meta: list[dict[str, Any]] = []
+    chunk_sz = max(4, min(max_seqs_per_chunk, n))
+    pos = 0
+    while pos < n:
+        end = min(pos + chunk_sz, n)
+        sub_enc = exp_enc[pos:end]
+        max_l = max(len(e) for e in sub_enc)
+        tok_t = torch.full((len(sub_enc), max_l), tokenizer.pad_id, dtype=torch.long, device=device)
+        for i, e in enumerate(sub_enc):
+            tok_t[i, : len(e)] = torch.tensor(e, dtype=torch.long, device=device)
+        z_t = torch.from_numpy(z_np[pos:end]).to(device)
+        try:
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                st_chunk, meta_chunk = ema_model.generate_batch(
+                    tok_t,
+                    style_z=z_t,
+                    temperature=temperature,
+                    pen_temperature=1.0,
+                    cfg_scale=cfg_scale,
+                    max_steps=512,
+                    return_meta=True,
+                    return_actions=True,
+                )
+            all_strokes.extend(st_chunk)
+            all_meta.extend(meta_chunk)
+            pos = end
+        except torch.cuda.OutOfMemoryError:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if chunk_sz <= 4:
+                raise
+            chunk_sz = max(4, chunk_sz // 2)
+            print(f"[star-dpo] CUDA OOM during rollout; backing off chunk size to {chunk_sz}", flush=True)
+    return all_strokes, all_meta
+
+
+@torch.inference_mode()
+def _evaluate_fixed_prompts(
+    ema_model: InkForgeModel,
+    judge_model: torch.nn.Module,
+    judge_tok: Any,
+    tokenizer: InkForgeTokenizer,
+    eval_prompts: Sequence[str],
+    eval_zs: np.ndarray,
+    device: torch.device,
+    *,
+    temperature: float,
+    cfg_scale: float,
+    judge_batch_size: int,
+    seed: int = 202601,
+) -> tuple[float, dict[str, int]]:
+    """Deterministic post-update evaluation on a fixed prompt + style subset."""
+    ema_model.to(device)
+    ema_model.eval()
+    eval_enc = [tokenizer.encode(p, max_len=ema_model.cfg.max_text_len) for p in eval_prompts]
+    devices = [device] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
+        st_list, meta_list = _generate_rollouts_chunked(
+            ema_model,
+            tokenizer,
+            eval_enc,
+            eval_zs,
+            device,
+            temperature=temperature,
+            cfg_scale=cfg_scale,
+            max_seqs_per_chunk=32,
+        )
+    ema_model.to("cpu")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    rows = [
+        {"latex": eval_prompts[i], "strokes": st_list[i], "finished": meta_list[i]["finished"]}
+        for i in range(len(eval_prompts))
+    ]
+    judge_model.to(device)
+    verdicts = judge_rollouts_with_inktex(judge_model, judge_tok, rows, device, batch_size=judge_batch_size)
+    judge_model.to("cpu")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    reasons = Counter(reason for _ok, _pred, reason in verdicts)
+    pass_rate = reasons["ok"] / max(1, len(rows))
+    return pass_rate, dict(reasons)
 
 
 def run_star_dpo(args: argparse.Namespace) -> None:
@@ -346,21 +499,49 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         p.requires_grad_(False)
     print(f"[star-dpo] Loaded frozen InkTeX v2 judge from {args.judge_ckpt}", flush=True)
 
-    # 3. Replay dataset (strictly real human samples so handwriting naturalness stays anchored!)
-    replay_ds = InkForgeDataset(args.cache_dir, split="train", cfg=cfg, augment=True, input_noise_std=0.010)
+    # 3. Replay dataset: STRICTLY real human samples (source_ids <= 5) with Stage-1 source weights!
+    full_train_ds = InkForgeDataset(args.cache_dir, split="train", cfg=cfg, augment=True, input_noise_std=0.010)
+    real_indices = np.where(full_train_ds.source_ids <= 5)[0]
+    if len(real_indices) == 0:
+        real_indices = np.arange(len(full_train_ds))
+    real_weights = torch.from_numpy(full_train_ds.sample_weights[real_indices].astype(np.float64))
+    replay_subset = Subset(full_train_ds, real_indices.tolist())
+    replay_sampler = WeightedRandomSampler(
+        weights=real_weights,
+        num_samples=max(len(real_indices), args.rounds * args.max_updates_per_round * args.train_batch_size),
+        replacement=True,
+    )
     replay_loader = DataLoader(
-        replay_ds,
+        replay_subset,
         batch_size=args.train_batch_size,
-        shuffle=True,
+        sampler=replay_sampler,
         num_workers=4,
         pin_memory=(device.type == "cuda"),
         collate_fn=partial(collate_inkforge_batch, pad_id=cfg.pad_id),
     )
     replay_iter = iter(replay_loader)
+    print(
+        f"[star-dpo] Real-human replay pool: {len(real_indices):,} / {len(full_train_ds):,} rows (source_ids <= 5)",
+        flush=True,
+    )
 
-    # 4. Build hard prompt pool
+    # 4. Build hard prompt pool + held-out fixed eval prompts for post-update best.pt selection
     prompt_pool = build_hard_prompt_pool(tokenizer, seed=args.seed)
-    print(f"[star-dpo] Built prompt pool: {len(prompt_pool):,} prompts", flush=True)
+    eval_count = min(128, max(16, len(prompt_pool) // 20))
+    fixed_eval_prompts = list(PREVIEW_PROMPTS) + [p for p in prompt_pool[:eval_count] if p not in PREVIEW_PROMPTS]
+    fixed_eval_prompts = fixed_eval_prompts[:eval_count]
+    fixed_eval_set = set(fixed_eval_prompts)
+    train_prompt_pool = [p for p in prompt_pool if p not in fixed_eval_set] or prompt_pool
+
+    eval_rng = random.Random(args.seed + 777)
+    fixed_eval_zs = np.zeros((len(fixed_eval_prompts), cfg.style_dim), dtype=np.float32)
+    for i in range(len(fixed_eval_prompts)):
+        if i % 2 == 1 and len(z_bank) > 0:
+            fixed_eval_zs[i] = z_bank[eval_rng.randrange(len(z_bank))]
+    print(
+        f"[star-dpo] Train prompt pool: {len(train_prompt_pool):,} | Fixed eval prompts: {len(fixed_eval_prompts)}",
+        flush=True,
+    )
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -369,14 +550,58 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         weight_decay=0.01,
     )
     log_path = out_dir / "star_dpo_metrics.jsonl"
+    state_path = out_dir / "star_dpo_state.json"
     rng = random.Random(args.seed)
+    start_round = 1
     global_step = 0
+    best_eval_pass = -1.0
+    total_pref_or_star_updates = 0
+    wrote_best = False
 
-    for rd in range(1, args.rounds + 1):
+    # Automatic round-level resume if interrupted
+    latest_ckpt_path = out_dir / "latest.pt"
+    if state_path.is_file() and latest_ckpt_path.is_file():
+        st_data = json.loads(state_path.read_text(encoding="utf-8"))
+        lckpt = torch.load(latest_ckpt_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(lckpt["model_state_dict"])
+        ema_model.load_state_dict(lckpt["ema_state_dict"])
+        if "optimizer_state_dict" in lckpt:
+            optimizer.load_state_dict(lckpt["optimizer_state_dict"])
+        start_round = int(st_data.get("next_round", 1))
+        global_step = int(st_data.get("global_step", 0))
+        best_eval_pass = float(st_data.get("best_eval_pass", -1.0))
+        total_pref_or_star_updates = int(st_data.get("total_pref_or_star_updates", 0))
+        wrote_best = (out_dir / "best.pt").is_file() and total_pref_or_star_updates > 0
+        print(
+            f"[star-dpo] Resuming at round {start_round}/{args.rounds} "
+            f"(global_step={global_step}, best_eval_pass={best_eval_pass*100:.1f}%)",
+            flush=True,
+        )
+    else:
+        base_pass, base_reasons = _evaluate_fixed_prompts(
+            ema_model,
+            judge_model,
+            judge_tok,
+            tokenizer,
+            fixed_eval_prompts,
+            fixed_eval_zs,
+            device,
+            temperature=args.rollout_temp,
+            cfg_scale=args.cfg_scale,
+            judge_batch_size=args.judge_batch_size,
+        )
+        print(
+            f"[star-dpo baseline eval] fixed_pass={base_pass*100:.1f}% | reasons={json.dumps(base_reasons)}",
+            flush=True,
+        )
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"round": 0, "global_step": 0, "eval_pass_rate": round(base_pass, 4), "eval_reasons": base_reasons}) + "\n")
+
+    for rd in range(start_round, args.rounds + 1):
         t_rd = time.perf_counter()
-        rd_prompts = rng.sample(prompt_pool, min(args.prompts_per_round, len(prompt_pool)))
+        rd_prompts = rng.sample(train_prompt_pool, min(args.prompts_per_round, len(train_prompt_pool)))
 
-        # ---- Phase 1: Batched Rollout Generation (ema_model on GPU) ----
+        # ---- Phase 1: Batched Rollout Generation (ema_model on GPU, SAME style_z per prompt!) ----
         ema_model.to(device)
         ema_model.eval()
         rollout_rows: list[dict[str, Any]] = []
@@ -386,31 +611,27 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         for start in range(0, len(rd_prompts), args.gen_batch_size):
             sub_p = rd_prompts[start : start + args.gen_batch_size]
             sub_enc = encoded_prompts[start : start + args.gen_batch_size]
-            # Expand each prompt K times
+
+            # Assign ONE shared style_z per prompt across all K rollouts so winner/loser pairs share exact style!
+            prompt_zs = np.zeros((len(sub_p), cfg.style_dim), dtype=np.float32)
+            for pi in range(len(sub_p)):
+                if (start + pi) % 2 == 1 and len(z_bank) > 0:
+                    prompt_zs[pi] = z_bank[rng.randrange(len(z_bank))]
+
             exp_p = [p for p in sub_p for _ in range(k_roll)]
             exp_enc = [e for e in sub_enc for _ in range(k_roll)]
-            max_l = max(len(e) for e in exp_enc)
-            tok_t = torch.full((len(exp_enc), max_l), tokenizer.pad_id, dtype=torch.long, device=device)
-            for i, e in enumerate(exp_enc):
-                tok_t[i, : len(e)] = torch.tensor(e, dtype=torch.long, device=device)
+            z_np = np.repeat(prompt_zs, k_roll, axis=0)
 
-            # Mix 50% neutral z=0 and 50% real human writer styles
-            z_np = np.zeros((len(exp_enc), cfg.style_dim), dtype=np.float32)
-            for i in range(len(exp_enc)):
-                if i % 2 == 1 and len(z_bank) > 0:
-                    z_np[i] = z_bank[rng.randrange(len(z_bank))]
-            z_t = torch.from_numpy(z_np).to(device)
-
-            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                strokes_list, meta_list = ema_model.generate_batch(
-                    tok_t,
-                    style_z=z_t,
-                    temperature=args.rollout_temp,
-                    pen_temperature=1.0,
-                    cfg_scale=args.cfg_scale,
-                    max_steps=512,
-                    return_meta=True,
-                )
+            strokes_list, meta_list = _generate_rollouts_chunked(
+                ema_model,
+                tokenizer,
+                exp_enc,
+                z_np,
+                device,
+                temperature=args.rollout_temp,
+                cfg_scale=args.cfg_scale,
+                max_seqs_per_chunk=32,
+            )
             for i in range(len(exp_enc)):
                 rollout_rows.append({
                     "prompt_idx": start + (i // k_roll),
@@ -419,6 +640,7 @@ def run_star_dpo(args: argparse.Namespace) -> None:
                     "style_z": z_np[i],
                     "strokes": strokes_list[i],
                     "finished": meta_list[i]["finished"],
+                    "raw_trace": meta_list[i].get("raw_trace"),
                 })
 
         # Park ema_model on CPU before moving InkTeX v2 judge onto GPU
@@ -435,15 +657,16 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        # Group winners & losers by prompt
+        # Group winners (`reason=="ok"`) & clean recognition-failure losers (`reason=="wrong_latex"`) by prompt
         by_prompt: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
-        total_pass = 0
-        for row, (ok, _pred) in zip(rollout_rows, verdicts):
+        reason_counts: Counter[str] = Counter()
+        for row, (ok, _pred, reason) in zip(rollout_rows, verdicts):
+            reason_counts[reason] += 1
             w_list, l_list = by_prompt.setdefault(row["prompt_idx"], ([], []))
             if ok:
-                total_pass += 1
                 w_list.append(row)
-            else:
+            elif reason == "wrong_latex":
+                # Strictly exclude hit_cap, geom_fail, raster_fail, and decode_cap from DPO losers!
                 l_list.append(row)
 
         star_winners: list[dict[str, Any]] = []
@@ -454,35 +677,35 @@ def run_star_dpo(args: argparse.Namespace) -> None:
                 continue
             prompts_with_win += 1
             for w in ws[:2]:
-                item_w = strokes_to_inkforge_item(w["strokes"], w["token_ids"], w["style_z"], cfg)
+                item_w = raw_trace_to_inkforge_item(w["raw_trace"], w["token_ids"], w["style_z"])
                 if item_w is not None:
                     star_winners.append(item_w)
                     if ls:
                         l_cand = rng.choice(ls)
-                        item_l = strokes_to_inkforge_item(
-                            l_cand["strokes"], l_cand["token_ids"], l_cand["style_z"], cfg
+                        item_l = raw_trace_to_inkforge_item(
+                            l_cand["raw_trace"], l_cand["token_ids"], l_cand["style_z"]
                         )
                         if item_l is not None:
                             dpo_pairs.append((item_w, item_l))
 
+        total_pass = reason_counts["ok"]
         pass_rate = total_pass / max(1, len(rollout_rows))
         prompt_solve_rate = prompts_with_win / max(1, len(rd_prompts))
         print(
             f"[star-dpo round {rd}/{args.rounds}] rollout_pass={pass_rate*100:.1f}% "
             f"({total_pass}/{len(rollout_rows)}) | prompt_pass@{k_roll}={prompt_solve_rate*100:.1f}% "
             f"| winners={len(star_winners)} | dpo_pairs={len(dpo_pairs)} "
-            f"({time.perf_counter()-t_rd:.1f}s)",
+            f"| reasons={json.dumps(dict(reason_counts))} ({time.perf_counter()-t_rd:.1f}s)",
             flush=True,
         )
         if not dpo_pairs and not star_winners:
             print(f"[star-dpo round {rd}] no verified rollouts found, skipping update.", flush=True)
             continue
 
-        # ---- Phase 3: STaR + DPO + Human Replay Updates ----
+        # ---- Phase 3: Deterministic STaR + DPO + Real-Human Replay Updates ----
         model.to(device)
         ref_model.to(device)
         ema_model.to(device)
-        model.train()
         ref_model.eval()
 
         rng.shuffle(dpo_pairs)
@@ -498,25 +721,36 @@ def run_star_dpo(args: argparse.Namespace) -> None:
             optimizer.zero_grad(set_to_none=True)
             total_step_loss = torch.zeros((), device=device, dtype=torch.float32)
 
-            # 3a. DPO preference loss
+            # 3a & 3b: Disable dropout (`model.eval()`) during preference/SFT scoring so policy==ref
+            # gives EXACT 0.0 margin at init while grad_checkpoint remains active under enable_grad!
+            model.eval()
+
             if dpo_pairs:
                 sub_pairs = [dpo_pairs[(bi * bs + j) % len(dpo_pairs)] for j in range(min(bs, len(dpo_pairs)))]
                 bw = {k: v.to(device, non_blocking=True) for k, v in collate_rollout_items([p[0] for p in sub_pairs], cfg.pad_id).items()}
                 bl = {k: v.to(device, non_blocking=True) for k, v in collate_rollout_items([p[1] for p in sub_pairs], cfg.pad_id).items()}
                 with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                    lp_w = model.sequence_log_prob(**bw)
-                    lp_l = model.sequence_log_prob(**bl)
+                    lp_w = model.sequence_log_prob(**bw, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
+                    lp_l = model.sequence_log_prob(**bl, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
                     with torch.no_grad():
-                        ref_w = ref_model.sequence_log_prob(**bw)
-                        ref_l = ref_model.sequence_log_prob(**bl)
+                        ref_w = ref_model.sequence_log_prob(**bw, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
+                        ref_l = ref_model.sequence_log_prob(**bl, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
                 logits_dpo = args.dpo_beta * ((lp_w - ref_w) - (lp_l - ref_l))
                 dpo_loss = -F.logsigmoid(logits_dpo).mean()
-                sft_loss = -lp_w.mean()
-                total_step_loss = total_step_loss + dpo_loss + args.sft_weight * sft_loss
+                total_step_loss = total_step_loss + dpo_loss
                 dpo_loss_sum += float(dpo_loss.item())
+
+            if star_winners:
+                sub_wins = [star_winners[(bi * bs + j) % len(star_winners)] for j in range(min(bs, len(star_winners)))]
+                bsft = {k: v.to(device, non_blocking=True) for k, v in collate_rollout_items(sub_wins, cfg.pad_id).items()}
+                with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                    lp_sft = model.sequence_log_prob(**bsft, pen_weight=1.0, length_normalize=True, mask_illegal_eos=True)
+                sft_loss = -lp_sft.mean()
+                total_step_loss = total_step_loss + args.sft_weight * sft_loss
                 sft_loss_sum += float(sft_loss.item())
 
-            # 3b. Real human replay anchor (prevents style/naturalness drift)
+            # 3c. Strictly real-human replay anchor (standard training mode with dropout + text CFG drop)
+            model.train()
             try:
                 rep_batch = next(replay_iter)
             except StopIteration:
@@ -546,28 +780,94 @@ def run_star_dpo(args: argparse.Namespace) -> None:
             global_step += 1
             update_ema(ema_model, model, 0.995)
             n_updates += 1
+            total_pref_or_star_updates += 1
 
-        # Save checkpoint + render preview sheet after every round
+        # Park train models on CPU before post-update fixed evaluation (avoid GPU overlap with judge!)
+        model.to("cpu")
+        ref_model.to("cpu")
+        ema_model.to("cpu")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        # ---- Phase 4: Post-update Fixed Eval & Checkpointing ----
+        eval_pass, eval_reasons = _evaluate_fixed_prompts(
+            ema_model,
+            judge_model,
+            judge_tok,
+            tokenizer,
+            fixed_eval_prompts,
+            fixed_eval_zs,
+            device,
+            temperature=args.rollout_temp,
+            cfg_scale=args.cfg_scale,
+            judge_batch_size=args.judge_batch_size,
+        )
+
+        # Render previews from updated EMA on GPU, then save checkpoints
+        ema_model.to(device)
+        render_preview_sheets(
+            ema_model, tokenizer, full_train_ds, out_dir, global_step, device, cfg_scale=args.cfg_scale
+        )
+        ema_model.to("cpu")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
         save_checkpoint(
-            out_dir / "best.pt",
+            out_dir / f"round_{rd:02d}.pt",
             step=global_step,
             cfg=cfg,
             tokenizer=tokenizer,
             model=model,
             ema_model=ema_model,
             optimizer=optimizer,
-            best_val=-pass_rate,
+            best_val=-eval_pass,
         )
-        render_preview_sheets(
-            ema_model, tokenizer, replay_ds, out_dir, global_step, device, cfg_scale=args.cfg_scale
+        improved = (not wrote_best) or (eval_pass > best_eval_pass)
+        if improved:
+            best_eval_pass = eval_pass
+            save_checkpoint(
+                out_dir / "best.pt",
+                step=global_step,
+                cfg=cfg,
+                tokenizer=tokenizer,
+                model=model,
+                ema_model=ema_model,
+                optimizer=optimizer,
+                best_val=-best_eval_pass,
+            )
+            wrote_best = True
+        save_checkpoint(
+            out_dir / "latest.pt",
+            step=global_step,
+            cfg=cfg,
+            tokenizer=tokenizer,
+            model=model,
+            ema_model=ema_model,
+            optimizer=optimizer,
+            best_val=-best_eval_pass,
         )
+        state_path.write_text(
+            json.dumps({
+                "next_round": rd + 1,
+                "global_step": global_step,
+                "best_eval_pass": best_eval_pass,
+                "total_pref_or_star_updates": total_pref_or_star_updates,
+            }, indent=2),
+            encoding="utf-8",
+        )
+
         rec = {
             "round": rd,
             "global_step": global_step,
             "rollout_pass_rate": round(pass_rate, 4),
             "prompt_pass_at_k": round(prompt_solve_rate, 4),
+            "eval_pass_rate": round(eval_pass, 4),
+            "best_eval_pass": round(best_eval_pass, 4),
+            "eval_reasons": eval_reasons,
+            "rollout_reasons": dict(reason_counts),
             "winners": len(star_winners),
             "dpo_pairs": len(dpo_pairs),
+            "updates": n_updates,
             "dpo_loss": round(dpo_loss_sum / max(1, n_updates), 4),
             "sft_loss": round(sft_loss_sum / max(1, n_updates), 4),
             "replay_loss": round(replay_loss_sum / max(1, n_updates), 4),
@@ -577,14 +877,17 @@ def run_star_dpo(args: argparse.Namespace) -> None:
             f.write(json.dumps(rec) + "\n")
         print(f"[star-dpo round {rd} done] {json.dumps(rec)}", flush=True)
 
-        # Free GPU before next round
-        model.to("cpu")
-        ref_model.to("cpu")
-        ema_model.to("cpu")
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    if total_pref_or_star_updates == 0 or not (out_dir / "best.pt").is_file():
+        raise RuntimeError(
+            f"[star-dpo] FAILED: completed {args.rounds} rounds with {total_pref_or_star_updates} preference/winner updates "
+            f"and best.pt exists={(out_dir / 'best.pt').is_file()}"
+        )
 
-    print(f"[star-dpo] Finished {args.rounds} rounds -> {out_dir / 'best.pt'}", flush=True)
+    print(
+        f"[star-dpo] Finished {args.rounds} rounds ({total_pref_or_star_updates} updates, "
+        f"best_eval_pass={best_eval_pass*100:.1f}%) -> {out_dir / 'best.pt'}",
+        flush=True,
+    )
 
 
 def main() -> None:

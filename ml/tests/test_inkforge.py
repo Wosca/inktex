@@ -328,13 +328,21 @@ def test_composed_weak_structure_generator():
 
 
 def test_star_dpo_rollout_collation_and_prompt_pool():
-    from inkforge.star_dpo import build_hard_prompt_pool, collate_rollout_items, strokes_to_inkforge_item
+    import copy
+    from inkforge.star_dpo import (
+        _canonicalize_judge_latex,
+        build_hard_prompt_pool,
+        collate_rollout_items,
+        raw_trace_to_inkforge_item,
+        strokes_to_inkforge_item,
+    )
 
     tok = InkForgeTokenizer.default()
     cfg = InkForgeConfig(vocab_size=len(tok), d_model=128, n_heads=4, d_ff=384, enc_layers=2, dec_layers=2, style_dim=16)
     pool = build_hard_prompt_pool(tok, unimer_path=Path("__nonexistent__.jsonl"), seed=7)
     assert len(pool) > 50
     assert any(r"\sqrt" in p for p in pool)
+    assert _canonicalize_judge_latex(r"\mathrm{Pr}(A)") == r"\Pr(A)"
 
     st = [np.array([[0.0, 0.0], [0.2, 0.1], [0.4, 0.3]], dtype=np.float64)]
     it = strokes_to_inkforge_item(st, tok.encode(r"x^2+1"), np.zeros((16,), dtype=np.float32), cfg)
@@ -342,3 +350,30 @@ def test_star_dpo_rollout_collation_and_prompt_pool():
     batch = collate_rollout_items([it, it], pad_id=tok.pad_id)
     assert batch["token_ids"].shape[0] == 2
     assert batch["style_z"].shape == (2, 16)
+
+    # Verify raw_trace preserves exact action length & NEVER fabricates EOS on capped rollouts,
+    # and verify model.eval() with grad_checkpoint matches ref_model identically (0.0 DPO margin at init)!
+    model = InkForgeModel(cfg, grad_checkpoint=True)
+    ref = copy.deepcopy(model)
+    ref.grad_checkpoint = False
+    model.eval()
+    ref.eval()
+
+    tok_ids = torch.tensor([tok.encode(r"x^2+1")], dtype=torch.long)
+    z0 = torch.zeros((1, 16), dtype=torch.float32)
+    _gen, meta_cap = model.generate_batch(
+        tok_ids, style_z=z0, temperature=0.4, max_steps=5, min_steps=10, return_meta=True, return_actions=True
+    )
+    assert meta_cap[0]["hit_cap"] and not meta_cap[0]["finished"]
+    raw_cap = meta_cap[0]["raw_trace"]
+    assert len(raw_cap["target_pen"]) == 5
+    assert int((raw_cap["target_pen"] == 2).sum()) == 0  # NO fabricated EOS!
+
+    raw_item = raw_trace_to_inkforge_item(raw_cap, tok.encode(r"x^2+1"), np.zeros((16,), dtype=np.float32))
+    assert raw_item is not None
+    rb = collate_rollout_items([raw_item], pad_id=tok.pad_id)
+    lp_pol = model.sequence_log_prob(**rb, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
+    with torch.no_grad():
+        lp_ref = ref.sequence_log_prob(**rb, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
+    assert float((lp_pol - lp_ref).abs().max().item()) < 1e-5
+    (-lp_pol.mean()).backward()

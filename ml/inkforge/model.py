@@ -508,7 +508,7 @@ class InkForgeModel(nn.Module):
         active_kappa_seq: Tensor | None = None
         for idx, blk in enumerate(self.dec_blocks):
             want = return_guided_attns and (idx >= guide_start)
-            if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+            if self.grad_checkpoint and torch.is_grad_enabled():
                 def _blk_fn(
                     _x: Tensor,
                     _mem: Tensor,
@@ -607,10 +607,15 @@ class InkForgeModel(nn.Module):
         target_pen: Tensor,
         stroke_mask: Tensor,
         style_z: Tensor,
-        pen_weight: float = 2.0,
-        length_normalize: bool = True,
+        pen_weight: float = 1.0,
+        length_normalize: bool = False,
+        mask_illegal_eos: bool = True,
     ) -> Tensor:
-        """Compute per-sequence MDN + pen log-probability `[B]` in float32 (used for STaR / DPO)."""
+        """Compute per-sequence joint MDN + pen log-probability `[B]` in float32 (used for STaR / DPO).
+
+        When `mask_illegal_eos=True` (default), enforces the same pen grammar as `generate_batch`:
+        EOS is only legal immediately after a `pen_lift` (`stroke_inputs[..., 5] > 0.5`).
+        """
         memory, mem_mask = self.encode_memory(token_ids)
         raw, _, _ = self.decode_features(
             stroke_inputs, memory, mem_mask, style_z, return_guided_attns=False
@@ -631,6 +636,13 @@ class InkForgeModel(nn.Module):
         log_comp = -0.5 * z_quad - log_norm
         log_pi = F.log_softmax(pi_logits, dim=-1)
         mdn_logp = torch.logsumexp(log_pi + log_comp, dim=-1)  # [B, T]
+
+        if mask_illegal_eos:
+            can_eos = stroke_inputs[:, :, 5] > 0.5
+            forbid_eos = stroke_mask & (~can_eos) & target_pen.ne(2)
+            if forbid_eos.any():
+                pen_logits = pen_logits.clone()
+                pen_logits[forbid_eos, 2] = -1e4
 
         coord_mask = (stroke_mask & target_pen.ne(2)).float()
         valid_f = stroke_mask.float()
@@ -850,6 +862,7 @@ class InkForgeModel(nn.Module):
         max_steps: int = 512,
         min_steps: int = 1,
         return_meta: bool = False,
+        return_actions: bool = False,
     ) -> list[list[np.ndarray]] | tuple[list[list[np.ndarray]], list[dict[str, Any]]]:
         """Generate batched handwritten 2D strokes in glyph-normalized units (h = 1.0).
 
@@ -901,6 +914,8 @@ class InkForgeModel(nn.Module):
         xs_hist = torch.zeros((b, max_steps), device=device, dtype=torch.float32)
         ys_hist = torch.zeros((b, max_steps), device=device, dtype=torch.float32)
         pen_hist = torch.full((b, max_steps), 2, device=device, dtype=torch.long)
+        dx_hist = torch.zeros((b, max_steps), device=device, dtype=torch.float32) if return_actions else None
+        dy_hist = torch.zeros((b, max_steps), device=device, dtype=torch.float32) if return_actions else None
 
         for step in range(max_steps):
             feat_in = torch.cat([cur_feat, cur_feat], dim=0) if use_cfg else cur_feat
@@ -975,6 +990,9 @@ class InkForgeModel(nn.Module):
             xs_hist[:, step] = abs_x
             ys_hist[:, step] = abs_y
             pen_hist[:, step] = pen
+            if dx_hist is not None and dy_hist is not None:
+                dx_hist[:, step] = torch.where(active, dx, torch.zeros_like(dx))
+                dy_hist[:, step] = torch.where(active, dy, torch.zeros_like(dy))
 
             can_eos = pen.eq(1)
             finished = finished | pen.eq(2)
@@ -994,6 +1012,8 @@ class InkForgeModel(nn.Module):
         xs_np = xs_hist.cpu().numpy()
         ys_np = ys_hist.cpu().numpy()
         pen_np = pen_hist.cpu().numpy()
+        dx_np = dx_hist.cpu().numpy() if dx_hist is not None else None
+        dy_np = dy_hist.cpu().numpy() if dy_hist is not None else None
         finished_np = finished.cpu().numpy()
         steps_np = steps_taken.cpu().numpy()
 
@@ -1019,11 +1039,32 @@ class InkForgeModel(nn.Module):
                 strokes = strokes[1:]
             results.append(strokes)
             is_fin = bool(finished_np[i])
-            meta_list.append({
+            n_st = int(steps_np[i])
+            m_entry: dict[str, Any] = {
                 "finished": is_fin,
                 "hit_cap": not is_fin,
-                "steps": int(steps_np[i]),
-            })
+                "steps": n_st,
+            }
+            if return_actions and dx_np is not None and dy_np is not None and n_st > 0:
+                t_dx = dx_np[i, :n_st].astype(np.float32)
+                t_dy = dy_np[i, :n_st].astype(np.float32)
+                t_pen = pen_np[i, :n_st].astype(np.int64)
+                s_in = np.zeros((n_st, 7), dtype=np.float32)
+                s_in[0, 6] = 1.0
+                if n_st > 1:
+                    s_in[1:, 0] = t_dx[:-1]
+                    s_in[1:, 1] = t_dy[:-1]
+                    s_in[1:, 2] = np.clip(xs_np[i, : n_st - 1], -self.cfg.abs_x_clip, self.cfg.abs_x_clip)
+                    s_in[1:, 3] = np.clip(ys_np[i, : n_st - 1], -self.cfg.abs_y_clip, self.cfg.abs_y_clip)
+                    s_in[1:, 4] = (t_pen[:-1] == 0).astype(np.float32)
+                    s_in[1:, 5] = (t_pen[:-1] == 1).astype(np.float32)
+                m_entry["raw_trace"] = {
+                    "stroke_inputs": s_in,
+                    "target_dx": t_dx,
+                    "target_dy": t_dy,
+                    "target_pen": t_pen,
+                }
+            meta_list.append(m_entry)
         if return_meta:
             return results, meta_list
         return results
