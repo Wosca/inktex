@@ -485,7 +485,7 @@ class InkForgeDataset(Dataset):
         *,
         cfg: InkForgeConfig | None = None,
         augment: bool = True,
-        input_noise_std: float = 0.015,
+        input_noise_std: float = 0.030,
         source_weights: dict[str, float] | None = None,
     ):
         self.split_dir = Path(cache_dir) / split
@@ -581,14 +581,19 @@ class InkForgeDataset(Dataset):
             in_dy = target_dy[:-1].copy()
             in_ax = np.clip(xy[1:, 0], -self.cfg.abs_x_clip, self.cfg.abs_x_clip)
             in_ay = np.clip(xy[1:, 1], -self.cfg.abs_y_clip, self.cfg.abs_y_clip)
-            # Exposure-bias noise injection on decoder inputs during training!
+            # Exposure-bias noise injection on decoder inputs during training
+            # (step jitter + small per-stroke cumulative drift so autoregressive generation stays stable!)
             if self.augment and self.input_noise_std > 0:
                 noise_x = rng.normal(0.0, self.input_noise_std, size=in_dx.shape).astype(np.float32)
                 noise_y = rng.normal(0.0, self.input_noise_std, size=in_dy.shape).astype(np.float32)
+                # Smooth cumulative position drift across strokes mimics autoregressive drift
+                stroke_starts = (target_pen[:-1] == 1).astype(np.float32)
+                drift_x = np.cumsum(stroke_starts * rng.normal(0.0, self.input_noise_std * 0.75, size=in_dx.shape).astype(np.float32))
+                drift_y = np.cumsum(stroke_starts * rng.normal(0.0, self.input_noise_std * 0.75, size=in_dy.shape).astype(np.float32))
                 in_dx += noise_x
                 in_dy += noise_y
-                in_ax = np.clip(in_ax + noise_x, -self.cfg.abs_x_clip, self.cfg.abs_x_clip)
-                in_ay = np.clip(in_ay + noise_y, -self.cfg.abs_y_clip, self.cfg.abs_y_clip)
+                in_ax = np.clip(in_ax + noise_x + drift_x, -self.cfg.abs_x_clip, self.cfg.abs_x_clip)
+                in_ay = np.clip(in_ay + noise_y + drift_y, -self.cfg.abs_y_clip, self.cfg.abs_y_clip)
 
             stroke_in[1:, 0] = in_dx
             stroke_in[1:, 1] = in_dy
@@ -597,7 +602,9 @@ class InkForgeDataset(Dataset):
             stroke_in[1:, 4] = (target_pen[:-1] == 0).astype(np.float32)
             stroke_in[1:, 5] = (target_pen[:-1] == 1).astype(np.float32)
 
-        # Style reference strokes: prefer a DIFFERENT expression from the SAME writer!
+        # Style reference strokes: STRICTLY from a DIFFERENT equation by the SAME named writer!
+        # Writerless / single-sample rows get empty style_strokes (style_mask = all True -> exact z = 0)
+        # so the Style Encoder can NEVER leak the target equation's own strokes!
         wid = int(self.writer_ids[idx])
         style_strokes: list[np.ndarray]
         if wid in self.writer_peers:
@@ -607,15 +614,7 @@ class InkForgeDataset(Dataset):
                 peer_idx = int(peers[(int(np.searchsorted(peers, idx)) + 1) % len(peers)])
             style_strokes = self._get_raw_strokes(peer_idx)
         else:
-            # Single-sample writer: take strokes from self with 40% random stroke dropout so style can't copy layout
-            self_strokes = unpack_points_to_strokes(xy.astype(np.float64), pen.astype(np.uint8))
-            if self.augment and len(self_strokes) > 3:
-                keep_n = max(2, int(round(len(self_strokes) * float(rng.uniform(0.45, 0.85)))))
-                chosen = rng.choice(len(self_strokes), size=keep_n, replace=False)
-                chosen.sort()
-                style_strokes = [self_strokes[int(i)] for i in chosen]
-            else:
-                style_strokes = self_strokes
+            style_strokes = []
 
         if self.augment and style_strokes:
             style_strokes = warp_raw_strokes(

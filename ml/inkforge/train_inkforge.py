@@ -22,6 +22,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch import Tensor
 from torch.utils.data import DataLoader, Sampler
 
 ML_ROOT = Path(__file__).resolve().parents[1]
@@ -119,9 +120,10 @@ def evaluate_val(
     device: torch.device,
     *,
     max_batches: int = 40,
+    guided_attn_weight: float = 4.0,
 ) -> dict[str, float]:
     model.eval()
-    totals = {"loss": 0.0, "mdn_loss": 0.0, "pen_loss": 0.0, "kl_raw": 0.0, "pen_acc": 0.0}
+    totals = {"loss": 0.0, "mdn_loss": 0.0, "pen_loss": 0.0, "guided_loss": 0.0, "kl_raw": 0.0, "pen_acc": 0.0}
     n = 0
     for batch in val_loader:
         if n >= max_batches:
@@ -138,8 +140,9 @@ def evaluate_val(
                 style_points=batch["style_points"],
                 style_aspect=batch["style_aspect"],
                 style_mask=batch["style_mask"],
-                kl_weight=0.015,
+                kl_weight=0.025,
                 style_drop_prob=0.0,
+                guided_attn_weight=guided_attn_weight,
             )
         for k in totals:
             totals[k] += float(out[k].item())
@@ -148,9 +151,41 @@ def evaluate_val(
 
 
 @torch.inference_mode()
+def _extract_named_writer_preview_styles(
+    model: InkForgeModel,
+    dataset: InkForgeDataset,
+    count: int,
+    device: torch.device,
+) -> Tensor:
+    """Extract real named-writer `mu_z` vectors for preview rendering (zero N(0, I) drift)."""
+    peer_wids = sorted(dataset.writer_peers.keys())
+    if not peer_wids:
+        return torch.zeros((count, model.cfg.style_dim), device=device, dtype=torch.float32)
+
+    orig_aug = dataset.augment
+    dataset.augment = False
+    try:
+        items = []
+        for i in range(count):
+            wid = peer_wids[(i * 17) % len(peer_wids)]
+            sample_idx = int(dataset.writer_peers[wid][0])
+            items.append(dataset[sample_idx])
+        batch = collate_inkforge_batch(items, pad_id=model.cfg.pad_id)
+        sp = batch["style_points"].to(device)
+        sa = batch["style_aspect"].to(device)
+        sm = batch["style_mask"].to(device)
+        with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            _, mu, _ = model.encode_style(sp, sa, sm, sample=False)
+        return mu.float()
+    finally:
+        dataset.augment = orig_aug
+
+
+@torch.inference_mode()
 def render_preview_sheets(
     model: InkForgeModel,
     tokenizer: InkForgeTokenizer,
+    style_ref_ds: InkForgeDataset,
     out_dir: Path,
     step: int,
     device: torch.device,
@@ -162,14 +197,19 @@ def render_preview_sheets(
     for i, e in enumerate(encoded):
         tok_t[i, : len(e)] = torch.tensor(e, dtype=torch.long, device=device)
 
-    gen = torch.Generator(device=device).manual_seed(1337)
-    style_z = torch.randn((len(encoded), model.cfg.style_dim), generator=gen, device=device)
+    zero_z = torch.zeros((len(encoded), model.cfg.style_dim), device=device, dtype=torch.float32)
+    writer_z = _extract_named_writer_preview_styles(model, style_ref_ds, len(encoded), device)
 
-    for tag, temp in (("neat", 0.35), ("natural", 0.55)):
+    configs = (
+        ("neutral_z0", zero_z, 0.35),
+        ("writer_neat", writer_z, 0.35),
+        ("writer_natural", writer_z, 0.50),
+    )
+    for tag, z_in, temp in configs:
         with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
             strokes_list = model.generate_batch(
                 tok_t,
-                style_z=style_z,
+                style_z=z_in,
                 temperature=temp,
                 pen_temperature=0.70,
                 max_steps=420,
@@ -195,11 +235,11 @@ def export_writer_style_bank(
     max_writers: int = 5000,
     batch_size: int = 128,
 ) -> Path:
-    """Extract real human writer `mu_z` vectors from training samples for realistic overnight sampling."""
+    """Extract real human writer `mu_z` vectors strictly from named multi-sample writers."""
     model.eval()
     rng = np.random.default_rng(2026)
-    # Prefer mathwriting + crohme + iamondo full expressions for rich style vectors
-    eligible = np.where(dataset.source_ids <= 2)[0]
+    peer_wids = set(dataset.writer_peers.keys())
+    eligible = np.array([i for i, wid in enumerate(dataset.writer_ids.tolist()) if wid in peer_wids], dtype=np.int64)
     if len(eligible) == 0:
         eligible = np.arange(len(dataset))
     chosen = rng.choice(eligible, size=min(max_writers, len(eligible)), replace=False)
@@ -362,7 +402,7 @@ def train(args: argparse.Namespace) -> None:
     log_path = out_dir / "metrics.jsonl"
     t0 = time.perf_counter()
     train_iter = iter(train_loader)
-    running = {"loss": 0.0, "mdn_loss": 0.0, "pen_loss": 0.0, "kl_raw": 0.0, "pen_acc": 0.0}
+    running = {"loss": 0.0, "mdn_loss": 0.0, "pen_loss": 0.0, "guided_loss": 0.0, "kl_raw": 0.0, "pen_acc": 0.0}
     running_n = 0
 
     for step in range(start_step + 1, args.total_steps + 1):
@@ -394,6 +434,8 @@ def train(args: argparse.Namespace) -> None:
                     kl_weight=kl_w,
                     free_bits=args.free_bits,
                     style_drop_prob=args.style_drop_prob,
+                    guided_attn_weight=args.guided_attn_weight,
+                    guided_attn_sigma=args.guided_attn_sigma,
                 )
                 loss = out["loss"] / float(args.grad_accum)
             loss.backward()
@@ -415,7 +457,7 @@ def train(args: argparse.Namespace) -> None:
             print(
                 f"[step {step:6d}/{args.total_steps}] "
                 f"loss={avg['loss']:.3f} mdn={avg['mdn_loss']:.3f} pen={avg['pen_loss']:.3f} "
-                f"pen_acc={avg['pen_acc']*100:.1f}% kl={avg['kl_raw']:.1f} "
+                f"guide={avg['guided_loss']:.4f} pen_acc={avg['pen_acc']*100:.1f}% kl={avg['kl_raw']:.1f} "
                 f"lr={lr:.2e} ({sps:.2f} step/s, ETA {eta_min:.1f}m)",
                 flush=True,
             )
@@ -425,17 +467,22 @@ def train(args: argparse.Namespace) -> None:
             running_n = 0
 
         if step == 500 or step % args.eval_every == 0 or step == args.total_steps:
-            val_metrics = evaluate_val(ema_model, val_loader, device)
+            val_metrics = evaluate_val(
+                ema_model,
+                val_loader,
+                device,
+                guided_attn_weight=args.guided_attn_weight,
+            )
             print(
                 f"  >>> [VAL step {step:6d}] mdn={val_metrics['mdn_loss']:.4f} "
-                f"pen={val_metrics['pen_loss']:.4f} pen_acc={val_metrics['pen_acc']*100:.2f}% "
-                f"kl={val_metrics['kl_raw']:.1f}",
+                f"pen={val_metrics['pen_loss']:.4f} guide={val_metrics['guided_loss']:.4f} "
+                f"pen_acc={val_metrics['pen_acc']*100:.2f}% kl={val_metrics['kl_raw']:.1f}",
                 flush=True,
             )
             with log_path.open("a", encoding="utf-8") as lf:
                 lf.write(json.dumps({"step": step, "split": "val", **val_metrics}) + "\n")
 
-            render_preview_sheets(ema_model, tokenizer, out_dir, step, device)
+            render_preview_sheets(ema_model, tokenizer, train_ds, out_dir, step, device)
 
             save_checkpoint(
                 out_dir / "latest.pt",
@@ -484,10 +531,12 @@ def main() -> None:
     parser.add_argument("--kl-warmup-steps", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=4.0e-4)
     parser.add_argument("--weight-decay", type=float, default=0.02)
-    parser.add_argument("--kl-weight", type=float, default=0.015)
-    parser.add_argument("--free-bits", type=float, default=0.25)
-    parser.add_argument("--style-drop-prob", type=float, default=0.10)
-    parser.add_argument("--input-noise", type=float, default=0.015)
+    parser.add_argument("--kl-weight", type=float, default=0.025)
+    parser.add_argument("--free-bits", type=float, default=0.15)
+    parser.add_argument("--style-drop-prob", type=float, default=0.30)
+    parser.add_argument("--input-noise", type=float, default=0.030)
+    parser.add_argument("--guided-attn-weight", type=float, default=4.0)
+    parser.add_argument("--guided-attn-sigma", type=float, default=0.24)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=4)

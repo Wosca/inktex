@@ -87,9 +87,18 @@ def test_model_forward_backward_and_kv_generate(tmp_path: Path):
             style_points=style_points,
             style_aspect=style_aspect,
             style_mask=style_mask,
+            guided_attn_weight=4.0,
         )
     assert torch.isfinite(out["loss"])
+    assert torch.isfinite(out["guided_loss"]) and float(out["guided_loss"].item()) > 0.0
     out["loss"].backward()
+
+    # Verify empty style_mask produces EXACT z=0 even in training mode (zero N(0,I) noise injection!)
+    model.train()
+    empty_mask = torch.ones((b, cfg.style_max_strokes), dtype=torch.bool, device=device)
+    z_empty, mu_empty, _ = model.encode_style(style_points, style_aspect, empty_mask, sample=True)
+    assert float(z_empty.abs().max().item()) == 0.0
+    assert float(mu_empty.abs().max().item()) == 0.0
 
     model.eval()
     with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):

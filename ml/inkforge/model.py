@@ -286,7 +286,8 @@ class StrokeDecoderBlock(nn.Module):
         sin: Tensor,
         past_kv: tuple[Tensor, Tensor] | None = None,
         cross_kv: tuple[Tensor, Tensor] | None = None,
-    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        need_cross_attn: bool = False,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor], Tensor | None]:
         b, t, d = x.shape
         gamma1, beta1, gamma3, beta3 = self.style_film(style_z).chunk(4, dim=-1)
 
@@ -319,19 +320,30 @@ class StrokeDecoderBlock(nn.Module):
             k2, v2 = cross_kv
         else:
             k2, v2 = self.project_cross_kv(memory)
-        cross_mask = (~memory_pad_mask)[:, None, None, :]
-        y2 = F.scaled_dot_product_attention(
-            q2, k2, v2,
-            attn_mask=cross_mask,
-            dropout_p=self.dropout_p if self.training else 0.0,
-        )
+
+        cross_attn_weights: Tensor | None = None
+        if need_cross_attn:
+            scale = 1.0 / math.sqrt(self.head_dim)
+            scores = torch.matmul(q2.float(), k2.float().transpose(-2, -1)) * scale  # [B, H, T, 1+L]
+            scores = scores.masked_fill(memory_pad_mask[:, None, None, :], -1e4)
+            attn_probs = torch.softmax(scores, dim=-1)
+            cross_attn_weights = attn_probs
+            attn_drop = F.dropout(attn_probs, p=self.dropout_p, training=self.training)
+            y2 = torch.matmul(attn_drop.to(v2.dtype), v2)
+        else:
+            cross_mask = (~memory_pad_mask)[:, None, None, :]
+            y2 = F.scaled_dot_product_attention(
+                q2, k2, v2,
+                attn_mask=cross_mask,
+                dropout_p=self.dropout_p if self.training else 0.0,
+            )
         y2 = y2.transpose(1, 2).contiguous().view(b, t, d)
         x = x + self.drop(self.out2(y2))
 
         # 3. Style-modulated SwiGLU FFN
         h3 = self.norm3(x) * (1.0 + gamma3.unsqueeze(1)) + beta3.unsqueeze(1)
         x = x + self.ff(h3)
-        return x, new_kv
+        return x, new_kv, cross_attn_weights
 
 
 # ---------------------------------------------------------------------------
@@ -379,11 +391,12 @@ class InkForgeModel(nn.Module):
         sample: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
         mu, logvar = self.style_encoder(style_points, style_aspect, style_mask)
+        has_any = (~style_mask).any(dim=1, keepdim=True).to(mu.dtype)
         if sample and self.training:
             std = torch.exp(0.5 * logvar)
-            z = mu + std * torch.randn_like(std)
+            z = (mu + std * torch.randn_like(std)) * has_any
         else:
-            z = mu
+            z = mu * has_any
         return z, mu, logvar
 
     def encode_memory(self, token_ids: Tensor, style_z: Tensor) -> tuple[Tensor, Tensor]:
@@ -401,13 +414,53 @@ class InkForgeModel(nn.Module):
         memory: Tensor,
         mem_mask: Tensor,
         style_z: Tensor,
-    ) -> Tensor:
+        *,
+        return_guided_attns: bool = False,
+    ) -> tuple[Tensor, list[Tensor]]:
         t = stroke_in_feats.shape[1]
         x = self.stroke_in(stroke_in_feats)
         cos, sin = self.dec_rope(t, offset=0)
-        for blk in self.dec_blocks:
-            x, _ = blk(x, memory, mem_mask, style_z, cos, sin)
-        return self.mdn_head(self.dec_norm(x))
+        guided_attns: list[Tensor] = []
+        guide_start = max(0, len(self.dec_blocks) // 4)
+        for idx, blk in enumerate(self.dec_blocks):
+            want = return_guided_attns and (idx >= guide_start)
+            x, _, attn_w = blk(x, memory, mem_mask, style_z, cos, sin, need_cross_attn=want)
+            if attn_w is not None:
+                guided_attns.append(attn_w)
+        return self.mdn_head(self.dec_norm(x)), guided_attns
+
+    @staticmethod
+    def _guided_diagonal_attn_loss(
+        attn_list: list[Tensor],
+        stroke_mask: Tensor,    # [B, T] bool (True = valid)
+        text_pad_mask: Tensor,  # [B, L] bool (True = padded)
+        *,
+        sigma: float = 0.24,
+    ) -> Tensor:
+        """Soft diagonal alignment guidance on half of cross-attention heads (leaves other half free for 2D jumps)."""
+        if not attn_list:
+            return torch.zeros((), device=stroke_mask.device, dtype=torch.float32)
+        b, t = stroke_mask.shape
+        l = text_pad_mask.shape[1]
+        t_lens = stroke_mask.float().sum(dim=1).clamp(min=2.0) - 1.0  # [B]
+        l_lens = (~text_pad_mask).float().sum(dim=1).clamp(min=2.0) - 1.0  # [B]
+        t_pos = torch.arange(t, device=stroke_mask.device, dtype=torch.float32)[None, :, None] / t_lens[:, None, None]
+        l_pos = torch.arange(l, device=stroke_mask.device, dtype=torch.float32)[None, None, :] / l_lens[:, None, None]
+        # 0 along diagonal (t/T == l/L), smoothly -> 1 far off diagonal (2D-friendly bandwidth sigma=0.24)
+        w_guide = 1.0 - torch.exp(-((t_pos - l_pos) ** 2) / (2.0 * sigma * sigma))  # [B, T, L]
+        valid = stroke_mask[:, :, None] & (~text_pad_mask)[:, None, :]  # [B, T, L]
+        w_masked = (w_guide * valid.float()).unsqueeze(1)  # [B, 1, T, L]
+
+        n_heads = attn_list[0].shape[1]
+        n_guided = max(1, n_heads // 2)
+        denom = (stroke_mask.float().sum() * float(n_guided)).clamp(min=1.0)
+
+        total = torch.zeros((), device=stroke_mask.device, dtype=torch.float32)
+        for attn in attn_list:
+            # Skip index 0 (style token); guide heads 0..n_guided-1 over the L LaTeX tokens
+            a_text = attn[:, :n_guided, :, 1:].float()
+            total = total + (a_text * w_masked).sum() / denom
+        return total / float(len(attn_list))
 
     def split_mdn_params(self, raw: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Split raw head output `[B, T, 6M+3]` strictly in float32 for numerical stability."""
@@ -434,19 +487,28 @@ class InkForgeModel(nn.Module):
         style_points: Tensor,     # [B, S, P, 8]
         style_aspect: Tensor,     # [B, S, 4]
         style_mask: Tensor,       # [B, S] bool (True = padded)
-        kl_weight: float = 0.01,
-        free_bits: float = 0.25,
-        style_drop_prob: float = 0.10,
+        kl_weight: float = 0.025,
+        free_bits: float = 0.15,
+        style_drop_prob: float = 0.30,
+        guided_attn_weight: float = 4.0,
+        guided_attn_sigma: float = 0.24,
     ) -> dict[str, Tensor]:
         z, mu, logvar = self.encode_style(style_points, style_aspect, style_mask, sample=True)
+        has_style = (~style_mask).any(dim=1)  # [B] bool
 
-        # Occasional classifier-free style dropout so z=0 works cleanly as neutral handwriting
+        # Classifier-free style dropout on styled rows so LaTeX text always dominates over z
         if self.training and style_drop_prob > 0:
             keep = (torch.rand((z.shape[0], 1), device=z.device) >= style_drop_prob).to(z.dtype)
             z = z * keep
 
         memory, mem_mask = self.encode_memory(token_ids, z)
-        raw = self.decode_features(stroke_inputs, memory, mem_mask, z)
+        raw, guided_attns = self.decode_features(
+            stroke_inputs,
+            memory,
+            mem_mask,
+            z,
+            return_guided_attns=(guided_attn_weight > 0),
+        )
         pi_logits, mu_x, mu_y, sx, sy, rho, pen_logits = self.split_mdn_params(raw)
 
         # Bivariate Gaussian Mixture NLL in float32
@@ -481,13 +543,27 @@ class InkForgeModel(nn.Module):
         ).view_as(valid_f)
         pen_loss = (pen_ce * valid_f).sum() / valid_f.sum().clamp(min=1.0)
 
-        # Free-bits KL divergence per latent dimension (prevents posterior collapse!)
-        kl_per_dim = -0.5 * (1.0 + logvar.float() - mu.float().pow(2) - logvar.float().exp())  # [B, D_z]
-        kl_dim_mean = kl_per_dim.mean(dim=0)  # [D_z]
-        kl_loss = torch.clamp(kl_dim_mean, min=free_bits).sum()
-        kl_raw = kl_dim_mean.sum()
+        # Guided diagonal cross-attention loss (prevents symbol repetition & skipping)
+        text_pad_mask = token_ids.eq(self.cfg.pad_id)
+        guided_loss = (
+            self._guided_diagonal_attn_loss(guided_attns, stroke_mask, text_pad_mask, sigma=guided_attn_sigma)
+            if guided_attn_weight > 0
+            else torch.zeros((), device=mdn_loss.device, dtype=torch.float32)
+        )
 
-        total_loss = mdn_loss + 1.5 * pen_loss + kl_weight * kl_loss
+        # Free-bits KL divergence strictly over rows that actually have real peer writer strokes
+        if has_style.any():
+            kl_per_dim = -0.5 * (
+                1.0 + logvar[has_style].float() - mu[has_style].float().pow(2) - logvar[has_style].float().exp()
+            )
+            kl_dim_mean = kl_per_dim.mean(dim=0)
+            kl_loss = torch.clamp(kl_dim_mean, min=free_bits).sum()
+            kl_raw = kl_dim_mean.sum()
+        else:
+            kl_loss = torch.zeros((), device=mdn_loss.device, dtype=torch.float32)
+            kl_raw = torch.zeros((), device=mdn_loss.device, dtype=torch.float32)
+
+        total_loss = mdn_loss + 1.5 * pen_loss + guided_attn_weight * guided_loss + kl_weight * kl_loss
 
         with torch.no_grad():
             pen_pred = pen_logits.argmax(dim=-1)
@@ -497,6 +573,7 @@ class InkForgeModel(nn.Module):
             "loss": total_loss,
             "mdn_loss": mdn_loss.detach(),
             "pen_loss": pen_loss.detach(),
+            "guided_loss": guided_loss.detach(),
             "kl_raw": kl_raw.detach(),
             "pen_acc": pen_acc.detach(),
         }
@@ -551,7 +628,7 @@ class InkForgeModel(nn.Module):
             x = self.stroke_in(cur_feat)
             cos, sin = self.dec_rope(1, offset=step)
             for idx, blk in enumerate(self.dec_blocks):
-                x, past_kvs[idx] = blk(
+                x, past_kvs[idx], _ = blk(
                     x,
                     memory,
                     mem_mask,
@@ -560,6 +637,7 @@ class InkForgeModel(nn.Module):
                     sin,
                     past_kv=past_kvs[idx],
                     cross_kv=cross_kvs[idx],
+                    need_cross_attn=False,
                 )
             raw = self.mdn_head(self.dec_norm(x))
             pi_logits, mu_x, mu_y, sx, sy, rho, pen_logits = self.split_mdn_params(raw)
