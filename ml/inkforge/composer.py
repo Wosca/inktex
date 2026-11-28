@@ -534,6 +534,54 @@ def _decompose_big_frac_tree(
                 items.append(s_node)
             return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
 
+    # 2b. Tall/long parenthesized group containing `\frac` or >= 12 tokens -> `delim("(", ")", body)`!
+    if len(toks) >= 16 and "(" in s and ")" in s and (has_frac or len(toks) >= 20):
+        bdepth = 0
+        pdepth = 0
+        open_p = -1
+        found_paren: tuple[int, str, int] | None = None
+        for idx_p, ch in enumerate(s):
+            if ch == "{" and (idx_p == 0 or s[idx_p - 1] != "\\"):
+                bdepth += 1
+            elif ch == "}" and (idx_p == 0 or s[idx_p - 1] != "\\"):
+                bdepth = max(0, bdepth - 1)
+            elif bdepth == 0 and ch == "(":
+                if pdepth == 0:
+                    open_p = idx_p
+                pdepth += 1
+            elif bdepth == 0 and ch == ")" and pdepth > 0:
+                pdepth -= 1
+                if pdepth == 0 and open_p >= 0:
+                    inner_p = s[open_p + 1 : idx_p].strip()
+                    if r"\frac" in inner_p or len(tokenize_inkforge(inner_p)) >= 12:
+                        found_paren = (open_p, inner_p, idx_p + 1)
+                        break
+                    open_p = -1
+        if found_paren is not None:
+            p_start, inner_p, p_end = found_paren
+            prefix = s[:p_start].strip()
+            suffix = s[p_end:].strip()
+            # Never detach a trailing exponent/subscript like `(1 + 1/x)^x` from its parenthesized base!
+            if not suffix.startswith(("^", "_")) and (
+                prefix or suffix or r"\frac" in inner_p or len(tokenize_inkforge(inner_p)) >= 16
+            ):
+                items = []
+                if prefix:
+                    p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                    if p_node is None:
+                        return None
+                    items.append(p_node)
+                in_node = _decompose_big_frac_tree(inner_p, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                if in_node is None:
+                    return None
+                items.append({"op": "delim", "left": "(", "right": ")", "body": in_node})
+                if suffix:
+                    s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                    if s_node is None:
+                        return None
+                    items.append(s_node)
+                return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
+
     # 3. Very long expression (`>= 20` tokens) -> split cleanly at top-level `+` / `-`!
     if len(toks) >= 20:
         pm_split = _find_top_level_split(s, ("+", "-"))

@@ -15,6 +15,7 @@ import argparse
 import json
 from pathlib import Path
 import random
+import re
 import sys
 import time
 from typing import Any
@@ -44,10 +45,45 @@ from tokenizer.latex_tokenizer import tokenize_latex  # noqa: E402
 from v2.eval_v2 import _safe_std_v2, load_v2_checkpoint  # noqa: E402
 
 
-def _is_dangling_prefix_cell(latex: str) -> bool:
-    """Short operator-bounded chunk cells like `f(x) =`, `1 +`, `= f(x)`, or `+ 2xy`."""
+_ZERO_COUNT_FUNC_RE = re.compile(
+    r"\\(ln|exp|det|max|min|cot|sec|csc|sinh|cosh|tanh|arcsin|arccos|arctan|arg|deg|dim|gcd|ker)(?![a-zA-Z])"
+)
+_SINGLE_TOKEN_BRACE_RE = re.compile(r"([_^])\{\s*(\\[a-zA-Z]+|[A-Za-z0-9])\s*\}")
+_SINGLE_CHAR_AMBIG_MAP = {
+    "C": "c", "K": "k", "O": "o", "P": "p", "S": "s",
+    "V": "v", "W": "w", "X": "x", "Y": "y", "Z": "z",
+    r"\Pi": r"\pi",
+}
+
+
+def normalize_cell_for_inkforge(latex: str) -> str:
+    """Map zero-training-count tokens & redundant single-token braces to InkForge v2's trained format.
+
+    Only used when conditioning InkForge's text encoder — the original canonical LaTeX is ALWAYS preserved
+    for the InkTeX v2 judge and the saved dataset label!
+    """
     s = latex.strip()
-    return len(tokenize_inkforge(s)) <= 12 and (s.endswith(("=", "+", "-")) or s.startswith(("=", "+", "-")))
+    # Zero-count accents -> exact trained visual equivalents (`\overline`: 17,289, `\hat`: 21,152, `\tilde`: 12,328)
+    s = re.sub(r"\\bar(?![a-zA-Z])", r"\\overline", s)
+    s = re.sub(r"\\widehat(?![a-zA-Z])", r"\\hat", s)
+    s = re.sub(r"\\widetilde(?![a-zA-Z])", r"\\tilde", s)
+    # Zero-count named functions -> plain roman text letters (matches `inkforge_data_v2`, e.g. `ln(x+1)`)
+    s = _ZERO_COUNT_FUNC_RE.sub(r"\\text{\1}", s)
+    # Unwrap zero-count styling wrappers (`\mathbf{x}` -> `x`, `\boxed{x}` -> `x`)
+    s = re.sub(r"\\(?:mathbf|boxed)\s*\{([^{}]*)\}", r"\1", s)
+    s = s.replace("~", " ")
+    # Strip redundant braces around single-token scripts (`^{\infty}` -> `^\infty`, `^{n}` -> `^n`)
+    # matching Standardizer v2's exact format in `inkforge_data_v2`!
+    s = _SINGLE_TOKEN_BRACE_RE.sub(r"\1\2", s)
+    return s
+
+
+def _is_dangling_prefix_cell(latex: str) -> bool:
+    """Short operator-bounded chunk cells like `f(x) =`, `1 +`, `-b \\pm`, `= f(x)`, or `+ 2xy`."""
+    s = latex.strip()
+    return len(tokenize_inkforge(s)) <= 12 and (
+        s.endswith(("=", "+", "-", r"\pm", r"\mp")) or s.startswith(("=", "+", "-", r"\pm", r"\mp"))
+    )
 
 
 def _prefix_tokens_match(target_latex: str, pred_latex: str) -> bool:
@@ -58,7 +94,7 @@ def _prefix_tokens_match(target_latex: str, pred_latex: str) -> bool:
         return False
     if p_toks == t_toks:
         return True
-    ops = ("=", "+", "-")
+    ops = ("=", "+", "-", r"\pm", r"\mp")
     t_core = list(t_toks)
     p_core = list(p_toks)
     if t_core and t_core[-1] in ops:
@@ -70,6 +106,15 @@ def _prefix_tokens_match(target_latex: str, pred_latex: str) -> bool:
     if p_core and p_core[0] in ops:
         p_core = p_core[1:]
     return bool(t_core) and p_core == t_core
+
+
+def _single_token_case_match(target_latex: str, pred_latex: str) -> bool:
+    """Isolated 1-glyph cells (`c`, `x`, `\\pi`) lack x-height context vs `C`, `X`, `\\Pi`."""
+    t_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(target_latex)))
+    p_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(pred_latex)))
+    if len(t_toks) != 1 or len(p_toks) != 1:
+        return False
+    return _SINGLE_CHAR_AMBIG_MAP.get(t_toks[0], t_toks[0]) == _SINGLE_CHAR_AMBIG_MAP.get(p_toks[0], p_toks[0])
 
 
 @torch.inference_mode()
@@ -97,7 +142,7 @@ def generate_verified_cells(
     out_strokes: list[list[np.ndarray]] = [[] for _ in range(n)]
     cell_ok: list[bool] = [False] * n
     pending = list(range(n))
-    all_enc = [tokenizer.encode(c, max_len=model.cfg.max_text_len) for c in flat_cells]
+    all_enc = [tokenizer.encode(normalize_cell_for_inkforge(c), max_len=model.cfg.max_text_len) for c in flat_cells]
 
     for attempt in range(max_retries + 1):
         if not pending:
@@ -168,7 +213,11 @@ def generate_verified_cells(
             )
             for pos, (v_ok, pred_tex, _reason) in zip(geom_pass_pos, verdicts):
                 idx = pending[pos]
-                if v_ok or (_is_dangling_prefix_cell(flat_cells[idx]) and _prefix_tokens_match(flat_cells[idx], pred_tex)):
+                if (
+                    v_ok
+                    or (_is_dangling_prefix_cell(flat_cells[idx]) and _prefix_tokens_match(flat_cells[idx], pred_tex))
+                    or _single_token_case_match(flat_cells[idx], pred_tex)
+                ):
                     out_strokes[idx] = cand_strokes[pos]
                     cell_ok[idx] = True
 

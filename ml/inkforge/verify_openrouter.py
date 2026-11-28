@@ -233,11 +233,10 @@ def call_openrouter_audit_grid(
     last_err: Exception | None = None
     for attempt in range(max_retries):
         model_id = models[attempt % len(models)]
-        payload = {
+        payload: dict[str, Any] = {
             "model": model_id,
             "temperature": 0.0,
             "max_tokens": 2200,
-            "reasoning": {"effort": "none"},
             "messages": [
                 {
                     "role": "user",
@@ -248,6 +247,8 @@ def call_openrouter_audit_grid(
                 }
             ],
         }
+        if model_id != "openrouter/free":
+            payload["reasoning"] = {"effort": "none"}
         req = urllib.request.Request(
             OPENROUTER_URL,
             data=json.dumps(payload).encode("utf-8"),

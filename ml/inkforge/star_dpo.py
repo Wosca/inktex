@@ -263,8 +263,11 @@ def _canonicalize_judge_latex(latex: str) -> str:
     s = latex.strip()
     s = re.sub(r"\\(?:mathrm|operatorname|text)\s*\{\s*Pr\s*\}", r"\\Pr", s)
     s = s.replace(r"\dots", r"\ldots")
-    # Fold bare function names emitted without backslash by InkTeX v2 (e.g. `sin x` -> `\sin x`)
+    # Visually identical handwritten overbar aliases (`\bar{A}` vs `\overline{A}`)
+    s = re.sub(r"\\overline(?![a-zA-Z])", r"\\bar", s)
+    # Fold bare function names emitted without backslash by InkTeX v2 (e.g. `sin x` -> `\sin x`, `sinx` -> `\sin x`)
     s = re.sub(r"(?<!\\)\b(sin|cos|tan|cot|sec|csc|ln|log|exp|lim|det|max|min)\b", r"\\\1", s)
+    s = re.sub(r"(?<!\\)(?<![a-zA-Z])(sin|cos|tan|cot|sec|csc|ln|log|exp)([xyztu])\b", r"\\\1 \2", s)
     return s
 
 

@@ -418,3 +418,35 @@ def test_openrouter_blind_grid_and_verdict_parser():
     parsed = parse_vlm_verdict_json(raw, count=2)
     assert parsed[1]["ok"] is True
     assert parsed[2]["ok"] is False and "missing" in parsed[2]["reason"]
+
+
+def test_zero_count_conditioning_and_judge_canonicalizer():
+    from inkforge.generate_overnight import (
+        _is_dangling_prefix_cell,
+        _prefix_tokens_match,
+        _single_token_case_match,
+        normalize_cell_for_inkforge,
+    )
+    from inkforge.star_dpo import _canonicalize_judge_latex
+
+    tok = InkForgeTokenizer.default()
+    assert normalize_cell_for_inkforge(r"\bar{A} + \ln(x+1) + \sum_{k=0}^{n} x^{\infty}") == (
+        r"\overline{A} + \text{ln}(x+1) + \sum_{k=0}^n x^\infty"
+    )
+    assert _canonicalize_judge_latex(r"\frac{sinx}{x}") == r"\frac{\sin x}{x}"
+    assert _canonicalize_judge_latex(r"P(B|\overline{A})") == r"P(B|\bar{A})"
+    assert _is_dangling_prefix_cell(r"-b \pm")
+    assert _prefix_tokens_match(r"-b \pm", "-b")
+    assert _single_token_case_match("c", "C")
+    assert _single_token_case_match(r"\pi", r"\Pi")
+    assert not _single_token_case_match("cx", "CX")
+
+    # Parenthesized compound fraction decomposition (wave equation)
+    wave = parse_unimer_prompt(
+        r"\frac{\partial^2 u}{\partial t^2} = c^2 (\frac{\partial^2 u}{\partial x^2} + \frac{\partial^2 u}{\partial y^2})",
+        tok,
+    )
+    assert wave is not None and wave.kind == "tree" and len(wave.cells) >= 4
+    # Must NOT detach trailing exponent `^x` from parenthesized base `(1 + \frac{1}{x})^x`
+    lim_e = parse_unimer_prompt(r"\lim_{x \rightarrow \infty} (1 + \frac{1}{x})^x = e", tok)
+    assert lim_e is not None and all(not c.lstrip().startswith("^") for c in lim_e.cells)
