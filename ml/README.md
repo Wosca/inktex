@@ -72,6 +72,33 @@ python -m v2.verify_ipad_bundle \
 
 ---
 
+## InkForge v2 (`ml/inkforge/`)
+
+Writer-style-conditioned 62.7M Transformer-MDN math handwriting generator + recursive 2D equation composer + local InkTeX v2 atomic-cell verifier + blind VLM auditor. Download from GitHub Release [`v0.3.0-inkforge`](https://github.com/Wosca/inktex/releases/tag/v0.3.0-inkforge):
+
+```bash
+cd ml
+python download_checkpoints.py --model inkforge-v2         # -> ../checkpoints/inkforge_v2_release.pt
+python download_checkpoints.py --model inkforge-v2-styles  # -> ../checkpoints/inkforge_v2_writer_styles.npz
+
+# Generate InkTeX-verified multi-line / matrix / cases / STEM synthetic shards (`stroke-latex-v1`)
+python -m inkforge.generate_overnight \
+  --checkpoint ../checkpoints/inkforge_v2_release.pt \
+  --style-bank ../checkpoints/inkforge_v2_writer_styles.npz \
+  --judge-ckpt ../checkpoints/inktex_v2_release.pt \
+  --out-dir ./inkforge_synth \
+  --target-count 50000
+
+# Optional: blind VLM quality audit (Gemini free tier or OpenRouter) with 960x320 single-image recheck
+python -m inkforge.verify_openrouter \
+  --provider gemini \
+  --input ./inkforge_synth/inkforge_synth_00000.jsonl \
+  --out-verified ./inkforge_synth/verified_00000.jsonl \
+  --mode blind --tiles-per-call 3
+```
+
+---
+
 ## InkTeX v1 (`inktex-75m-stage26-best.pt`)
 
 Download the v1 checkpoint from GitHub Release [`v0.1.0-models`](https://github.com/Wosca/inktex/releases/tag/v0.1.0-models):

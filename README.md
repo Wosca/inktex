@@ -13,6 +13,10 @@
   - **Tier 2 (Hot-Swappable Ink-Only LoRA):** Adapts only `q/v/o` projections in stroke blocks `9–12` (`r=8`, `alpha=16`, **288 KB** `.inktexlora`) with zero model reload and zero vision/decoder drift.
   - **Tier 3 (Correction Capture & Export):** Save corrections directly on iPad, optionally enable instant exact-geometry caching, and export `corrections.jsonl` for fast `<60s` personal LoRA fine-tuning.
 
+- **InkForge v2 (62.7M Handwritten Math Stroke Generator, GitHub Release [`v0.3.0-inkforge`](https://github.com/Wosca/inktex/releases/tag/v0.3.0-inkforge)):**
+  - **Style-Conditioned Transformer-MDN:** Generates realistic online math handwriting strokes (`Δx, Δy, pen` 20-component MDN, monotonic Gaussian attention, text CFG, 658-writer latent bank) trained on 807k samples and post-trained with InkTeX-guided STaR + DPO.
+  - **Recursive 2D Composer & Dual Verifier:** Synthesizes multi-line derivations, matrices (`bmatrix`/`pmatrix`/`vmatrix`), piecewise `\begin{cases}`, nested fractions, and long STEM equations sharing a single consistent writer style `z`, verified per atomic cell by local InkTeX v2 and optionally audited blind via free Gemini (`gemini-3.5-flash-lite`) or OpenRouter vision models.
+
 ## Benchmark Results
 
 ### InkTeX v2 (Stage C Soup, GitHub Release [`v0.2.0-models`](https://github.com/Wosca/inktex/releases/tag/v0.2.0-models), Beam-5 + R2L `α=0.4`, Unmodified Ground Truth)
@@ -41,6 +45,7 @@ inktex/
 ├── export/           # v1 PyTorch (.pt) -> split KV-cached ONNX exporter & parity tests
 └── ml/               # Training, evaluation, ONNX v2 export, and personalization pipelines
     ├── configs/      # YAML configs for v1 and v2 training stages
+    ├── inkforge/     # InkForge v2 62.7M math handwriting generator, 2D composer, STaR+DPO & VLM auditor
     ├── v2/           # InkTeX v2 model, training, eval, ONNX/LoRA exporter, personalization
     └── tests/        # Unit tests
 ```

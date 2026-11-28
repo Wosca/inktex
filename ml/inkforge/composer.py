@@ -1164,7 +1164,10 @@ def _assemble_ink_node(
         bar_pad = float(rng.uniform(0.24, 0.46))
         bar_w = max(nw, dw, 0.9) + 2.0 * bar_pad
         v_gap_top = float(rng.uniform(0.28, 0.46))
-        v_gap_bot = float(rng.uniform(0.28, 0.46))
+        den_has_sqrt = (node["den"].get("op") == "sqrt") or any(
+            ch.get("op") == "sqrt" for ch in node["den"].get("items", []) if isinstance(ch, dict)
+        )
+        v_gap_bot = float(rng.uniform(0.44, 0.64) if den_has_sqrt else rng.uniform(0.28, 0.46))
         y_bar = nh + v_gap_top
 
         out: list[np.ndarray] = []

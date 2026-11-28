@@ -22,6 +22,18 @@ ARTIFACTS: dict[str, dict[str, str]] = {
         "sha256": "062f72cf8fcfa69c4890bf177495873178840bab2a0f25017f7063159c1720f3",
         "description": "InkTeX v2 5-graph FP16 ONNX bundle for iPadOS (173.0 MB zip / 199 MB unzipped)",
     },
+    "inkforge-v2": {
+        "tag": "v0.3.0-inkforge",
+        "filename": "inkforge_v2_release.pt",
+        "sha256": "2cdda54c73ac535d10c6f2ab33a0eedef0916ee6c2473fa1e6001c206fc36b57",
+        "description": "InkForge v2 (62.7M Stage 2.5 v2 STaR+DPO) handwritten math stroke generator checkpoint (239.3 MB)",
+    },
+    "inkforge-v2-styles": {
+        "tag": "v0.3.0-inkforge",
+        "filename": "inkforge_v2_writer_styles.npz",
+        "sha256": "d1615c7e7719085dcbe06074f05238827105dc89c83c9cc7e4620c25c9a1c331",
+        "description": "InkForge v2 658-writer real-human style latent bank (52 KB)",
+    },
     "v1": {
         "tag": "v0.1.0-models",
         "filename": "inktex-75m-stage26-best.pt",
@@ -102,7 +114,7 @@ def main() -> None:
         "--model",
         choices=tuple(ARTIFACTS.keys()),
         default="v2",
-        help="Artifact to download: v2 (PyTorch checkpoint), ipad-v2 (FP16 ONNX bundle), or v1 (legacy checkpoint)",
+        help="Artifact to download: v2, ipad-v2, inkforge-v2, inkforge-v2-styles, or v1",
     )
     parser.add_argument(
         "--output-dir",
