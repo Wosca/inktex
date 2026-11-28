@@ -311,90 +311,28 @@ def call_openrouter_single_recheck(
     timeout_s: int = 60,
     max_retries: int = 4,
 ) -> tuple[dict[str, Any], str]:
-    """Individual high-res (960x320) single-equation second-opinion audit on Pass-1 disagreements.
+    """Individual high-res (960x320) BLIND single-equation re-transcription on Pass-1 disagreements.
 
-    Uses a rotated secondary model (preferring a different model from Pass 1) to distinguish
-    Pass-1 OCR false rejections (e.g. misreading handwritten `e` as `\\emptyset`) from genuine
-    ink errors (missing symbols, wrong digits, garbled glyphs).
+    Re-renders ONLY the failed equation at full 960x320 resolution with zero neighboring tiles and
+    runs a blind transcription pass with the strongest vision model (`models[0]`) — eliminating both
+    multi-tile interference and target-prompt sycophancy!
     """
     png_bytes = render_blind_audit_grid([list(strokes)], cols=1, tile_w=960, tile_h=320)
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    prompt = (
-        "You are performing a strict high-resolution single-image audit of ONE handwritten math equation.\n"
-        f"Intended LaTeX: {target_latex}\n\n"
-        "Inspect ONLY the handwritten image against the Intended LaTeX character-by-character:\n"
-        "- Set ok=true if EVERY symbol, operator, exponent, subscript, bar, and parenthesis in the "
-        "Intended LaTeX is genuinely present and clearly legible as normal human handwriting "
-        "(accept normal handwritten aliases like w for \\omega, P for p, or \\triangle for \\Delta).\n"
-        "- Set ok=false if ANY symbol is missing, wrong (e.g. `0` instead of `r`, `2` instead of `z`, "
-        "`\\geq` instead of `>`, `t` instead of `\\ln`, missing `\\bar{A}`), duplicated, or illegible.\n"
-        'Return ONLY valid JSON: {"ok": true/false, "latex": "what you literally see", "reason": "short specific note"}'
+    verdicts, used_model = call_openrouter_audit_grid(
+        png_bytes,
+        [target_latex],
+        api_key,
+        models=models,
+        mode="blind",
+        timeout_s=timeout_s,
+        max_retries=max_retries,
     )
-    # Rotate so Pass 2 prefers the 2nd model in `models` for independent cross-model verification
-    rot_models = list(models[1:]) + list(models[:1]) if len(models) > 1 else list(models)
-    last_err: Exception | None = None
-    for attempt in range(max_retries):
-        model_id = rot_models[attempt % len(rot_models)]
-        payload = {
-            "model": model_id,
-            "temperature": 0.0,
-            "max_tokens": 900,
-            "reasoning": {"effort": "none"},
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    ],
-                }
-            ],
-        }
-        req = urllib.request.Request(
-            OPENROUTER_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/Wosca/inktex",
-                "X-Title": "InkForge Synthetic Data Single Recheck",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            msg = data["choices"][0]["message"]
-            content = (msg.get("content") or "").strip() or (msg.get("reasoning") or "").strip()
-            used_model = str(data.get("model", model_id))
-            # Parse single JSON object cleanly
-            text = content
-            m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-            if m:
-                text = m.group(1)
-            else:
-                s0, e0 = text.find("{"), text.rfind("}")
-                if s0 >= 0 and e0 > s0:
-                    text = text[s0 : e0 + 1]
-            try:
-                obj = json.loads(text)
-            except json.JSONDecodeError:
-                obj = json.loads(re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", text))
-            return {
-                "ok": bool(obj.get("ok", False)),
-                "latex": str(obj.get("latex", "")),
-                "reason": str(obj.get("reason", "")),
-            }, used_model
-        except urllib.error.HTTPError as e:
-            last_err = e
-            if e.code in (429, 502, 503, 504):
-                time.sleep(min(20.0, 2.0 * (attempt + 1)))
-                continue
-            raise
-        except Exception as e:
-            last_err = e
-            time.sleep(2.0 * (attempt + 1))
-    raise RuntimeError(f"OpenRouter single recheck failed after {max_retries} retries: {last_err}")
+    v = verdicts[1]
+    return {
+        "ok": bool(v.get("ok", False)),
+        "latex": str(v.get("latex", "")),
+        "reason": str(v.get("reason", "")),
+    }, used_model
 
 
 def audit_shard(
