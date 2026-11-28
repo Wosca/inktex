@@ -238,3 +238,24 @@ def test_v3_checkpoint_round_trip_and_v2_vocabulary_transfer(model_inputs, tmp_p
     unaveraged, _, _ = load_inkforge_checkpoint(path_v3, "cpu", prefer_ema=False)
     torch.testing.assert_close(unaveraged.mdn_head.bias, model.mdn_head.bias)
 
+
+def test_v3_input_noise_keeps_bos_pen_and_targets_uncorrupted(model_inputs):
+    _, cfg, data = model_inputs
+    model = InkForgeV3Model(cfg).train()
+    orig_inputs = data["stroke_inputs"].clone()
+    orig_dx = data["target_dx"].clone()
+    orig_dy = data["target_dy"].clone()
+    perturbed = model._perturb_inputs(orig_inputs, data["stroke_mask"], noise=0.02)
+    # BOS step (col 6 == 1) and pen-state/padding flags (cols 4:7) must never be perturbed
+    torch.testing.assert_close(perturbed[:, 0, :4], orig_inputs[:, 0, :4])
+    torch.testing.assert_close(perturbed[..., 4:], orig_inputs[..., 4:])
+    # Perturbation must stay local & bounded (no cumulative stroke drift!), and targets untouched
+    assert (perturbed[..., :2] - orig_inputs[..., :2]).abs().max().item() < 0.20
+    # Verify a model with sharp fixed MDN output on clean targets keeps nearly identical NLL under input_noise
+    with torch.no_grad():
+        res_clean = model.compute_loss(**data, input_noise=0.0, style_drop_prob=0.0)
+        res_noisy = model.compute_loss(**data, input_noise=0.01, style_drop_prob=0.0)
+        assert abs(res_noisy["mdn_loss"].item() - res_clean["mdn_loss"].item()) < 0.5
+    torch.testing.assert_close(data["target_dx"], orig_dx)
+    torch.testing.assert_close(data["target_dy"], orig_dy)
+

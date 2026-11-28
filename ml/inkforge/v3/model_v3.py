@@ -332,21 +332,17 @@ class InkForgeV3Model(InkForgeModel):
             scores = scores / stroke_mask.sum(dim=1).clamp_min(1)
         return scores
 
-    def _perturb_inputs(
-        self, inputs: Tensor, mask: Tensor, noise: float
-    ) -> tuple[Tensor, Tensor]:
-        # Translation errors accumulate at stroke starts. Point jitter is local.
-        # The target corrects the current displacement to reach the clean next point.
-        starts = F.pad(inputs[:, :-1, 5].gt(0.5), (1, 0))
-        valid = mask & inputs[..., 6].le(0.5)
-        drift, jitter = torch.randn_like(inputs[..., :4].float()).chunk(2, dim=-1)
-        drift = (drift * starts[..., None] * valid[..., None]).cumsum(dim=1)
-        offset = (1.5 * drift + 0.35 * jitter) * valid[..., None] * noise
-        prev_offset = F.pad(offset[:, :-1], (0, 0, 1, 0))
+    def _perturb_inputs(self, inputs: Tensor, mask: Tensor, noise: float) -> Tensor:
+        # Clean input-only perturbation (matches v2's proven exposure-bias recipe):
+        # perturb observed (dx, dy, abs_x, abs_y) slightly while keeping ground-truth
+        # (target_dx, target_dy) strictly clean so MDN output scales (sx, sy) stay sharp.
+        valid = (mask & inputs[..., 6].le(0.5)).unsqueeze(-1)
         xy_limit = inputs.new_tensor((self.cfg.abs_x_clip, self.cfg.abs_y_clip))
-        deltas = (inputs[..., :2] + offset - prev_offset).clamp(-self.cfg.coord_clip, self.cfg.coord_clip)
-        xy = (inputs[..., 2:4] + offset).clamp(-xy_limit, xy_limit)
-        return torch.cat((deltas, xy, inputs[..., 4:]), dim=-1), offset
+        delta_noise = torch.randn_like(inputs[..., :2].float()) * noise * valid
+        xy_noise = torch.randn_like(inputs[..., 2:4].float()) * (0.5 * noise) * valid
+        deltas = (inputs[..., :2] + delta_noise.to(inputs.dtype)).clamp(-self.cfg.coord_clip, self.cfg.coord_clip)
+        xy = (inputs[..., 2:4] + xy_noise.to(inputs.dtype)).clamp(-xy_limit, xy_limit)
+        return torch.cat((deltas, xy, inputs[..., 4:]), dim=-1)
 
     def compute_loss(
         self,
@@ -364,10 +360,10 @@ class InkForgeV3Model(InkForgeModel):
         free_bits: float = 0.15,
         style_drop_prob: float = 0.30,
         text_drop_prob: float = 0.0,
-        guided_attn_weight: float = 0.5,
+        guided_attn_weight: float = 2.0,
         guided_attn_sigma: float = 0.24,
         transition_weight: float = 4.0,
-        cursor_end_weight: float = 0.15,
+        cursor_end_weight: float = 0.5,
         jump_aux_weight: float = 0.25,
         input_noise: float = 0.0,
     ) -> dict[str, Tensor]:
@@ -380,9 +376,7 @@ class InkForgeV3Model(InkForgeModel):
             token_ids = torch.where(keep_text[:, None], token_ids, self._make_uncond_tokens(token_ids))
 
         if self.training and input_noise > 0:
-            stroke_inputs, offset = self._perturb_inputs(stroke_inputs, stroke_mask, input_noise)
-            target_dx = (target_dx - offset[..., 0]).clamp(-self.cfg.coord_clip, self.cfg.coord_clip)
-            target_dy = (target_dy - offset[..., 1]).clamp(-self.cfg.coord_clip, self.cfg.coord_clip)
+            stroke_inputs = self._perturb_inputs(stroke_inputs, stroke_mask, input_noise)
 
         memory, mask = self.encode_memory(token_ids)
         raw, attns, cursor = self.decode_features(
