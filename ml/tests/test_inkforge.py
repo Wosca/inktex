@@ -402,3 +402,19 @@ def test_star_dpo_rollout_collation_and_prompt_pool():
         text_drop_prob=0.10,
     )
     rep_out["loss"].backward()
+
+
+def test_openrouter_blind_grid_and_verdict_parser():
+    from inkforge.verify_openrouter import parse_vlm_verdict_json, render_blind_audit_grid
+
+    dummy = [
+        [np.array([[0.0, 0.0], [0.5, 0.4], [1.0, 0.0]], dtype=np.float64)],
+        [np.array([[0.0, 0.0], [0.2, 0.8]], dtype=np.float64)],
+    ]
+    png = render_blind_audit_grid(dummy, cols=2, tile_w=200, tile_h=100)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 500
+
+    raw = '```json\n{"1": {"ok": true, "reason": "clean"}, "2": {"ok": false, "reason": "missing sign"}}\n```'
+    parsed = parse_vlm_verdict_json(raw, count=2)
+    assert parsed[1]["ok"] is True
+    assert parsed[2]["ok"] is False and "missing" in parsed[2]["reason"]

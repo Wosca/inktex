@@ -38,7 +38,108 @@ from inkforge.composer import (  # noqa: E402
 )
 from inkforge.model import InkForgeConfig, InkForgeModel  # noqa: E402
 from inkforge.render import render_contact_sheet  # noqa: E402
-from inkforge.tokenizer import InkForgeTokenizer  # noqa: E402
+from inkforge.star_dpo import DEFAULT_INKTEX_V2_CKPT, judge_rollouts_with_inktex  # noqa: E402
+from inkforge.tokenizer import InkForgeTokenizer, tokenize_inkforge  # noqa: E402
+from v2.eval_v2 import load_v2_checkpoint  # noqa: E402
+
+
+def _is_dangling_prefix_cell(latex: str) -> bool:
+    """Short operator-terminated prefix cells like `f(x) =` or `1 +` are geometry-gated rather than exact-matched."""
+    s = latex.strip()
+    return len(tokenize_inkforge(s)) <= 6 and s.endswith(("=", "+", "-"))
+
+
+@torch.inference_mode()
+def generate_verified_cells(
+    model: InkForgeModel,
+    tokenizer: InkForgeTokenizer,
+    flat_cells: list[str],
+    cell_zs_np: np.ndarray,
+    cell_temps_np: np.ndarray,
+    device: torch.device,
+    *,
+    cfg_scale: float = 1.5,
+    max_chunk_seqs: int = 32,
+    judge_model: torch.nn.Module | None = None,
+    judge_tok: Any | None = None,
+    judge_batch_size: int = 32,
+    max_retries: int = 2,
+) -> tuple[list[list[np.ndarray]], list[bool]]:
+    """Generate flattened cells in OOM-safe chunks with optional InkTeX v2 per-cell verification + selective retry!
+
+    Failed cells are selectively regenerated using the EXACT SAME writer style `z` (preserving consistent
+    handwriting across every line/cell of a multi-line or big-fraction equation) up to `max_retries` times.
+    """
+    n = len(flat_cells)
+    out_strokes: list[list[np.ndarray]] = [[] for _ in range(n)]
+    cell_ok: list[bool] = [False] * n
+    pending = list(range(n))
+
+    for attempt in range(max_retries + 1):
+        if not pending:
+            break
+        # Gently cool temperature slightly on retries for higher precision
+        temp_scale = 1.0 if attempt == 0 else max(0.75, 1.0 - 0.10 * attempt)
+        cand_strokes: list[list[np.ndarray]] = []
+        cand_meta: list[dict[str, Any]] = []
+
+        for s in range(0, len(pending), max_chunk_seqs):
+            sub_ids = pending[s : s + max_chunk_seqs]
+            enc = [tokenizer.encode(flat_cells[i], max_len=model.cfg.max_text_len) for i in sub_ids]
+            max_l = max(len(e) for e in enc)
+            tok_t = torch.full((len(sub_ids), max_l), tokenizer.pad_id, dtype=torch.long, device=device)
+            for j, e in enumerate(enc):
+                tok_t[j, : len(e)] = torch.tensor(e, dtype=torch.long, device=device)
+            z_t = torch.from_numpy(cell_zs_np[sub_ids]).to(device)
+            t_t = torch.from_numpy((cell_temps_np[sub_ids] * temp_scale).astype(np.float32)).to(device)
+            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                st_c, meta_c = model.generate_batch(
+                    tok_t,
+                    style_z=z_t,
+                    temperature=t_t,
+                    pen_temperature=1.0,
+                    cfg_scale=cfg_scale,
+                    max_steps=512,
+                    return_meta=True,
+                )
+            cand_strokes.extend(st_c)
+            cand_meta.extend(meta_c)
+
+        # Geometry gate on every atomic cell first
+        geom_pass_pos: list[int] = []
+        for pos, idx in enumerate(pending):
+            ok_geom = bool(cand_meta[pos]["finished"]) and passes_geometry_gate(
+                flat_cells[idx], cand_strokes[pos], is_atomic_cell=True
+            )
+            if ok_geom:
+                if judge_model is None or _is_dangling_prefix_cell(flat_cells[idx]):
+                    out_strokes[idx] = cand_strokes[pos]
+                    cell_ok[idx] = True
+                else:
+                    geom_pass_pos.append(pos)
+
+        # Run fast InkTeX v2 bimodal recognition strictly on non-dangling geometry-valid cells
+        if judge_model is not None and judge_tok is not None and geom_pass_pos:
+            judge_rows = [
+                {
+                    "latex": flat_cells[pending[pos]],
+                    "strokes": cand_strokes[pos],
+                    "finished": True,
+                }
+                for pos in geom_pass_pos
+            ]
+            verdicts = judge_rollouts_with_inktex(
+                judge_model, judge_tok, judge_rows, device, batch_size=judge_batch_size
+            )
+            for pos, (v_ok, _pred, _reason) in zip(geom_pass_pos, verdicts):
+                if v_ok:
+                    idx = pending[pos]
+                    out_strokes[idx] = cand_strokes[pos]
+                    cell_ok[idx] = True
+
+        pending = [idx for idx in pending if not cell_ok[idx]]
+
+    return out_strokes, cell_ok
 
 
 def sample_writer_latents(
@@ -82,8 +183,11 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=96, help="GPU cell batch size (96-128 fits RTX 4070 Ti easily)")
     parser.add_argument("--structured-prob", type=float, default=0.45, help="Fraction of multi-line/matrix/cases prompts")
     parser.add_argument("--temp-min", type=float, default=0.28)
-    parser.add_argument("--temp-max", type=float, default=0.62)
+    parser.add_argument("--temp-max", type=float, default=0.52)
     parser.add_argument("--cfg-scale", type=float, default=1.5, help="Text CFG scale (1.5 for InkForge v2)")
+    parser.add_argument("--judge-ckpt", type=Path, default=DEFAULT_INKTEX_V2_CKPT, help="InkTeX v2 judge for cell verification")
+    parser.add_argument("--no-verify-cells", action="store_true", help="Disable InkTeX v2 atomic-cell verification")
+    parser.add_argument("--max-cell-retries", type=int, default=2, help="Selective retries per failed atomic cell (same writer z)")
     parser.add_argument("--preview-every", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
@@ -97,6 +201,15 @@ def main() -> None:
     model.load_state_dict(state)
     model.eval()
     print(f"[gen] Loaded InkForge ({model.parameter_count()/1e6:.2f}M params, step={ckpt.get('step')}) on {device}")
+
+    judge_model = None
+    judge_tok = None
+    if not args.no_verify_cells and args.judge_ckpt.is_file():
+        judge_model, judge_tok, _ = load_v2_checkpoint(args.judge_ckpt, None, device, use_ema=True)
+        judge_model.eval()
+        for p in judge_model.parameters():
+            p.requires_grad_(False)
+        print(f"[gen] Loaded InkTeX v2 atomic-cell verifier (retries={args.max_cell_retries}) from {args.judge_ckpt}")
 
     style_bank = None
     bank_path = args.style_bank or (args.checkpoint.parent / "writer_styles.npz")
@@ -165,33 +278,28 @@ def main() -> None:
             prompt_zs = sample_writer_latents(n_prompts, cfg.style_dim, np_rng, bank=style_bank)
             prompt_temps = np_rng.uniform(args.temp_min, args.temp_max, size=(n_prompts,)).astype(np.float32)
 
-            # Encode all flattened cells into one GPU batch
-            encoded_cells = [tokenizer.encode(c, max_len=cfg.max_text_len) for c in flat_cells]
-            max_l = max(len(e) for e in encoded_cells)
-            tok_t = torch.full((len(flat_cells), max_l), tokenizer.pad_id, dtype=torch.long, device=device)
-            for i, e in enumerate(encoded_cells):
-                tok_t[i, : len(e)] = torch.tensor(e, dtype=torch.long, device=device)
+            cell_zs_np = prompt_zs[np.asarray(cell_owner)]
+            cell_temps_np = prompt_temps[np.asarray(cell_owner)]
+            cell_strokes_flat, cell_ok_flat = generate_verified_cells(
+                model,
+                tokenizer,
+                flat_cells,
+                cell_zs_np,
+                cell_temps_np,
+                device,
+                cfg_scale=args.cfg_scale,
+                max_chunk_seqs=32,
+                judge_model=judge_model,
+                judge_tok=judge_tok,
+                max_retries=args.max_cell_retries,
+            )
 
-            cell_zs = torch.from_numpy(prompt_zs[np.asarray(cell_owner)]).to(device)
-            cell_temps = torch.from_numpy(prompt_temps[np.asarray(cell_owner)]).to(device)
-
-            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                cell_strokes_flat, cell_meta_flat = model.generate_batch(
-                    tok_t,
-                    style_z=cell_zs,
-                    temperature=cell_temps,
-                    pen_temperature=1.0,
-                    cfg_scale=args.cfg_scale,
-                    max_steps=512,
-                    return_meta=True,
-                )
-
-            # Group generated cells back per prompt and validate EVERY atomic cell before 2D assembly
+            # Group generated cells back per prompt (every atomic cell must pass!)
             grouped: list[list[list[np.ndarray]]] = [[] for _ in range(n_prompts)]
             grouped_ok: list[bool] = [True] * n_prompts
-            for c_tex, c_st, c_meta, owner in zip(flat_cells, cell_strokes_flat, cell_meta_flat, cell_owner):
+            for c_st, c_ok, owner in zip(cell_strokes_flat, cell_ok_flat, cell_owner):
                 grouped[owner].append(c_st)
-                if not c_meta["finished"] or not passes_geometry_gate(c_tex, c_st):
+                if not c_ok:
                     grouped_ok[owner] = False
 
             for p_idx, pr in enumerate(prompts_batch):

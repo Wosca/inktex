@@ -103,7 +103,12 @@ def strokes_bbox(strokes: Sequence[np.ndarray]) -> tuple[float, float, float, fl
     )
 
 
-def passes_geometry_gate(latex: str, strokes: Sequence[np.ndarray]) -> bool:
+def passes_geometry_gate(
+    latex: str,
+    strokes: Sequence[np.ndarray],
+    *,
+    is_atomic_cell: bool = False,
+) -> bool:
     """Reject degenerate/runaway generated strokes before saving to disk."""
     if not strokes:
         return False
@@ -117,6 +122,16 @@ def passes_geometry_gate(latex: str, strokes: Sequence[np.ndarray]) -> bool:
     w, h = x1 - x0, y1 - y0
     if max(w, h) < 0.20 or max(w, h) > 95.0:
         return False
+
+    # Reject stray giant slash strokes / blown-up height on plain single-line atomic cells
+    if is_atomic_cell:
+        has_tall_op = any(k in latex for k in (r"\frac", r"\int", r"\sum", r"\prod", r"\begin", r"\sqrt"))
+        max_h_allowed = 8.5 if has_tall_op else 4.8
+        if h > max_h_allowed:
+            return False
+        stroke_hs = [float(s[:, 1].max() - s[:, 1].min()) for s in pts]
+        if max(stroke_hs) > (6.5 if has_tall_op else 3.8):
+            return False
 
     # Strip environment names before estimating visible symbol count
     clean_tex = re.sub(r"\\(?:begin|end)\{[A-Za-z*]+\}", "", latex)
@@ -307,26 +322,29 @@ def _decompose_big_frac_tree(
     depth: int = 0,
     max_depth: int = 2,
 ) -> dict[str, Any] | None:
-    """Recursively decompose large top-level `\\frac{NUM}{DEN}` expressions into an `InkNode` tree.
+    """Recursively decompose large top-level `\\frac{NUM}{DEN}` and `\\sqrt{BODY}` into an `InkNode` tree.
 
-    Only splits when the expression is long or contains nested big operators so small fractions
-    like `\\frac{1}{2}` stay native single InkForge cells.
+    Keeps short simple fractions like `\\frac{1}{2}` or `\\sqrt{x}` as native single InkForge cells,
+    while decomposing big fractions and compound radicals so InkForge never blows up on them.
     """
     s = latex.strip()
     if not s:
         return None
     toks = tokenize_inkforge(s)
-    if depth >= max_depth or r"\frac" not in s or len(toks) < 16:
+    has_frac = r"\frac" in s
+    has_sqrt = r"\sqrt" in s
+    if depth >= max_depth or (not has_frac and not has_sqrt) or (not has_sqrt and len(toks) < 16):
         if 1 <= len(toks) <= 44 and not tokenizer.has_unk(s):
             idx = len(cells)
             cells.append(s)
             return {"op": "cell", "i": idx}
         return None
 
-    # Find first top-level `\frac{...}{...}` (brace depth == 0)
+    # 1. Find first top-level `\frac{...}{...}` (brace depth == 0)
     bdepth = 0
     i = 0
-    found: tuple[int, str, str, int] | None = None
+    found_frac: tuple[int, str, str, int] | None = None
+    found_sqrt: tuple[int, str, int] | None = None
     while i < len(s):
         ch = s[i]
         if ch == "{" and (i == 0 or s[i - 1] != "\\"):
@@ -348,39 +366,70 @@ def _decompose_big_frac_tree(
                     den_s, den_end = den_res
                     num_t = tokenize_inkforge(num_s)
                     den_t = tokenize_inkforge(den_s)
-                    # Decompose if either side is substantial or itself has nested \frac / \sum / \int / \sqrt
-                    if max(len(num_t), len(den_t)) >= 6 or r"\frac" in num_s or r"\frac" in den_s:
-                        found = (i, num_s.strip(), den_s.strip(), den_end + 1)
+                    if max(len(num_t), len(den_t)) >= 6 or r"\frac" in num_s or r"\frac" in den_s or r"\sqrt" in num_s or r"\sqrt" in den_s:
+                        found_frac = (i, num_s.strip(), den_s.strip(), den_end + 1)
                         break
+        elif bdepth == 0 and found_sqrt is None and s.startswith(r"\sqrt", i) and (i + 5 < len(s) and s[i + 5] in ("{", " ")):
+            j = i + 5
+            while j < len(s) and s[j] == " ":
+                j += 1
+            rad_res = _extract_balanced_brace(s, j)
+            if rad_res is not None:
+                rad_s, rad_end = rad_res
+                rad_t = tokenize_inkforge(rad_s)
+                # Decompose compound or long radicals (e.g. \sqrt{b^2-4ac} + 2xy or \sqrt{\frac{...}{...}})
+                if len(rad_t) >= 4 or (i > 0 or rad_end + 1 < len(s)):
+                    found_sqrt = (i, rad_s.strip(), rad_end + 1)
         i += 1
 
-    if found is None:
-        if 1 <= len(toks) <= 56 and not tokenizer.has_unk(s):
-            idx = len(cells)
-            cells.append(s)
-            return {"op": "cell", "i": idx}
-        return None
+    if found_frac is not None:
+        f_start, num_s, den_s, f_end = found_frac
+        prefix = s[:f_start].strip()
+        suffix = s[f_end:].strip()
+        items: list[dict[str, Any]] = []
+        if prefix:
+            p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            if p_node is None:
+                return None
+            items.append(p_node)
+        num_node = _decompose_big_frac_tree(num_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+        den_node = _decompose_big_frac_tree(den_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+        if num_node is None or den_node is None:
+            return None
+        items.append({"op": "frac", "num": num_node, "den": den_node, "scale": 0.94 if depth == 0 else 0.84})
+        if suffix:
+            s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            if s_node is None:
+                return None
+            items.append(s_node)
+        return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
 
-    f_start, num_s, den_s, f_end = found
-    prefix = s[:f_start].strip()
-    suffix = s[f_end:].strip()
-    items: list[dict[str, Any]] = []
-    if prefix:
-        p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-        if p_node is None:
+    if found_sqrt is not None:
+        s_start, rad_s, s_end = found_sqrt
+        prefix = s[:s_start].strip()
+        suffix = s[s_end:].strip()
+        items = []
+        if prefix:
+            p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            if p_node is None:
+                return None
+            items.append(p_node)
+        rad_node = _decompose_big_frac_tree(rad_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+        if rad_node is None:
             return None
-        items.append(p_node)
-    num_node = _decompose_big_frac_tree(num_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-    den_node = _decompose_big_frac_tree(den_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-    if num_node is None or den_node is None:
-        return None
-    items.append({"op": "frac", "num": num_node, "den": den_node, "scale": 0.94 if depth == 0 else 0.84})
-    if suffix:
-        s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-        if s_node is None:
-            return None
-        items.append(s_node)
-    return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
+        items.append({"op": "sqrt", "body": rad_node})
+        if suffix:
+            s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            if s_node is None:
+                return None
+            items.append(s_node)
+        return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
+
+    if 1 <= len(toks) <= 56 and not tokenizer.has_unk(s):
+        idx = len(cells)
+        cells.append(s)
+        return {"op": "cell", "i": idx}
+    return None
 
 
 _ENV_MATRIX_RE = re.compile(
@@ -530,17 +579,29 @@ def sample_big_fraction_or_multistep_prompt(rng: random.Random) -> StructuredPro
             f"\\sum_{{i=1}}^{v} i + {b}{v}^2",
             f"({v} + {a})({v} - {b}) + {c}",
         ])
-        den = rng.choice([
-            f"\\sqrt{{{v}^2 + {a}{v} + {c}}}",
-            f"{b}{v}^2 - {a}{v} + {c}",
-            f"({v} + {a})^2 + {b}",
-            f"\\sqrt{{{a}^2 + {b}^2}} + {v}",
-        ])
+        den_kind = rng.randrange(4)
+        if den_kind == 0:
+            rad_inner = f"{v}^2 + {a}{v} + {c}"
+            den_tex = f"\\sqrt{{{rad_inner}}}"
+            den_node: dict[str, Any] = {"op": "sqrt", "body": _tree_cell(cells, rad_inner)}
+        elif den_kind == 1:
+            rad_inner = f"{a}^2 + {b}^2"
+            den_tex = f"\\sqrt{{{rad_inner}}} + {v}"
+            den_node = {
+                "op": "hcat",
+                "items": [{"op": "sqrt", "body": _tree_cell(cells, rad_inner)}, _tree_cell(cells, f"+ {v}")],
+            }
+        elif den_kind == 2:
+            den_tex = f"{b}{v}^2 - {a}{v} + {c}"
+            den_node = _tree_cell(cells, den_tex)
+        else:
+            den_tex = f"({v} + {a})^2 + {b}"
+            den_node = _tree_cell(cells, den_tex)
         tail = rng.choice(["", f"+ {c}", "= 0", f"= {b}{v}"])
-        items = [_tree_cell(cells, lhs), {"op": "frac", "num": _tree_cell(cells, num), "den": _tree_cell(cells, den), "scale": 0.96}]
+        items = [_tree_cell(cells, lhs), {"op": "frac", "num": _tree_cell(cells, num), "den": den_node, "scale": 0.96}]
         if tail:
             items.append(_tree_cell(cells, tail))
-        latex = f"{lhs} \\frac{{{num}}}{{{den}}}" + (f" {tail}" if tail else "")
+        latex = f"{lhs} \\frac{{{num}}}{{{den_tex}}}" + (f" {tail}" if tail else "")
         return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": {"op": "hcat", "items": items}, "subkind": "big_frac"})
 
     if mode == "nested_frac":
