@@ -79,33 +79,41 @@ def build_hard_prompt_pool(
     rng = random.Random(seed)
     prompts: list[str] = []
 
-    # 1. Curated programmatic hard-structure prompts (heavy on v1 failure modes)
+    # 1. Curated programmatic hard-structure prompts (heavy on v1/v2 failure modes, especially \sum!)
     vars_a = ["x", "y", "z", "t", "n", "k", "a", "b", "c", "r", "u", "v"]
     digits = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
     greeks = [r"\alpha", r"\beta", r"\gamma", r"\theta", r"\lambda", r"\mu", r"\sigma", r"\omega"]
-    for _ in range(4000):
+    idx_vars = ["i", "j", "k", "m"]
+    for _ in range(5000):
         v1, v2, v3 = rng.sample(vars_a, 3)
         d1, d2 = rng.choice(digits), rng.choice(digits)
         op = rng.choice(["+", "-"])
         g1, g2 = rng.sample(greeks, 2)
-        c = rng.randrange(10)
+        iv = rng.choice(idx_vars)
+        c = rng.randrange(13)
         if c == 0:
             p = f"\\sqrt{{{v1}^2 {op} {d1}{v2}{v3}}}"
         elif c == 1:
             p = f"\\sqrt{{{v1}^2 {op} {v2}^2}}"
         elif c == 2:
-            p = f"\\sum_{{i=1}}^{v1} {v2}_i = \\frac{{{v1}({v1}+1)}}{{{d2}}}"
+            p = f"\\sum_{{{iv}=1}}^{v1} {iv} = \\frac{{{v1}({v1}+1)}}{{{d2}}}"
         elif c == 3:
-            p = f"\\lim_{{{v1} \\rightarrow 0}} \\frac{{\\sin {v1}}}{{{v1}}} = 1"
+            p = f"\\sum_{{{iv}=1}}^{v1} {v2}_{iv} = {v3}"
         elif c == 4:
-            p = f"\\sin^2 {g1} + \\cos^2 {g1} = 1"
+            p = f"\\sum_{{{iv}=0}}^\\infty {v1}^{iv} = \\frac{{1}}{{1-{v1}}}"
         elif c == 5:
-            p = f"\\Pr(A \\cap B) = \\Pr(A)\\Pr(B)"
+            p = f"\\sum_{{{iv}=1}}^{v1} {iv}^2 = \\frac{{{v1}({v1}+1)(2{v1}+1)}}{{6}}"
         elif c == 6:
-            p = f"\\forall {v1} \\in \\mathbb{{R}}, {v1}^2 \\geq 0"
+            p = f"\\lim_{{{v1} \\rightarrow 0}} \\frac{{\\sin {v1}}}{{{v1}}} = 1"
         elif c == 7:
-            p = f"\\int_0^\\infty e^{{-{v1}}} d{v1} = 1"
+            p = f"\\sin^2 {g1} + \\cos^2 {g1} = 1"
         elif c == 8:
+            p = f"\\Pr(A \\cap B) = \\Pr(A)\\Pr(B)"
+        elif c == 9:
+            p = f"\\forall {v1} \\in \\mathbb{{R}}, {v1}^2 \\geq 0"
+        elif c == 10:
+            p = f"\\int_0^\\infty e^{{-{v1}}} d{v1} = 1"
+        elif c == 11:
             p = f"\\frac{{\\partial f}}{{\\partial {v1}}} + \\frac{{\\partial f}}{{\\partial {v2}}}"
         else:
             p = f"\\Delta {v1} = {g1} {g2}"
@@ -446,6 +454,14 @@ def _evaluate_fixed_prompts(
     return pass_rate, dict(reasons)
 
 
+def _move_optimizer_state(optimizer: torch.optim.Optimizer, target_device: torch.device | str) -> None:
+    """Keep AdamW state tensors colocated with `model` across CPU/GPU phase swaps & resume."""
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(target_device, non_blocking=False)
+
+
 def run_star_dpo(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -515,7 +531,7 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         replay_subset,
         batch_size=args.train_batch_size,
         sampler=replay_sampler,
-        num_workers=4,
+        num_workers=0,
         pin_memory=(device.type == "cuda"),
         collate_fn=partial(collate_inkforge_batch, pad_id=cfg.pad_id),
     )
@@ -703,9 +719,13 @@ def run_star_dpo(args: argparse.Namespace) -> None:
             continue
 
         # ---- Phase 3: Deterministic STaR + DPO + Real-Human Replay Updates ----
+        # Keep ema_model parked on CPU and call .backward() SEQUENTIALLY per loss term so:
+        #   1) Each checkpointed backward runs under the EXACT same train/eval mode as its forward
+        #      (prevents PyTorch grad_checkpoint CheckpointError on dropout masks!).
+        #   2) Only ONE autograd graph is resident on GPU at any time (peak VRAM < 6 GiB on 4070 Ti!).
         model.to(device)
+        _move_optimizer_state(optimizer, device)
         ref_model.to(device)
-        ema_model.to(device)
         ref_model.eval()
 
         rng.shuffle(dpo_pairs)
@@ -714,17 +734,18 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         sft_loss_sum = 0.0
         replay_loss_sum = 0.0
         n_updates = 0
+        t_p3 = time.perf_counter()
 
         bs = args.train_batch_size
-        n_batches = max(len(dpo_pairs) // max(1, bs), len(star_winners) // max(1, bs), 1)
-        for bi in range(min(n_batches, args.max_updates_per_round)):
+        n_batches = min(
+            max(len(dpo_pairs) // max(1, bs), len(star_winners) // max(1, bs), 1),
+            args.max_updates_per_round,
+        )
+        for bi in range(n_batches):
             optimizer.zero_grad(set_to_none=True)
-            total_step_loss = torch.zeros((), device=device, dtype=torch.float32)
 
-            # 3a & 3b: Disable dropout (`model.eval()`) during preference/SFT scoring so policy==ref
-            # gives EXACT 0.0 margin at init while grad_checkpoint remains active under enable_grad!
+            # 3a. DPO preference loss (model.eval() -> dropout OFF, exact 0.0 margin vs ref at init!)
             model.eval()
-
             if dpo_pairs:
                 sub_pairs = [dpo_pairs[(bi * bs + j) % len(dpo_pairs)] for j in range(min(bs, len(dpo_pairs)))]
                 bw = {k: v.to(device, non_blocking=True) for k, v in collate_rollout_items([p[0] for p in sub_pairs], cfg.pad_id).items()}
@@ -737,19 +758,22 @@ def run_star_dpo(args: argparse.Namespace) -> None:
                         ref_l = ref_model.sequence_log_prob(**bl, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
                 logits_dpo = args.dpo_beta * ((lp_w - ref_w) - (lp_l - ref_l))
                 dpo_loss = -F.logsigmoid(logits_dpo).mean()
-                total_step_loss = total_step_loss + dpo_loss
+                dpo_loss.backward()
                 dpo_loss_sum += float(dpo_loss.item())
+                del bw, bl, lp_w, lp_l, ref_w, ref_l, logits_dpo, dpo_loss
 
+            # 3b. STaR SFT loss on verified winners (model.eval() -> matches forward mode during backward!)
             if star_winners:
                 sub_wins = [star_winners[(bi * bs + j) % len(star_winners)] for j in range(min(bs, len(star_winners)))]
                 bsft = {k: v.to(device, non_blocking=True) for k, v in collate_rollout_items(sub_wins, cfg.pad_id).items()}
                 with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
                     lp_sft = model.sequence_log_prob(**bsft, pen_weight=1.0, length_normalize=True, mask_illegal_eos=True)
                 sft_loss = -lp_sft.mean()
-                total_step_loss = total_step_loss + args.sft_weight * sft_loss
+                (args.sft_weight * sft_loss).backward()
                 sft_loss_sum += float(sft_loss.item())
+                del bsft, lp_sft, sft_loss
 
-            # 3c. Strictly real-human replay anchor (standard training mode with dropout + text CFG drop)
+            # 3c. Strictly real-human replay anchor (model.train() for BOTH forward AND backward!)
             model.train()
             try:
                 rep_batch = next(replay_iter)
@@ -771,21 +795,36 @@ def run_star_dpo(args: argparse.Namespace) -> None:
                     text_drop_prob=0.10,
                 )
                 rep_loss = rep_out["loss"]
-            total_step_loss = total_step_loss + args.replay_weight * rep_loss
+            (args.replay_weight * rep_loss).backward()
             replay_loss_sum += float(rep_loss.item())
+            del rep_batch, rep_out, rep_loss
 
-            total_step_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             global_step += 1
-            update_ema(ema_model, model, 0.995)
+            # Update CPU-resident ema_model directly without holding a 3rd model copy on GPU
+            with torch.no_grad():
+                for p_ema, p in zip(ema_model.parameters(), model.parameters()):
+                    p_ema.data.mul_(0.995).add_(p.data.detach().cpu(), alpha=0.005)
+                for b_ema, b_src in zip(ema_model.buffers(), model.buffers()):
+                    b_ema.copy_(b_src.detach().cpu())
             n_updates += 1
             total_pref_or_star_updates += 1
 
-        # Park train models on CPU before post-update fixed evaluation (avoid GPU overlap with judge!)
+            if n_updates == 1 or n_updates % 25 == 0 or n_updates == n_batches:
+                vram_gb = (torch.cuda.memory_allocated(device) / (1024**3)) if device.type == "cuda" else 0.0
+                print(
+                    f"  [round {rd} upd {n_updates:3d}/{n_batches}] "
+                    f"dpo={dpo_loss_sum/n_updates:.4f} sft={sft_loss_sum/n_updates:.4f} "
+                    f"rep={replay_loss_sum/n_updates:.4f} vram={vram_gb:.2f}GiB "
+                    f"({time.perf_counter()-t_p3:.1f}s)",
+                    flush=True,
+                )
+
+        # Park train models & optimizer states on CPU before post-update fixed eval (zero GPU overlap with judge!)
         model.to("cpu")
+        _move_optimizer_state(optimizer, "cpu")
         ref_model.to("cpu")
-        ema_model.to("cpu")
         if device.type == "cuda":
             torch.cuda.empty_cache()
 

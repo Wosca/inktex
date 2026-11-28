@@ -377,3 +377,23 @@ def test_star_dpo_rollout_collation_and_prompt_pool():
         lp_ref = ref.sequence_log_prob(**rb, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
     assert float((lp_pol - lp_ref).abs().max().item()) < 1e-5
     (-lp_pol.mean()).backward()
+
+    # Regression test: sequential eval-mode DPO backward followed by train-mode replay backward
+    # with grad_checkpoint=True must NOT raise CheckpointError on dropout masks!
+    model.train()
+    sp = torch.zeros((1, cfg.style_max_strokes, cfg.style_points, 8), dtype=torch.float32)
+    sa = torch.zeros((1, cfg.style_max_strokes, 4), dtype=torch.float32)
+    sm = torch.ones((1, cfg.style_max_strokes), dtype=torch.bool)
+    rep_out = model.compute_loss(
+        token_ids=rb["token_ids"],
+        stroke_inputs=rb["stroke_inputs"],
+        target_dx=rb["target_dx"],
+        target_dy=rb["target_dy"],
+        target_pen=rb["target_pen"],
+        stroke_mask=rb["stroke_mask"],
+        style_points=sp,
+        style_aspect=sa,
+        style_mask=sm,
+        text_drop_prob=0.10,
+    )
+    rep_out["loss"].backward()
