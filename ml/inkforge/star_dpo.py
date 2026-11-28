@@ -731,6 +731,9 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         rng.shuffle(dpo_pairs)
         rng.shuffle(star_winners)
         dpo_loss_sum = 0.0
+        dpo_acc_sum = 0.0
+        dpo_margin_sum = 0.0
+        dpo_count = 0
         sft_loss_sum = 0.0
         replay_loss_sum = 0.0
         n_updates = 0
@@ -756,11 +759,15 @@ def run_star_dpo(args: argparse.Namespace) -> None:
                     with torch.no_grad():
                         ref_w = ref_model.sequence_log_prob(**bw, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
                         ref_l = ref_model.sequence_log_prob(**bl, pen_weight=1.0, length_normalize=False, mask_illegal_eos=True)
-                logits_dpo = args.dpo_beta * ((lp_w - ref_w) - (lp_l - ref_l))
+                raw_margin = (lp_w - ref_w) - (lp_l - ref_l)
+                logits_dpo = args.dpo_beta * raw_margin
                 dpo_loss = -F.logsigmoid(logits_dpo).mean()
                 dpo_loss.backward()
                 dpo_loss_sum += float(dpo_loss.item())
-                del bw, bl, lp_w, lp_l, ref_w, ref_l, logits_dpo, dpo_loss
+                dpo_acc_sum += float((logits_dpo > 0).float().mean().item())
+                dpo_margin_sum += float(raw_margin.mean().item())
+                dpo_count += 1
+                del bw, bl, lp_w, lp_l, ref_w, ref_l, raw_margin, logits_dpo, dpo_loss
 
             # 3b. STaR SFT loss on verified winners (model.eval() -> matches forward mode during backward!)
             if star_winners:
@@ -813,9 +820,12 @@ def run_star_dpo(args: argparse.Namespace) -> None:
 
             if n_updates == 1 or n_updates % 25 == 0 or n_updates == n_batches:
                 vram_gb = (torch.cuda.memory_allocated(device) / (1024**3)) if device.type == "cuda" else 0.0
+                dpo_denom = max(1, dpo_count)
                 print(
                     f"  [round {rd} upd {n_updates:3d}/{n_batches}] "
-                    f"dpo={dpo_loss_sum/n_updates:.4f} sft={sft_loss_sum/n_updates:.4f} "
+                    f"dpo={dpo_loss_sum/dpo_denom:.4f} dpo_acc={dpo_acc_sum/dpo_denom*100:.1f}% "
+                    f"margin={dpo_margin_sum/dpo_denom:+.2f} "
+                    f"sft={sft_loss_sum/n_updates:.4f} "
                     f"rep={replay_loss_sum/n_updates:.4f} vram={vram_gb:.2f}GiB "
                     f"({time.perf_counter()-t_p3:.1f}s)",
                     flush=True,
@@ -907,7 +917,9 @@ def run_star_dpo(args: argparse.Namespace) -> None:
             "winners": len(star_winners),
             "dpo_pairs": len(dpo_pairs),
             "updates": n_updates,
-            "dpo_loss": round(dpo_loss_sum / max(1, n_updates), 4),
+            "dpo_loss": round(dpo_loss_sum / max(1, dpo_count), 4),
+            "dpo_acc": round(dpo_acc_sum / max(1, dpo_count), 4),
+            "dpo_margin": round(dpo_margin_sum / max(1, dpo_count), 4),
             "sft_loss": round(sft_loss_sum / max(1, n_updates), 4),
             "replay_loss": round(replay_loss_sum / max(1, n_updates), 4),
             "elapsed_s": round(time.perf_counter() - t_rd, 1),
@@ -944,10 +956,10 @@ def main() -> None:
     parser.add_argument("--max-updates-per-round", type=int, default=200)
     parser.add_argument("--rollout-temp", type=float, default=0.45)
     parser.add_argument("--cfg-scale", type=float, default=1.5)
-    parser.add_argument("--dpo-beta", type=float, default=0.15)
+    parser.add_argument("--dpo-beta", type=float, default=0.003)
     parser.add_argument("--sft-weight", type=float, default=0.25)
     parser.add_argument("--replay-weight", type=float, default=0.35)
-    parser.add_argument("--lr", type=float, default=3.0e-5)
+    parser.add_argument("--lr", type=float, default=1.0e-5)
     parser.add_argument("--grad-checkpoint", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()

@@ -63,10 +63,10 @@ Write-Output "[pipeline] === STAGE 2: InkTeX-Guided STaR + DPO Post-Training ===
   --max-updates-per-round 200 `
   --rollout-temp 0.45 `
   --cfg-scale 1.5 `
-  --dpo-beta 0.15 `
+  --dpo-beta 0.003 `
   --sft-weight 0.25 `
   --replay-weight 0.35 `
-  --lr 3e-5 `
+  --lr 1e-5 `
   --grad-checkpoint `
   1>> "$Stage2Out\star_dpo_stdout.log" 2>> "$Stage2Out\star_dpo_stderr.log"
 
