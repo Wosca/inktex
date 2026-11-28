@@ -314,18 +314,63 @@ def _extract_balanced_brace(s: str, open_idx: int) -> tuple[str, int] | None:
     return None
 
 
+def _find_top_level_split(s: str, ops: tuple[str, ...]) -> tuple[int, str] | None:
+    """Find a top-level operator (`=` or `+`/`-`) outside `{...}` and `(...)` closest to string midpoint."""
+    bdepth = 0
+    pdepth = 0
+    mid = len(s) * 0.5
+    best: tuple[float, int, str] | None = None
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            # Skip escaped command or escaped brace
+            i += 2
+            while i < len(s) and s[i].isalpha():
+                i += 1
+            continue
+        if ch == "{":
+            bdepth += 1
+        elif ch == "}":
+            bdepth = max(0, bdepth - 1)
+        elif ch in ("(", "["):
+            pdepth += 1
+        elif ch in (")", "]"):
+            pdepth = max(0, pdepth - 1)
+        elif bdepth == 0 and pdepth == 0 and ch in ops:
+            # Skip unary leading sign at start or right after `=` / `(` / `,`
+            prev_nonspace = s[:i].rstrip()
+            if ch in ("+", "-") and (not prev_nonspace or prev_nonspace[-1] in ("=", "(", "[", ",", "+", "-")):
+                i += 1
+                continue
+            left_s = s[:i].strip()
+            right_s = s[i + 1 :].strip()
+            if len(tokenize_inkforge(left_s)) >= 3 and len(tokenize_inkforge(right_s)) >= 3:
+                dist = abs(i - mid)
+                if best is None or dist < best[0]:
+                    best = (dist, i, ch)
+        i += 1
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 def _decompose_big_frac_tree(
     latex: str,
     tokenizer: InkForgeTokenizer,
     cells: list[str],
     *,
     depth: int = 0,
-    max_depth: int = 2,
+    max_depth: int = 3,
 ) -> dict[str, Any] | None:
-    """Recursively decompose large top-level `\\frac{NUM}{DEN}` and `\\sqrt{BODY}` into an `InkNode` tree.
+    """Recursively decompose long equations, big `\\frac`, `\\sqrt`, and `\\binom` into an `InkNode` tree.
 
-    Keeps short simple fractions like `\\frac{1}{2}` or `\\sqrt{x}` as native single InkForge cells,
-    while decomposing big fractions and compound radicals so InkForge never blows up on them.
+    Decomposes:
+      1. Long equations (`>= 18` tokens) at top-level `=` so multi-part formulas never hit the 512-step cap.
+      2. Big/nested top-level `\\frac{NUM}{DEN}`.
+      3. Compound/long top-level `\\sqrt{BODY}`.
+      4. Top-level `\\binom{N}{K}` into tall-parenthesis stacked binomial nodes.
+      5. Very long expressions (`>= 22` tokens) at top-level `+`/`-`.
     """
     s = latex.strip()
     if not s:
@@ -333,97 +378,173 @@ def _decompose_big_frac_tree(
     toks = tokenize_inkforge(s)
     has_frac = r"\frac" in s
     has_sqrt = r"\sqrt" in s
-    if depth >= max_depth or (not has_frac and not has_sqrt) or (not has_sqrt and len(toks) < 16):
+    has_binom = r"\binom" in s
+
+    if depth >= max_depth:
         if 1 <= len(toks) <= 44 and not tokenizer.has_unk(s):
             idx = len(cells)
             cells.append(s)
             return {"op": "cell", "i": idx}
         return None
 
-    # 1. Find first top-level `\frac{...}{...}` (brace depth == 0)
-    bdepth = 0
-    i = 0
-    found_frac: tuple[int, str, str, int] | None = None
-    found_sqrt: tuple[int, str, int] | None = None
-    while i < len(s):
-        ch = s[i]
-        if ch == "{" and (i == 0 or s[i - 1] != "\\"):
-            bdepth += 1
-        elif ch == "}" and (i == 0 or s[i - 1] != "\\"):
-            bdepth -= 1
-        elif bdepth == 0 and s.startswith(r"\frac", i) and (i + 5 < len(s) and s[i + 5] in ("{", " ")):
-            j = i + 5
-            while j < len(s) and s[j] == " ":
-                j += 1
-            num_res = _extract_balanced_brace(s, j)
-            if num_res is not None:
-                num_s, num_end = num_res
-                k = num_end + 1
-                while k < len(s) and s[k] == " ":
-                    k += 1
-                den_res = _extract_balanced_brace(s, k)
-                if den_res is not None:
-                    den_s, den_end = den_res
-                    num_t = tokenize_inkforge(num_s)
-                    den_t = tokenize_inkforge(den_s)
-                    if max(len(num_t), len(den_t)) >= 6 or r"\frac" in num_s or r"\frac" in den_s or r"\sqrt" in num_s or r"\sqrt" in den_s:
-                        found_frac = (i, num_s.strip(), den_s.strip(), den_end + 1)
-                        break
-        elif bdepth == 0 and found_sqrt is None and s.startswith(r"\sqrt", i) and (i + 5 < len(s) and s[i + 5] in ("{", " ")):
-            j = i + 5
-            while j < len(s) and s[j] == " ":
-                j += 1
-            rad_res = _extract_balanced_brace(s, j)
-            if rad_res is not None:
-                rad_s, rad_end = rad_res
-                rad_t = tokenize_inkforge(rad_s)
-                # Decompose compound or long radicals (e.g. \sqrt{b^2-4ac} + 2xy or \sqrt{\frac{...}{...}})
-                if len(rad_t) >= 4 or (i > 0 or rad_end + 1 < len(s)):
-                    found_sqrt = (i, rad_s.strip(), rad_end + 1)
-        i += 1
+    # 1. Split long equations (`>= 18` tokens) at top-level `=` so neither side hits 512 steps!
+    if len(toks) >= 18 and "=" in s:
+        eq_split = _find_top_level_split(s, ("=",))
+        if eq_split is not None:
+            pos, _ = eq_split
+            left_s = s[:pos].strip()
+            right_s = s[pos + 1 :].strip()
+            # Keep short prefix like `x =` or `f(x) =` attached, otherwise emit explicit `=` cell
+            if len(tokenize_inkforge(left_s)) <= 5 and r"\frac" not in left_s and r"\int" not in left_s:
+                l_node = _decompose_big_frac_tree(left_s + " =", tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                r_node = _decompose_big_frac_tree(right_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                if l_node is not None and r_node is not None:
+                    return {"op": "hcat", "items": [l_node, r_node]}
+            else:
+                l_node = _decompose_big_frac_tree(left_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                r_node = _decompose_big_frac_tree("= " + right_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                if l_node is not None and r_node is not None:
+                    return {"op": "hcat", "items": [l_node, r_node]}
 
-    if found_frac is not None:
-        f_start, num_s, den_s, f_end = found_frac
-        prefix = s[:f_start].strip()
-        suffix = s[f_end:].strip()
-        items: list[dict[str, Any]] = []
-        if prefix:
-            p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-            if p_node is None:
-                return None
-            items.append(p_node)
-        num_node = _decompose_big_frac_tree(num_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-        den_node = _decompose_big_frac_tree(den_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-        if num_node is None or den_node is None:
-            return None
-        items.append({"op": "frac", "num": num_node, "den": den_node, "scale": 0.94 if depth == 0 else 0.84})
-        if suffix:
-            s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-            if s_node is None:
-                return None
-            items.append(s_node)
-        return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
+    # 2. Scan for top-level `\frac`, `\sqrt`, or `\binom` (brace depth == 0)
+    if has_frac or has_sqrt or has_binom:
+        bdepth = 0
+        i = 0
+        found_frac: tuple[int, str, str, int] | None = None
+        found_sqrt: tuple[int, str, int] | None = None
+        found_binom: tuple[int, str, str, int] | None = None
+        while i < len(s):
+            ch = s[i]
+            if ch == "{" and (i == 0 or s[i - 1] != "\\"):
+                bdepth += 1
+            elif ch == "}" and (i == 0 or s[i - 1] != "\\"):
+                bdepth = max(0, bdepth - 1)
+            elif bdepth == 0 and s.startswith(r"\frac", i) and (i + 5 < len(s) and s[i + 5] in ("{", " ")):
+                j = i + 5
+                while j < len(s) and s[j] == " ":
+                    j += 1
+                num_res = _extract_balanced_brace(s, j)
+                if num_res is not None:
+                    num_s, num_end = num_res
+                    k = num_end + 1
+                    while k < len(s) and s[k] == " ":
+                        k += 1
+                    den_res = _extract_balanced_brace(s, k)
+                    if den_res is not None:
+                        den_s, den_end = den_res
+                        num_t = tokenize_inkforge(num_s)
+                        den_t = tokenize_inkforge(den_s)
+                        if (
+                            max(len(num_t), len(den_t)) >= 6
+                            or r"\frac" in num_s
+                            or r"\frac" in den_s
+                            or r"\sqrt" in num_s
+                            or r"\sqrt" in den_s
+                        ):
+                            found_frac = (i, num_s.strip(), den_s.strip(), den_end + 1)
+                            break
+            elif bdepth == 0 and found_binom is None and s.startswith(r"\binom", i) and (i + 6 < len(s) and s[i + 6] in ("{", " ")):
+                j = i + 6
+                while j < len(s) and s[j] == " ":
+                    j += 1
+                top_res = _extract_balanced_brace(s, j)
+                if top_res is not None:
+                    top_s, top_end = top_res
+                    k = top_end + 1
+                    while k < len(s) and s[k] == " ":
+                        k += 1
+                    bot_res = _extract_balanced_brace(s, k)
+                    if bot_res is not None:
+                        bot_s, bot_end = bot_res
+                        found_binom = (i, top_s.strip(), bot_s.strip(), bot_end + 1)
+            elif bdepth == 0 and found_sqrt is None and s.startswith(r"\sqrt", i) and (i + 5 < len(s) and s[i + 5] in ("{", " ")):
+                j = i + 5
+                while j < len(s) and s[j] == " ":
+                    j += 1
+                rad_res = _extract_balanced_brace(s, j)
+                if rad_res is not None:
+                    rad_s, rad_end = rad_res
+                    rad_t = tokenize_inkforge(rad_s)
+                    if len(rad_t) >= 4 or (i > 0 or rad_end + 1 < len(s)):
+                        found_sqrt = (i, rad_s.strip(), rad_end + 1)
+            i += 1
 
-    if found_sqrt is not None:
-        s_start, rad_s, s_end = found_sqrt
-        prefix = s[:s_start].strip()
-        suffix = s[s_end:].strip()
-        items = []
-        if prefix:
-            p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-            if p_node is None:
+        if found_frac is not None:
+            f_start, num_s, den_s, f_end = found_frac
+            prefix = s[:f_start].strip()
+            suffix = s[f_end:].strip()
+            items: list[dict[str, Any]] = []
+            if prefix:
+                p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                if p_node is None:
+                    return None
+                items.append(p_node)
+            num_node = _decompose_big_frac_tree(num_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            den_node = _decompose_big_frac_tree(den_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            if num_node is None or den_node is None:
                 return None
-            items.append(p_node)
-        rad_node = _decompose_big_frac_tree(rad_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-        if rad_node is None:
-            return None
-        items.append({"op": "sqrt", "body": rad_node})
-        if suffix:
-            s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
-            if s_node is None:
+            items.append({"op": "frac", "num": num_node, "den": den_node, "scale": 0.94 if depth == 0 else 0.84})
+            if suffix:
+                s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                if s_node is None:
+                    return None
+                items.append(s_node)
+            return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
+
+        if found_binom is not None:
+            b_start, top_s, bot_s, b_end = found_binom
+            prefix = s[:b_start].strip()
+            suffix = s[b_end:].strip()
+            items = []
+            if prefix:
+                p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                if p_node is None:
+                    return None
+                items.append(p_node)
+            top_node = _decompose_big_frac_tree(top_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            bot_node = _decompose_big_frac_tree(bot_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            if top_node is None or bot_node is None:
                 return None
-            items.append(s_node)
-        return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
+            items.append({"op": "delim", "left": "(", "right": ")", "body": {"op": "binom", "top": top_node, "bot": bot_node}})
+            if suffix:
+                s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                if s_node is None:
+                    return None
+                items.append(s_node)
+            return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
+
+        if found_sqrt is not None:
+            s_start, rad_s, s_end = found_sqrt
+            prefix = s[:s_start].strip()
+            suffix = s[s_end:].strip()
+            items = []
+            if prefix:
+                p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                if p_node is None:
+                    return None
+                items.append(p_node)
+            rad_node = _decompose_big_frac_tree(rad_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            if rad_node is None:
+                return None
+            items.append({"op": "sqrt", "body": rad_node})
+            if suffix:
+                s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+                if s_node is None:
+                    return None
+                items.append(s_node)
+            return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
+
+    # 3. Very long expression (`>= 20` tokens) -> split cleanly at top-level `+` / `-`!
+    if len(toks) >= 20:
+        pm_split = _find_top_level_split(s, ("+", "-"))
+        if pm_split is not None:
+            pos, op_ch = pm_split
+            left_s = s[:pos].strip()
+            right_s = s[pos + 1 :].strip()
+            l_node = _decompose_big_frac_tree(left_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            r_node = _decompose_big_frac_tree(f"{op_ch} {right_s}", tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+            if l_node is not None and r_node is not None:
+                return {"op": "hcat", "items": [l_node, r_node]}
 
     if 1 <= len(toks) <= 56 and not tokenizer.has_unk(s):
         idx = len(cells)
@@ -446,15 +567,67 @@ _ENV_ALIGN_RE = re.compile(
 )
 
 
+_INLINE_MATRIX_RE = re.compile(
+    r"\\begin\{(bmatrix|pmatrix|vmatrix|matrix)\}(.*?)\\end\{\1\}",
+    re.DOTALL,
+)
+
+
+def _parse_matrix_equation(s: str, tokenizer: InkForgeTokenizer) -> StructuredPrompt | None:
+    """Parse multi-matrix equations like `A [a b \\ c d] [x \\ y] = [ax+by \\ cx+dy]` into a 2D tree."""
+    matches = list(_INLINE_MATRIX_RE.finditer(s))
+    if not matches:
+        return None
+    cells: list[str] = []
+    items: list[dict[str, Any]] = []
+    pos = 0
+    for m in matches:
+        gap = s[pos : m.start()].strip()
+        if gap:
+            if tokenizer.has_unk(gap) or len(tokenize_inkforge(gap)) > 24:
+                return None
+            idx = len(cells)
+            cells.append(gap)
+            items.append({"op": "cell", "i": idx})
+        env, body = m.group(1), m.group(2).strip()
+        rows_raw = [r.strip() for r in body.split(r"\\") if r.strip()]
+        if not (2 <= len(rows_raw) <= 4):
+            return None
+        grid_nodes: list[list[dict[str, Any]]] = []
+        for r in rows_raw:
+            cols = [c.strip() for c in r.split("&")]
+            if not (1 <= len(cols) <= 4):
+                return None
+            row_n: list[dict[str, Any]] = []
+            for c in cols:
+                if not c or tokenizer.has_unk(c) or len(tokenize_inkforge(c)) > 24:
+                    return None
+                idx = len(cells)
+                cells.append(c)
+                row_n.append({"op": "cell", "i": idx})
+            grid_nodes.append(row_n)
+        items.append({"op": "matrix", "env": env, "grid": grid_nodes})
+        pos = m.end()
+    tail = s[pos:].strip()
+    if tail:
+        if tokenizer.has_unk(tail) or len(tokenize_inkforge(tail)) > 24:
+            return None
+        idx = len(cells)
+        cells.append(tail)
+        items.append({"op": "cell", "i": idx})
+    tree = items[0] if len(items) == 1 else {"op": "hcat", "items": items, "gap": 0.42}
+    return StructuredPrompt(kind="tree", latex=s, cells=cells, meta={"tree": tree, "subkind": "matrix_eq"})
+
+
 def parse_unimer_prompt(latex: str, tokenizer: InkForgeTokenizer) -> StructuredPrompt | None:
     """Parse a clean UniMER formula into either a single-line or structured matrix/cases/multiline prompt."""
     s = (latex or "").strip()
     if not s or len(s) > 220:
         return None
 
-    # 1. Pure Matrix environment
+    # 1. Pure single Matrix environment
     m = _ENV_MATRIX_RE.match(s)
-    if m:
+    if m and r"\end{" not in m.group(2):
         env, body = m.group(1), m.group(2).strip()
         rows_raw = [r.strip() for r in body.split(r"\\") if r.strip()]
         if not (2 <= len(rows_raw) <= 4):
@@ -530,17 +703,23 @@ def parse_unimer_prompt(latex: str, tokenizer: InkForgeTokenizer) -> StructuredP
                 meta={"env": env},
             )
 
-    # 4. Standard single-line formula (or auto-decomposed big/nested fraction/radical!)
+    # 3b. Multi-matrix equation (e.g. `A [..] [..] = [..]`)
+    if _INLINE_MATRIX_RE.search(s) and r"\begin{cases}" not in s and r"\begin{aligned}" not in s:
+        meq = _parse_matrix_equation(s, tokenizer)
+        if meq is not None:
+            return meq
+
+    # 4. Standard single-line formula (or auto-decomposed long equation / big frac / sqrt / binom!)
     if r"\begin" in s or r"\end" in s or "&" in s or r"\\" in s:
         return None
     toks = tokenize_inkforge(s)
-    if not (4 <= len(toks) <= 110) or tokenizer.has_unk(s):
+    if not (4 <= len(toks) <= 120) or tokenizer.has_unk(s):
         return None
-    if r"\frac" in s and len(toks) >= 20:
+    if len(toks) >= 18 or r"\binom" in s or (r"\frac" in s and len(toks) >= 16) or (r"\sqrt" in s and len(toks) >= 12):
         cells: list[str] = []
-        tree = _decompose_big_frac_tree(s, tokenizer, cells, depth=0, max_depth=2)
+        tree = _decompose_big_frac_tree(s, tokenizer, cells, depth=0, max_depth=3)
         if tree is not None and len(cells) >= 2:
-            return StructuredPrompt(kind="tree", latex=s, cells=cells, meta={"tree": tree, "subkind": "big_frac"})
+            return StructuredPrompt(kind="tree", latex=s, cells=cells, meta={"tree": tree, "subkind": "long_tree"})
     if len(toks) > 80:
         return None
     return StructuredPrompt(kind="single", latex=s, cells=[s], meta={})
@@ -778,8 +957,32 @@ def sample_programmatic_structured_prompt(rng: random.Random) -> StructuredPromp
             latex = r" \\ ".join(lines)
         return StructuredPrompt(kind="multiline", latex=latex, cells=lines, meta={"env": "aligned" if use_aligned else "flat"})
 
-    # B. Matrix (2x2, 2x3, 3x3) with bmatrix / pmatrix / vmatrix (always delimited for unambiguous 2D layout!)
+    # B. Matrix (2x2, 2x3, 3x3) or Matrix Multiplication `A * x = b` (always delimited!)
     if choice < 0.75:
+        if rng.random() < 0.25:
+            # 2x2 Matrix-vector multiplication equation!
+            env = rng.choice(["bmatrix", "pmatrix"])
+            a1, a2, a3, a4 = [rng.choice(["a", "b", "c", "d", "1", "2", "3", "-1", "x", r"\lambda"]) for _ in range(4)]
+            v1, v2 = rng.choice([("x", "y"), ("u", "v"), ("1", "2")])
+            r1 = f"{a1}{v1} + {a2}{v2}" if a1 not in ("1", "-1") else f"{v1} + {a2}{v2}"
+            r2 = f"{a3}{v1} + {a4}{v2}" if a3 not in ("1", "-1") else f"{v1} + {a4}{v2}"
+            latex = (
+                f"\\begin{{{env}}} {a1} & {a2} \\\\ {a3} & {a4} \\end{{{env}}} "
+                f"\\begin{{{env}}} {v1} \\\\ {v2} \\end{{{env}}} = "
+                f"\\begin{{{env}}} {r1} \\\\ {r2} \\end{{{env}}}"
+            )
+            cells = [a1, a2, a3, a4, v1, v2, "=", r1, r2]
+            tree = {
+                "op": "hcat",
+                "gap": 0.40,
+                "items": [
+                    {"op": "matrix", "env": env, "grid": [[{"op": "cell", "i": 0}, {"op": "cell", "i": 1}], [{"op": "cell", "i": 2}, {"op": "cell", "i": 3}]]},
+                    {"op": "matrix", "env": env, "grid": [[{"op": "cell", "i": 4}], [{"op": "cell", "i": 5}]]},
+                    {"op": "cell", "i": 6},
+                    {"op": "matrix", "env": env, "grid": [[{"op": "cell", "i": 7}], [{"op": "cell", "i": 8}]]},
+                ],
+            }
+            return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": tree, "subkind": "matrix_eq"})
         env = rng.choice(["bmatrix", "pmatrix", "vmatrix"])
         rows = rng.choice([2, 2, 3])
         cols = rng.choice([2, 2, 3])
@@ -929,6 +1132,70 @@ def _assemble_ink_node(
         bx0, by0, bx1, by1 = strokes_bbox(out)
         out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
         return out, (0.0, 0.0, bx1 - bx0, by1 - by0), y_bar - by0
+
+    if op == "binom":
+        # Stacked binomial numerator over denominator (no bar; wrapped by `delim("(", ")")`)
+        scale = float(node.get("scale", 0.90))
+        top_st, (tx0, ty0, tx1, ty1), _ = _assemble_ink_node(node["top"], cell_strokes, rng, writer_slant)
+        bot_st, (bx0_i, by0_i, bx1_i, by1_i), _ = _assemble_ink_node(node["bot"], cell_strokes, rng, writer_slant)
+        tw, th = (tx1 - tx0) * scale, (ty1 - ty0) * scale
+        bw_i, bh_i = (bx1_i - bx0_i) * scale, (by1_i - by0_i) * scale
+        col_w = max(tw, bw_i, 0.7)
+        v_gap = float(rng.uniform(0.32, 0.52))
+        out = []
+        out.extend(_shift_scale_strokes(top_st, dx=0.5 * (col_w - tw) - tx0 * scale, dy=-ty0 * scale, scale=scale))
+        out.extend(_shift_scale_strokes(bot_st, dx=0.5 * (col_w - bw_i) - bx0_i * scale, dy=(th + v_gap) - by0_i * scale, scale=scale))
+        bx0, by0, bx1, by1 = strokes_bbox(out)
+        out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
+        return out, (0.0, 0.0, bx1 - bx0, by1 - by0), 0.5 * (by1 - by0)
+
+    if op == "matrix":
+        env = str(node.get("env", "bmatrix"))
+        grid_nodes: list[list[dict[str, Any]]] = node["grid"]
+        n_rows = len(grid_nodes)
+        n_cols = max(len(r) for r in grid_nodes)
+        assembled_grid = [
+            [_assemble_ink_node(ch, cell_strokes, rng, writer_slant) for ch in r]
+            for r in grid_nodes
+        ]
+        col_w = [0.7] * n_cols
+        row_h = [0.9] * n_rows
+        for r in range(n_rows):
+            for c, (_st, box, _ax) in enumerate(assembled_grid[r]):
+                col_w[c] = max(col_w[c], box[2] - box[0])
+                row_h[r] = max(row_h[r], box[3] - box[1])
+        col_gap = float(rng.uniform(0.55, 0.95))
+        row_gap = float(rng.uniform(0.48, 0.82))
+        col_xs, xc = [], 0.0
+        for cw in col_w:
+            col_xs.append(xc)
+            xc += cw + col_gap
+        mat_w = xc - col_gap
+        row_ys, yc = [], 0.0
+        for rh in row_h:
+            row_ys.append(yc)
+            yc += rh + row_gap
+        mat_h = yc - row_gap
+
+        left_d, right_d = {"bmatrix": ("[", "]"), "pmatrix": ("(", ")"), "vmatrix": ("|", "|")}.get(env, ("", ""))
+        out = []
+        x_start = 0.0
+        if left_d:
+            out.extend(draw_human_delimiter(left_d, 0.0, 0.0, mat_h, rng, slant=writer_slant))
+            x_start = float(rng.uniform(0.42, 0.65))
+        for r in range(n_rows):
+            for c, (st, (x0, y0, x1, y1), _ax) in enumerate(assembled_grid[r]):
+                if not st:
+                    continue
+                cw, ch = x1 - x0, y1 - y0
+                dx = x_start + col_xs[c] + 0.5 * (col_w[c] - cw) - x0 + float(rng.normal(0.0, 0.06))
+                dy = row_ys[r] + 0.5 * (row_h[r] - ch) - y0 + float(rng.normal(0.0, 0.05))
+                out.extend(_shift_scale_strokes(st, dx=dx, dy=dy))
+        if right_d:
+            out.extend(draw_human_delimiter(right_d, x_start + mat_w + float(rng.uniform(0.42, 0.65)), 0.0, mat_h, rng, slant=writer_slant))
+        bx0, by0, bx1, by1 = strokes_bbox(out)
+        out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
+        return out, (0.0, 0.0, bx1 - bx0, by1 - by0), 0.5 * (by1 - by0)
 
     if op == "sqrt":
         body_st, (x0, y0, x1, y1), y_ax = _assemble_ink_node(node["body"], cell_strokes, rng, writer_slant)

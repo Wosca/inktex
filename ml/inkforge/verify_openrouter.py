@@ -90,12 +90,22 @@ def record_strokes_to_arrays(rec: dict[str, Any]) -> list[np.ndarray]:
 def render_blind_audit_grid(
     strokes_batch: Sequence[list[np.ndarray]],
     *,
-    cols: int = 3,
-    tile_w: int = 480,
-    tile_h: int = 240,
+    cols: int | None = None,
+    tile_w: int | None = None,
+    tile_h: int | None = None,
 ) -> bytes:
-    """Render numbered tiles `#1..#N` onto a clean PNG WITHOUT printing ground-truth LaTeX."""
+    """Render numbered tiles `#1..#N` onto a high-res PNG WITHOUT printing ground-truth LaTeX.
+
+    For small batches (`<= 3` tiles), defaults to a 1-column vertical stack (`900x240` per equation)
+    giving maximum pixel clarity for long equations, subscripts, accents, and rare Greek letters!
+    """
     n = len(strokes_batch)
+    if cols is None:
+        cols = 1 if n <= 3 else (2 if n <= 6 else 3)
+    if tile_w is None:
+        tile_w = 900 if cols == 1 else (620 if cols == 2 else 480)
+    if tile_h is None:
+        tile_h = 240
     rows = max(1, (n + cols - 1) // cols)
     pad = 8
     canvas = Image.new("RGB", (cols * (tile_w + pad) + pad, rows * (tile_h + pad) + pad), (232, 235, 240))
@@ -195,10 +205,12 @@ def call_openrouter_audit_grid(
     if mode == "blind":
         prompt = (
             f"The attached image contains {n_tiles} numbered handwritten math tiles (#1 to #{n_tiles}).\n"
-            "For EACH tile, blindly transcribe the exact handwritten math you actually see into standard LaTeX "
-            "(do NOT guess or auto-correct broken characters; write exactly what is drawn) and mark "
-            '"legible": true if it is clean readable handwriting or false if garbled/overlapping/corrupted.\n'
-            "Use \\\\ for line breaks, \\begin{matrix}/\\begin{bmatrix}/\\begin{pmatrix} for matrices, "
+            "For EACH tile, blindly transcribe LITERALLY every symbol actually drawn into standard LaTeX.\n"
+            "CRITICAL ANTI-HALLUCINATION RULE: Do NOT auto-complete famous textbook formulas (like Bayes' theorem, "
+            "Binomial theorem, or Quadratic formula) from memory! If a bar (\\bar{A}), parenthesis, exponent, "
+            "or character is missing, miswritten, or repeated in the ink, transcribe the literal broken ink and "
+            'set "legible": false.\n'
+            "Use \\\\ for line breaks, \\begin{bmatrix}/\\begin{pmatrix}/\\begin{vmatrix} for matrices, "
             "and \\begin{cases} for piecewise functions.\n"
             'Return ONLY valid JSON (double-escape every LaTeX backslash like \\\\frac) mapping tile number '
             'to {"latex": "...", "legible": true/false, "reason": "short note"}, e.g.:\n'
@@ -296,7 +308,7 @@ def audit_shard(
     *,
     models: Sequence[str] = DEFAULT_FREE_MODELS,
     mode: str = "blind",
-    tiles_per_call: int = 9,
+    tiles_per_call: int = 3,
     min_delay_s: float = 3.2,
     max_samples: int = 0,
 ) -> dict[str, int]:
@@ -336,7 +348,7 @@ def audit_shard(
             t0 = time.perf_counter()
             strokes_batch = [record_strokes_to_arrays(r) for r in batch]
             targets = [str(r.get("latexNormalized") or r.get("latex") or "") for r in batch]
-            png_bytes = render_blind_audit_grid(strokes_batch, cols=3)
+            png_bytes = render_blind_audit_grid(strokes_batch)
             verdicts, used_model = call_openrouter_audit_grid(png_bytes, targets, api_key, models=models, mode=mode)
             stats["calls"] += 1
 
@@ -381,7 +393,7 @@ def main() -> None:
     parser.add_argument("--out-rejected", type=Path, default=None, help="Output rejected JSONL")
     parser.add_argument("--models", nargs="+", default=DEFAULT_FREE_MODELS, help="OpenRouter model IDs to rotate")
     parser.add_argument("--mode", choices=("blind", "verify"), default="blind", help="blind=zero-sycophancy transcribe+compare")
-    parser.add_argument("--tiles-per-call", type=int, default=9, help="Equations packed per 3x3 grid API call")
+    parser.add_argument("--tiles-per-call", type=int, default=3, help="Equations packed per high-res grid API call (default 3 = 1x3 vertical strip)")
     parser.add_argument("--min-delay", type=float, default=3.2, help="Min seconds between free-tier calls")
     parser.add_argument("--max-samples", type=int, default=0, help="Optional cap for quick sampling audit (0=all)")
     parser.add_argument("--api-key-file", type=Path, default=None, help="Optional path to file containing OPENROUTER_API_KEY")

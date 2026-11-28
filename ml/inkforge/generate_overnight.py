@@ -45,22 +45,30 @@ from v2.eval_v2 import _safe_std_v2, load_v2_checkpoint  # noqa: E402
 
 
 def _is_dangling_prefix_cell(latex: str) -> bool:
-    """Short operator-terminated prefix cells like `f(x) =` or `1 +`."""
+    """Short operator-bounded chunk cells like `f(x) =`, `1 +`, `= f(x)`, or `+ 2xy`."""
     s = latex.strip()
-    return len(tokenize_inkforge(s)) <= 6 and s.endswith(("=", "+", "-"))
+    return len(tokenize_inkforge(s)) <= 12 and (s.endswith(("=", "+", "-")) or s.startswith(("=", "+", "-")))
 
 
 def _prefix_tokens_match(target_latex: str, pred_latex: str) -> bool:
-    """Verify dangling prefixes like `r =` (catches `0 =` while allowing trailing-operator quirks)."""
+    """Verify operator-bounded split chunks (catches `0 =` vs `r =`, allows leading/trailing op quirks)."""
     t_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(target_latex)))
     p_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(pred_latex)))
     if not t_toks or not p_toks:
         return False
     if p_toks == t_toks:
         return True
-    # Also accept if core tokens before trailing `=` / `+` / `-` match exactly
-    t_core = t_toks[:-1] if t_toks[-1] in ("=", "+", "-") else t_toks
-    p_core = p_toks[:-1] if p_toks[-1] in ("=", "+", "-") else p_toks
+    ops = ("=", "+", "-")
+    t_core = list(t_toks)
+    p_core = list(p_toks)
+    if t_core and t_core[-1] in ops:
+        t_core = t_core[:-1]
+    if p_core and p_core[-1] in ops:
+        p_core = p_core[:-1]
+    if t_core and t_core[0] in ops:
+        t_core = t_core[1:]
+    if p_core and p_core[0] in ops:
+        p_core = p_core[1:]
     return bool(t_core) and p_core == t_core
 
 

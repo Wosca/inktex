@@ -73,17 +73,98 @@ def build_hard_prompt_pool(
     *,
     unimer_path: Path = DEFAULT_UNIMER_JSONL,
     max_unimer: int = 25000,
+    prompt_mode: str = "mixed",
     seed: int = 42,
 ) -> list[str]:
-    """Build a diverse LaTeX prompt pool heavy on radicals, sums, limits, fractions, trig, and STEM formulas."""
+    """Build a diverse LaTeX prompt pool heavy on radicals, sums, limits, fractions, trig, and rare STEM symbols.
+
+    `prompt_mode`:
+      - `"mixed"` (default): curated hard structures + 25k UniMER formulas.
+      - `"weak_symbols"` (Stage 2.5): laser-focused on InkForge's measured weak spots (`\\ln`, `\\log`,
+        `\\bar`/`\\hat`/`\\tilde`, `\\binom`, rare Greek `\\xi,\\zeta,\\eta,\\kappa,\\Psi,\\Phi,\\Omega`,
+        `\\prod`, `\\lim`, `\\sum`, `\\text{if } x > k`, logic/sets, and physics equations).
+    """
     rng = random.Random(seed)
     prompts: list[str] = []
 
-    # 1. Curated programmatic hard-structure prompts (heavy on v1/v2 failure modes, especially \sum!)
     vars_a = ["x", "y", "z", "t", "n", "k", "a", "b", "c", "r", "u", "v"]
-    digits = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    caps = ["A", "B", "C", "E", "F", "P", "X", "Y"]
+    digits = ["2", "3", "4", "5", "6", "7", "8", "9"]
     greeks = [r"\alpha", r"\beta", r"\gamma", r"\theta", r"\lambda", r"\mu", r"\sigma", r"\omega"]
+    rare_greeks = [r"\xi", r"\zeta", r"\eta", r"\kappa", r"\tau", r"\rho", r"\chi", r"\varphi", r"\psi", r"\phi"]
+    cap_greeks = [r"\Psi", r"\Phi", r"\Omega", r"\Lambda", r"\Gamma", r"\Delta", r"\Sigma"]
     idx_vars = ["i", "j", "k", "m"]
+
+    if prompt_mode == "weak_symbols":
+        for _ in range(8000):
+            v1, v2, v3 = rng.sample(vars_a, 3)
+            c1, c2 = rng.sample(caps, 2)
+            d1, d2 = rng.choice(digits), rng.choice(digits)
+            op = rng.choice(["+", "-"])
+            g1, g2 = rng.sample(rare_greeks, 2)
+            cg1, cg2 = rng.sample(cap_greeks, 2)
+            iv = rng.choice(idx_vars)
+            b = rng.randrange(14)
+            if b == 0:
+                p = f"\\ln({v1} {op} {d1}) = {v2}"
+            elif b == 1:
+                p = f"\\ln({d1}{v1}^2 {op} {d2}) + \\log({v2})"
+            elif b == 2:
+                p = f"\\frac{{d}}{{d{v1}}} \\ln({v1} + {d1}) = \\frac{{1}}{{{v1} + {d1}}}"
+            elif b == 3:
+                p = f"P({c1} | \\bar{{{c2}}}) P(\\bar{{{c2}}}) = P({c1} \\cap \\bar{{{c2}}})"
+            elif b == 4:
+                p = f"\\bar{{{v1}}} + \\hat{{{v2}}} = \\tilde{{{g1}}}"
+            elif b == 5:
+                p = f"\\binom{{{v1}}}{{{iv}}} {v2}^{iv} {v3}^{{{v1}-{iv}}}"
+            elif b == 6:
+                p = f"{g1} + {g2} = {cg1}({v1}) {op} {cg2}({v2})"
+            elif b == 7:
+                p = f"\\Psi({v1},{v2}) = \\Phi({v1}) e^{{-i \\omega {v2}}}"
+            elif b == 8:
+                p = f"\\prod_{{{iv}=1}}^{v1} (1 + \\frac{{1}}{{{iv}}}) = {v1} + 1"
+            elif b == 9:
+                p = f"\\lim_{{{v1} \\rightarrow \\infty}} (1 + \\frac{{1}}{{{v1}}})^{v1} = e"
+            elif b == 10:
+                p = f"\\sum_{{{iv}=1}}^{v1} {iv} = \\frac{{{v1}({v1}+1)}}{{2}}"
+            elif b == 11:
+                p = f"\\text{{if }} {v1} > {d1}"
+            elif b == 12:
+                p = f"\\forall {v1} \\in \\mathbb{{R}}, \\exists {v2} \\in \\mathbb{{Z}}"
+            else:
+                p = f"\\nabla \\times \\vec{{{c1}}} = -\\frac{{\\partial \\vec{{{c2}}}}}{{\\partial {v1}}}"
+            if not tokenizer.has_unk(p) and len(tokenize_inkforge(p)) <= 42:
+                prompts.append(p)
+        # Also mix 2,000 hard UniMER formulas containing rare symbols (\ln, \bar, \hat, \tilde, \binom, rare Greek)
+        if unimer_path.is_file():
+            rare_markers = (r"\ln", r"\log", r"\bar", r"\hat", r"\tilde", r"\binom", r"\xi", r"\zeta", r"\eta", r"\kappa", r"\Psi", r"\Phi", r"\Omega", r"\prod", r"\nabla", r"\forall", r"\exists")
+            unimer_rare: list[str] = []
+            with unimer_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if len(unimer_rare) >= 6000:
+                        break
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    tex = (rec.get("latex") or rec.get("text") or "").strip()
+                    if not tex or len(tex) > 80 or r"\begin{" in tex or r"\\" in tex:
+                        continue
+                    if not any(m in tex for m in rare_markers):
+                        continue
+                    if tokenizer.has_unk(tex):
+                        continue
+                    toks = tokenize_inkforge(tex)
+                    if 4 <= len(toks) <= 36:
+                        unimer_rare.append(tex)
+            rng.shuffle(unimer_rare)
+            prompts.extend(unimer_rare[:2000])
+        seen: set[str] = set()
+        uniq = [p for p in prompts if not (p in seen or seen.add(p))]
+        rng.shuffle(uniq)
+        return uniq
+
+    # 1. Curated programmatic hard-structure prompts (heavy on v1/v2 failure modes, especially \sum!)
     for _ in range(5000):
         v1, v2, v3 = rng.sample(vars_a, 3)
         d1, d2 = rng.choice(digits), rng.choice(digits)
@@ -182,6 +263,8 @@ def _canonicalize_judge_latex(latex: str) -> str:
     s = latex.strip()
     s = re.sub(r"\\(?:mathrm|operatorname|text)\s*\{\s*Pr\s*\}", r"\\Pr", s)
     s = s.replace(r"\dots", r"\ldots")
+    # Fold bare function names emitted without backslash by InkTeX v2 (e.g. `sin x` -> `\sin x`)
+    s = re.sub(r"(?<!\\)\b(sin|cos|tan|cot|sec|csc|ln|log|exp|lim|det|max|min)\b", r"\\\1", s)
     return s
 
 
@@ -542,10 +625,13 @@ def run_star_dpo(args: argparse.Namespace) -> None:
     )
 
     # 4. Build hard prompt pool + held-out fixed eval prompts for post-update best.pt selection
-    prompt_pool = build_hard_prompt_pool(tokenizer, seed=args.seed)
+    prompt_pool = build_hard_prompt_pool(tokenizer, prompt_mode=args.prompt_mode, seed=args.seed)
     eval_count = min(128, max(16, len(prompt_pool) // 20))
-    fixed_eval_prompts = list(PREVIEW_PROMPTS) + [p for p in prompt_pool[:eval_count] if p not in PREVIEW_PROMPTS]
-    fixed_eval_prompts = fixed_eval_prompts[:eval_count]
+    if args.prompt_mode == "weak_symbols":
+        fixed_eval_prompts = list(prompt_pool[:eval_count])
+    else:
+        fixed_eval_prompts = list(PREVIEW_PROMPTS) + [p for p in prompt_pool[:eval_count] if p not in PREVIEW_PROMPTS]
+        fixed_eval_prompts = fixed_eval_prompts[:eval_count]
     fixed_eval_set = set(fixed_eval_prompts)
     train_prompt_pool = [p for p in prompt_pool if p not in fixed_eval_set] or prompt_pool
 
@@ -960,6 +1046,7 @@ def main() -> None:
     parser.add_argument("--sft-weight", type=float, default=0.25)
     parser.add_argument("--replay-weight", type=float, default=0.35)
     parser.add_argument("--lr", type=float, default=1.0e-5)
+    parser.add_argument("--prompt-mode", choices=("mixed", "weak_symbols"), default="mixed")
     parser.add_argument("--grad-checkpoint", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
