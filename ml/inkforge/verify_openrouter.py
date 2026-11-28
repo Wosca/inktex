@@ -37,11 +37,17 @@ from tokenizer.latex_tokenizer import tokenize_latex  # noqa: E402
 from v2.eval_v2 import _safe_std_v2  # noqa: E402
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_FREE_MODELS = [
     "nvidia/nemotron-3.5-super-vl:free",
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     "openrouter/free",
     "google/gemma-4-31b-it:free",
+]
+DEFAULT_GEMINI_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemma-4-26b-a4b-it",
 ]
 
 
@@ -196,11 +202,12 @@ def call_openrouter_audit_grid(
     api_key: str,
     *,
     models: Sequence[str] = DEFAULT_FREE_MODELS,
+    provider: str = "openrouter",
     mode: str = "blind",
     timeout_s: int = 60,
-    max_retries: int = 5,
+    max_retries: int = 6,
 ) -> tuple[dict[int, dict[str, Any]], str]:
-    """Send a numbered grid PNG to OpenRouter free vision models (`blind` transcription or `verify` mode)."""
+    """Send a numbered grid PNG to Gemini API or OpenRouter free vision models (`blind` or `verify` mode)."""
     b64 = base64.b64encode(png_bytes).decode("ascii")
     n_tiles = len(target_latex_list)
     if mode == "blind":
@@ -209,8 +216,8 @@ def call_openrouter_audit_grid(
             "For EACH tile, blindly transcribe LITERALLY every symbol actually drawn into standard LaTeX.\n"
             "CRITICAL ANTI-HALLUCINATION RULE: Do NOT auto-complete famous textbook formulas (like Bayes' theorem, "
             "Binomial theorem, or Quadratic formula) from memory! If a bar (\\bar{A}), parenthesis, exponent, "
-            "or character is missing, miswritten, or repeated in the ink, transcribe the literal broken ink and "
-            'set "legible": false.\n'
+            "or character is missing, miswritten, merged, or ambiguous (e.g. `Si1x` instead of `\\sin x`, `t` instead of `+`, "
+            "or missing `\\sum`), transcribe the literal broken ink and set \"legible\": false.\n"
             "Use \\\\ for line breaks, \\begin{bmatrix}/\\begin{pmatrix}/\\begin{vmatrix} for matrices, "
             "and \\begin{cases} for piecewise functions.\n"
             'Return ONLY valid JSON (double-escape every LaTeX backslash like \\\\frac) mapping tile number '
@@ -233,39 +240,72 @@ def call_openrouter_audit_grid(
     last_err: Exception | None = None
     for attempt in range(max_retries):
         model_id = models[attempt % len(models)]
-        payload: dict[str, Any] = {
-            "model": model_id,
-            "temperature": 0.0,
-            "max_tokens": 2200,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    ],
-                }
-            ],
-        }
-        if model_id != "openrouter/free":
-            payload["reasoning"] = {"effort": "none"}
-        req = urllib.request.Request(
-            OPENROUTER_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/Wosca/inktex",
-                "X-Title": "InkForge Synthetic Data Auditor",
-            },
-            method="POST",
-        )
+        if provider == "gemini":
+            url = f"{GEMINI_API_BASE}/{model_id}:generateContent"
+            gen_cfg: dict[str, Any] = {"temperature": 0.0}
+            if not model_id.startswith("gemma"):
+                gen_cfg["responseMimeType"] = "application/json"
+            if "3.1-flash-lite" in model_id or "2.5-flash" in model_id:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+            payload: dict[str, Any] = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt},
+                            {"inlineData": {"mimeType": "image/png", "data": b64}},
+                        ]
+                    }
+                ],
+                "generationConfig": gen_cfg,
+            }
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "x-goog-api-key": api_key,
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+        else:
+            payload = {
+                "model": model_id,
+                "temperature": 0.0,
+                "max_tokens": 2200,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                        ],
+                    }
+                ],
+            }
+            if model_id != "openrouter/free":
+                payload["reasoning"] = {"effort": "none"}
+            req = urllib.request.Request(
+                OPENROUTER_URL,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/Wosca/inktex",
+                    "X-Title": "InkForge Synthetic Data Auditor",
+                },
+                method="POST",
+            )
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            msg = data["choices"][0]["message"]
-            content = (msg.get("content") or "").strip() or (msg.get("reasoning") or "").strip()
-            used_model = str(data.get("model", model_id))
+            if provider == "gemini":
+                parts = data["candidates"][0]["content"]["parts"]
+                content = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+                used_model = model_id
+            else:
+                msg = data["choices"][0]["message"]
+                content = (msg.get("content") or "").strip() or (msg.get("reasoning") or "").strip()
+                used_model = str(data.get("model", model_id))
             verdicts = parse_vlm_verdict_json(content, n_tiles)
             if mode == "blind":
                 for idx, target_tex in enumerate(target_latex_list, start=1):
@@ -285,21 +325,22 @@ def call_openrouter_audit_grid(
             return verdicts, used_model
         except urllib.error.HTTPError as e:
             last_err = e
-            wait_s = min(20.0, 2.0 * (attempt + 1))
-            if e.code in (429, 502, 503, 504):
-                time.sleep(wait_s)
-                continue
             body = ""
             try:
-                body = e.read().decode("utf-8", errors="ignore")[:300]
+                body = e.read().decode("utf-8", errors="ignore")[:500]
             except Exception:
                 pass
-            raise RuntimeError(f"OpenRouter HTTP {e.code} on {model_id}: {body}") from e
+            if e.code in (429, 502, 503, 504):
+                m_wait = re.search(r"retry in (\d+(?:\.\d+)?)s", body, re.IGNORECASE)
+                wait_s = min(25.0, float(m_wait.group(1)) + 0.5) if (m_wait and len(models) == 1) else min(15.0, 2.5 * (attempt + 1))
+                time.sleep(wait_s)
+                continue
+            raise RuntimeError(f"{provider} HTTP {e.code} on {model_id}: {body}") from e
         except Exception as e:
             last_err = e
             time.sleep(2.0 * (attempt + 1))
 
-    raise RuntimeError(f"OpenRouter audit failed after {max_retries} retries: {last_err}")
+    raise RuntimeError(f"{provider} audit failed after {max_retries} retries: {last_err}")
 
 
 def call_openrouter_single_recheck(
@@ -309,8 +350,9 @@ def call_openrouter_single_recheck(
     api_key: str,
     *,
     models: Sequence[str] = DEFAULT_FREE_MODELS,
+    provider: str = "openrouter",
     timeout_s: int = 60,
-    max_retries: int = 4,
+    max_retries: int = 6,
 ) -> tuple[dict[str, Any], str]:
     """Individual high-res (960x320) BLIND single-equation re-transcription on Pass-1 disagreements.
 
@@ -324,6 +366,7 @@ def call_openrouter_single_recheck(
         [target_latex],
         api_key,
         models=models,
+        provider=provider,
         mode="blind",
         timeout_s=timeout_s,
         max_retries=max_retries,
@@ -343,10 +386,11 @@ def audit_shard(
     api_key: str,
     *,
     models: Sequence[str] = DEFAULT_FREE_MODELS,
+    provider: str = "openrouter",
     mode: str = "blind",
     tiles_per_call: int = 3,
     recheck_failed: bool = True,
-    min_delay_s: float = 3.2,
+    min_delay_s: float = 4.2,
     max_samples: int = 0,
 ) -> dict[str, int]:
     """Resumable batch VLM auditor over a `stroke-latex-v1` JSONL shard."""
@@ -375,10 +419,10 @@ def audit_shard(
 
     stats = {"accepted": 0, "rejected": 0, "calls": 0}
     if not pending_recs:
-        print(f"[openrouter-audit] Nothing left to audit in {input_jsonl}")
+        print(f"[vlm-audit] Nothing left to audit in {input_jsonl}")
         return stats
 
-    print(f"[openrouter-audit] Auditing {len(pending_recs):,} samples ({tiles_per_call}/call) via {models[0]}...")
+    print(f"[vlm-audit:{provider}] Auditing {len(pending_recs):,} samples ({tiles_per_call}/call) via {models[0]}...")
     with out_verified.open("a", encoding="utf-8") as fv, out_rejected.open("a", encoding="utf-8") as fr:
         for start in range(0, len(pending_recs), tiles_per_call):
             batch = pending_recs[start : start + tiles_per_call]
@@ -386,7 +430,9 @@ def audit_shard(
             strokes_batch = [record_strokes_to_arrays(r) for r in batch]
             targets = [str(r.get("latexNormalized") or r.get("latex") or "") for r in batch]
             png_bytes = render_blind_audit_grid(strokes_batch)
-            verdicts, used_model = call_openrouter_audit_grid(png_bytes, targets, api_key, models=models, mode=mode)
+            verdicts, used_model = call_openrouter_audit_grid(
+                png_bytes, targets, api_key, models=models, provider=provider, mode=mode
+            )
             stats["calls"] += 1
 
             for i, rec in enumerate(batch):
@@ -394,13 +440,14 @@ def audit_shard(
                 recheck_info: dict[str, Any] | None = None
                 if (not v["ok"]) and recheck_failed and strokes_batch[i]:
                     try:
-                        time.sleep(max(1.2, min_delay_s * 0.5))
+                        time.sleep(max(1.5, min_delay_s))
                         rv, r_model = call_openrouter_single_recheck(
                             strokes_batch[i],
                             targets[i],
                             v.get("latex", ""),
                             api_key,
                             models=models,
+                            provider=provider,
                         )
                         stats["calls"] += 1
                         recheck_info = {"model": r_model, **rv}
@@ -415,6 +462,7 @@ def audit_shard(
 
                 rec.setdefault("metadata", {})
                 rec["metadata"]["vlm_audit"] = {
+                    "provider": provider,
                     "model": used_model,
                     "mode": mode,
                     "ok": v["ok"],
@@ -434,7 +482,7 @@ def audit_shard(
             total_done = stats["accepted"] + stats["rejected"]
             acc_pct = 100.0 * stats["accepted"] / max(1, total_done)
             print(
-                f"[openrouter-audit] {total_done}/{len(pending_recs)} | "
+                f"[vlm-audit:{provider}] {total_done}/{len(pending_recs)} | "
                 f"accept={acc_pct:.1f}% ({stats['accepted']} ok / {stats['rejected']} rej) | "
                 f"model={used_model}",
                 flush=True,
@@ -447,32 +495,36 @@ def audit_shard(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Audit InkForge synthetic shards using free OpenRouter vision models")
+    parser = argparse.ArgumentParser(description="Audit InkForge synthetic shards using free Gemini or OpenRouter vision models")
     parser.add_argument("--input", type=Path, required=True, help="Input stroke-latex-v1 JSONL shard")
     parser.add_argument("--out-verified", type=Path, required=True, help="Output verified JSONL")
     parser.add_argument("--out-rejected", type=Path, default=None, help="Output rejected JSONL")
-    parser.add_argument("--models", nargs="+", default=DEFAULT_FREE_MODELS, help="OpenRouter model IDs to rotate")
+    parser.add_argument("--provider", choices=("gemini", "openrouter"), default="gemini", help="Vision API provider (default: gemini)")
+    parser.add_argument("--models", nargs="+", default=None, help="Model IDs to rotate (default: provider's free vision stack)")
     parser.add_argument("--mode", choices=("blind", "verify"), default="blind", help="blind=zero-sycophancy transcribe+compare")
     parser.add_argument("--tiles-per-call", type=int, default=3, help="Equations packed per high-res grid API call (default 3 = 1x3 vertical strip)")
     parser.add_argument("--no-recheck-failed", action="store_true", help="Disable individual high-res single-image tiebreaker on Pass-1 fails")
-    parser.add_argument("--min-delay", type=float, default=3.2, help="Min seconds between free-tier calls")
+    parser.add_argument("--min-delay", type=float, default=4.2, help="Min seconds between free-tier calls (4.2s = 14.2 RPM < 15 RPM limit)")
     parser.add_argument("--max-samples", type=int, default=0, help="Optional cap for quick sampling audit (0=all)")
-    parser.add_argument("--api-key-file", type=Path, default=None, help="Optional path to file containing OPENROUTER_API_KEY")
+    parser.add_argument("--api-key-file", type=Path, default=None, help="Optional path to file containing API key")
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    env_var = "GEMINI_API_KEY" if args.provider == "gemini" else "OPENROUTER_API_KEY"
+    api_key = os.environ.get(env_var, "").strip()
     if not api_key and args.api_key_file and args.api_key_file.is_file():
         api_key = args.api_key_file.read_text(encoding="utf-8").strip()
     if not api_key:
-        raise SystemExit("Missing OPENROUTER_API_KEY environment variable (or --api-key-file).")
+        raise SystemExit(f"Missing {env_var} environment variable (or --api-key-file).")
 
+    models = args.models or (DEFAULT_GEMINI_MODELS if args.provider == "gemini" else DEFAULT_FREE_MODELS)
     out_rej = args.out_rejected or args.out_verified.with_name(args.out_verified.stem + "_rejected.jsonl")
     audit_shard(
         args.input,
         args.out_verified,
         out_rej,
         api_key,
-        models=args.models,
+        models=models,
+        provider=args.provider,
         mode=args.mode,
         tiles_per_call=args.tiles_per_call,
         recheck_failed=(not args.no_recheck_failed),

@@ -116,9 +116,10 @@ def build_hard_prompt_pool(
             elif b == 4:
                 p = f"\\bar{{{v1}}} + \\hat{{{v2}}} = \\tilde{{{g1}}}"
             elif b == 5:
-                p = f"\\binom{{{v1}}}{{{iv}}} {v2}^{iv} {v3}^{{{v1}-{iv}}}"
+                p = f"\\sum_{{{iv}=0}}^\\infty \\frac{{{v1}^{iv}}}{{{iv}!}} = e^{v1}"
             elif b == 6:
-                p = f"{g1} + {g2} = {cg1}({v1}) {op} {cg2}({v2})"
+                g3 = rng.choice([g for g in rare_greeks if g not in (g1, g2)])
+                p = f"{g1} + {g2} = {g3} {v1} {op} {cg1}({v2})"
             elif b == 7:
                 p = f"\\Psi({v1},{v2}) = \\Phi({v1}) e^{{-i \\omega {v2}}}"
             elif b == 8:
@@ -256,6 +257,29 @@ def raw_trace_to_inkforge_item(
         "target_pen": t_pen,
         "style_z": np.asarray(style_z, dtype=np.float32),
     }
+
+
+_ZERO_COUNT_FUNC_RE = re.compile(
+    r"\\(ln|exp|det|max|min|cot|sec|csc|sinh|cosh|tanh|arcsin|arccos|arctan|arg|deg|dim|gcd|ker)(?![a-zA-Z])"
+)
+_SINGLE_TOKEN_BRACE_RE = re.compile(r"([_^])\{\s*(\\[a-zA-Z]+|[A-Za-z0-9])\s*\}")
+
+
+def normalize_cell_for_inkforge(latex: str) -> str:
+    """Map zero-training-count tokens & redundant single-token braces to InkForge v2's trained format.
+
+    Only used when conditioning InkForge's text encoder — the original canonical LaTeX is ALWAYS preserved
+    for the InkTeX v2 judge and the saved dataset label!
+    """
+    s = latex.strip()
+    s = re.sub(r"\\bar(?![a-zA-Z])", r"\\overline", s)
+    s = re.sub(r"\\widehat(?![a-zA-Z])", r"\\hat", s)
+    s = re.sub(r"\\widetilde(?![a-zA-Z])", r"\\tilde", s)
+    s = _ZERO_COUNT_FUNC_RE.sub(r"\\text{\1}", s)
+    s = re.sub(r"\\(?:mathbf|boxed)\s*\{([^{}]*)\}", r"\1", s)
+    s = s.replace("~", " ")
+    s = _SINGLE_TOKEN_BRACE_RE.sub(r"\1\2", s)
+    return s
 
 
 def _canonicalize_judge_latex(latex: str) -> str:
@@ -505,7 +529,7 @@ def _evaluate_fixed_prompts(
     """Deterministic post-update evaluation on a fixed prompt + style subset."""
     ema_model.to(device)
     ema_model.eval()
-    eval_enc = [tokenizer.encode(p, max_len=ema_model.cfg.max_text_len) for p in eval_prompts]
+    eval_enc = [tokenizer.encode(normalize_cell_for_inkforge(p), max_len=ema_model.cfg.max_text_len) for p in eval_prompts]
     devices = [device] if device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
@@ -584,8 +608,12 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    # Load writer style bank if available
+    # Load writer style bank if available (with fallback to base Stage 1 bank so rollouts never collapse to z=0 only)
     style_bank_path = args.init_ckpt.parent / "writer_styles.npz"
+    if not style_bank_path.is_file():
+        fallback_bank = Path(r"E:\math-recogniser-training\inkforge_v2_model\writer_styles.npz")
+        if fallback_bank.is_file():
+            style_bank_path = fallback_bank
     if style_bank_path.is_file():
         z_bank = np.load(style_bank_path)["mu_bank"].astype(np.float32)
         print(f"[star-dpo] Loaded {len(z_bank)} writer styles from {style_bank_path}", flush=True)
@@ -710,7 +738,7 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         ema_model.to(device)
         ema_model.eval()
         rollout_rows: list[dict[str, Any]] = []
-        encoded_prompts = [tokenizer.encode(p, max_len=cfg.max_text_len) for p in rd_prompts]
+        encoded_prompts = [tokenizer.encode(normalize_cell_for_inkforge(p), max_len=cfg.max_text_len) for p in rd_prompts]
         k_roll = args.rollouts_per_prompt
 
         for start in range(0, len(rd_prompts), args.gen_batch_size):

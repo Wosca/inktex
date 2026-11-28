@@ -39,43 +39,22 @@ from inkforge.composer import (  # noqa: E402
 )
 from inkforge.model import InkForgeConfig, InkForgeModel  # noqa: E402
 from inkforge.render import render_contact_sheet  # noqa: E402
-from inkforge.star_dpo import DEFAULT_INKTEX_V2_CKPT, _canonicalize_judge_latex, judge_rollouts_with_inktex  # noqa: E402
+from inkforge.star_dpo import (  # noqa: E402
+    DEFAULT_INKTEX_V2_CKPT,
+    _canonicalize_judge_latex,
+    judge_rollouts_with_inktex,
+    normalize_cell_for_inkforge,
+)
 from inkforge.tokenizer import InkForgeTokenizer, tokenize_inkforge  # noqa: E402
 from tokenizer.latex_tokenizer import tokenize_latex  # noqa: E402
 from v2.eval_v2 import _safe_std_v2, load_v2_checkpoint  # noqa: E402
 
 
-_ZERO_COUNT_FUNC_RE = re.compile(
-    r"\\(ln|exp|det|max|min|cot|sec|csc|sinh|cosh|tanh|arcsin|arccos|arctan|arg|deg|dim|gcd|ker)(?![a-zA-Z])"
-)
-_SINGLE_TOKEN_BRACE_RE = re.compile(r"([_^])\{\s*(\\[a-zA-Z]+|[A-Za-z0-9])\s*\}")
 _SINGLE_CHAR_AMBIG_MAP = {
     "C": "c", "K": "k", "O": "o", "P": "p", "S": "s",
     "V": "v", "W": "w", "X": "x", "Y": "y", "Z": "z",
     r"\Pi": r"\pi",
 }
-
-
-def normalize_cell_for_inkforge(latex: str) -> str:
-    """Map zero-training-count tokens & redundant single-token braces to InkForge v2's trained format.
-
-    Only used when conditioning InkForge's text encoder — the original canonical LaTeX is ALWAYS preserved
-    for the InkTeX v2 judge and the saved dataset label!
-    """
-    s = latex.strip()
-    # Zero-count accents -> exact trained visual equivalents (`\overline`: 17,289, `\hat`: 21,152, `\tilde`: 12,328)
-    s = re.sub(r"\\bar(?![a-zA-Z])", r"\\overline", s)
-    s = re.sub(r"\\widehat(?![a-zA-Z])", r"\\hat", s)
-    s = re.sub(r"\\widetilde(?![a-zA-Z])", r"\\tilde", s)
-    # Zero-count named functions -> plain roman text letters (matches `inkforge_data_v2`, e.g. `ln(x+1)`)
-    s = _ZERO_COUNT_FUNC_RE.sub(r"\\text{\1}", s)
-    # Unwrap zero-count styling wrappers (`\mathbf{x}` -> `x`, `\boxed{x}` -> `x`)
-    s = re.sub(r"\\(?:mathbf|boxed)\s*\{([^{}]*)\}", r"\1", s)
-    s = s.replace("~", " ")
-    # Strip redundant braces around single-token scripts (`^{\infty}` -> `^\infty`, `^{n}` -> `^n`)
-    # matching Standardizer v2's exact format in `inkforge_data_v2`!
-    s = _SINGLE_TOKEN_BRACE_RE.sub(r"\1\2", s)
-    return s
 
 
 def _is_dangling_prefix_cell(latex: str) -> bool:
