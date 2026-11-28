@@ -257,8 +257,8 @@ def draw_human_sqrt(
     check_w = min(1.15, max(0.55, 0.32 * h))
     x_valley = x_left - float(rng.uniform(0.24, 0.42))
     x_hook = x_valley - check_w * float(rng.uniform(0.45, 0.65))
-    x_peak = x_left - float(rng.uniform(0.02, 0.12))
-    x_end = x_right + float(rng.uniform(0.14, 0.32))
+    x_peak = x_left - float(rng.uniform(0.02, 0.10))
+    x_end = x_right + float(rng.uniform(0.05, 0.12))
 
     # 1. Small upward/downward hook -> 2. downstroke to valley -> 3. diagonal up to roof -> 4. overbar
     seg1 = np.stack([
@@ -530,11 +530,11 @@ def parse_unimer_prompt(latex: str, tokenizer: InkForgeTokenizer) -> StructuredP
                 meta={"env": env},
             )
 
-    # 4. Standard single-line formula (or auto-decomposed big/nested fraction!)
+    # 4. Standard single-line formula (or auto-decomposed big/nested fraction/radical!)
     if r"\begin" in s or r"\end" in s or "&" in s or r"\\" in s:
         return None
     toks = tokenize_inkforge(s)
-    if not (2 <= len(toks) <= 110) or tokenizer.has_unk(s):
+    if not (4 <= len(toks) <= 110) or tokenizer.has_unk(s):
         return None
     if r"\frac" in s and len(toks) >= 20:
         cells: list[str] = []
@@ -737,8 +737,8 @@ def sample_programmatic_structured_prompt(rng: random.Random) -> StructuredPromp
     if choice < 0.58:
         v = rng.choice(["x", "y", "t", "u", "z", "n"])
         a = rng.randint(2, 9)
-        b = rng.randint(1, 9)
-        c = rng.randint(1, 12)
+        b = rng.randint(2, 9)
+        c = rng.randint(2, 12)
         template = rng.choice(["linear_solve", "quadratic_expand", "deriv_chain", "integral_eval", "system2"])
         if template == "linear_solve":
             rhs = a * c + b
@@ -754,10 +754,10 @@ def sample_programmatic_structured_prompt(rng: random.Random) -> StructuredPromp
                 f"{v}^2 + {2*b}{v} + {b*b - c} = 0" if b * b >= c else f"{v}^2 + {2*b}{v} = {c - b*b}",
             ]
         elif template == "deriv_chain":
-            g = rng.choice([r"\sin", r"\cos", r"\ln", r"\exp"])
+            g, dg = rng.choice([(r"\sin", r"\cos"), (r"\cos", r"-\sin"), (r"\exp", r"\exp")])
             lines = [
                 f"f({v}) = {g}({a}{v}^{b})",
-                f"f'({v}) = {a*b}{v}^{b-1} \\cdot {g}({a}{v}^{b})" if b > 1 else f"f'({v}) = {a} {g}({a}{v})",
+                f"f'({v}) = {a*b}{v}^{b-1} \\cdot {dg}({a}{v}^{b})" if b > 1 else f"f'({v}) = {a} {dg}({a}{v})",
             ]
         elif template == "integral_eval":
             lines = [
@@ -778,9 +778,9 @@ def sample_programmatic_structured_prompt(rng: random.Random) -> StructuredPromp
             latex = r" \\ ".join(lines)
         return StructuredPrompt(kind="multiline", latex=latex, cells=lines, meta={"env": "aligned" if use_aligned else "flat"})
 
-    # B. Matrix (2x2, 2x3, 3x3) with bmatrix / pmatrix / vmatrix (33%)
+    # B. Matrix (2x2, 2x3, 3x3) with bmatrix / pmatrix / vmatrix (always delimited for unambiguous 2D layout!)
     if choice < 0.75:
-        env = rng.choice(["bmatrix", "pmatrix", "vmatrix", "matrix"])
+        env = rng.choice(["bmatrix", "pmatrix", "vmatrix"])
         rows = rng.choice([2, 2, 3])
         cols = rng.choice([2, 2, 3])
         if env == "vmatrix":
@@ -814,8 +814,8 @@ def sample_programmatic_structured_prompt(rng: random.Random) -> StructuredPromp
     # C. Piecewise function `\begin{cases}` with `\text{if ...}` / `\text{otherwise}` (25%)
     v = rng.choice(["x", "t", "n"])
     fname = rng.choice(["f", "g", "h", "p"])
-    a = rng.randint(1, 6)
-    b = rng.randint(1, 5)
+    a = rng.randint(2, 6)
+    b = rng.randint(2, 5)
     case_rows = [
         (f"{v}^2 + {a}", rf"\text{{if }} {v} \geq 0"),
         (f"-{b}{v}", rf"\text{{if }} {v} < 0"),

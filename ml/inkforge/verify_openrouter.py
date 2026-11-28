@@ -32,13 +32,44 @@ if str(ML_ROOT) not in sys.path:
     sys.path.insert(0, str(ML_ROOT))
 
 from inkforge.render import render_strokes_tile  # noqa: E402
+from inkforge.star_dpo import _canonicalize_judge_latex  # noqa: E402
+from tokenizer.latex_tokenizer import tokenize_latex  # noqa: E402
+from v2.eval_v2 import _safe_std_v2  # noqa: E402
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_FREE_MODELS = [
-    "openrouter/free",
     "nvidia/nemotron-3.5-super-vl:free",
-    "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+    "openrouter/free",
+    "google/gemma-4-31b-it:free",
 ]
+
+
+def _normalize_for_vlm_compare(latex: str) -> list[str]:
+    """Canonicalize LaTeX for blind VLM-vs-ground-truth comparison (folds harmless formatting/env aliases)."""
+    s = _canonicalize_judge_latex(latex or "")
+    s = s.strip().strip("$").strip()
+    s = re.sub(r"^\\\[|\\\]$", "", s).strip()
+    # Fold delimiter-wrapped \begin{matrix} / \begin{array} into vmatrix/bmatrix/pmatrix/cases equivalently
+    s = s.replace(r"\\end{", r"\end{")
+    s = re.sub(r"\\left\\\{\s*\\begin\{array\}\{[^}]*\}(.*?)\\end\{array\}\s*\\right\.", r"\\begin{cases}\1\\end{cases}", s, flags=re.DOTALL)
+    s = re.sub(r"\\left\|\s*\\begin\{matrix\}(.*?)\\end\{matrix\}\s*\\right\|", r"\\begin{vmatrix}\1\\end{vmatrix}", s, flags=re.DOTALL)
+    s = re.sub(r"\\left\[\s*\\begin\{matrix\}(.*?)\\end\{matrix\}\s*\\right\]", r"\\begin{bmatrix}\1\\end{bmatrix}", s, flags=re.DOTALL)
+    s = re.sub(r"\\left\(\s*\\begin\{matrix\}(.*?)\\end\{matrix\}\s*\\right\)", r"\\begin{pmatrix}\1\\end{pmatrix}", s, flags=re.DOTALL)
+    # Strip harmless trailing \\ immediately before \end{...} (VLMs routinely write `otherwise \\ \end{cases}`)
+    s = re.sub(r"\\\\\s*(?=\\end\{)", " ", s)
+    # Fold \widetilde -> \tilde, \widehat -> \hat, sizing commands, and aligned wrappers
+    s = s.replace(r"\widetilde", r"\tilde").replace(r"\widehat", r"\hat")
+    s = re.sub(r"\\(?:left|right|big|Big|bigg|Bigg)\b", "", s)
+    s = re.sub(r"\\begin\{(aligned|align\*?|gather\*?)\}", "", s)
+    s = re.sub(r"\\end\{(aligned|align\*?|gather\*?)\}", "", s)
+    s = s.replace("&", " ")
+    s = re.sub(r"\\(?:qquad|quad|,|;|!|:)\b", " ", s)
+    s = s.replace(r"\,", " ").replace(r"\;", " ").replace(r"\!", " ")
+    toks = tokenize_latex(_safe_std_v2(s))
+    # Fold visually identical handwritten uppercase/lowercase single letters (c/C, p/P, s/S, v/V, w/W, x/X, y/Y, z/Z, k/K, o/O)
+    ambig_upper = {"C": "c", "K": "k", "O": "o", "P": "p", "S": "s", "V": "v", "W": "w", "X": "x", "Y": "y", "Z": "z"}
+    return [ambig_upper.get(t, t) for t in toks]
 
 
 def record_strokes_to_arrays(rec: dict[str, Any]) -> list[np.ndarray]:
@@ -81,7 +112,7 @@ def render_blind_audit_grid(
 
 
 def parse_vlm_verdict_json(raw_text: str, count: int) -> dict[int, dict[str, Any]]:
-    """Robustly extract `{1: {'ok': bool, 'reason': str}, ...}` from a VLM JSON response."""
+    """Robustly extract `{1: {'ok': bool, 'reason': str, 'latex': str}, ...}` from a VLM JSON response."""
     text = (raw_text or "").strip()
     # Strip markdown code fences if present
     m = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", text, re.DOTALL)
@@ -98,20 +129,34 @@ def parse_vlm_verdict_json(raw_text: str, count: int) -> dict[int, dict[str, Any
             if e0 > s0:
                 text = text[s0 : e0 + 1]
 
-    parsed = json.loads(text)
+    # Fix unescaped LaTeX backslashes inside JSON strings (very common when VLMs output \frac, \theta, \sqrt!)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", text)
+        parsed = json.loads(repaired)
+
     out: dict[int, dict[str, Any]] = {}
     if isinstance(parsed, list):
         for i, item in enumerate(parsed):
             if isinstance(item, dict):
                 tid = int(item.get("id", i + 1))
-                out[tid] = {"ok": bool(item.get("ok", False)), "reason": str(item.get("reason", ""))}
+                out[tid] = {
+                    "ok": bool(item.get("ok", item.get("legible", False))),
+                    "reason": str(item.get("reason", "")),
+                    "latex": str(item.get("latex", "")),
+                }
     elif isinstance(parsed, dict):
         items_src = parsed.get("results", parsed) if "results" in parsed and isinstance(parsed["results"], (dict, list)) else parsed
         if isinstance(items_src, list):
             for i, item in enumerate(items_src):
                 if isinstance(item, dict):
                     tid = int(item.get("id", i + 1))
-                    out[tid] = {"ok": bool(item.get("ok", False)), "reason": str(item.get("reason", ""))}
+                    out[tid] = {
+                        "ok": bool(item.get("ok", item.get("legible", False))),
+                        "reason": str(item.get("reason", "")),
+                        "latex": str(item.get("latex", "")),
+                    }
         elif isinstance(items_src, dict):
             for k, v in items_src.items():
                 digits = re.sub(r"[^0-9]", "", str(k))
@@ -119,12 +164,18 @@ def parse_vlm_verdict_json(raw_text: str, count: int) -> dict[int, dict[str, Any
                     continue
                 tid = int(digits)
                 if isinstance(v, bool):
-                    out[tid] = {"ok": v, "reason": ""}
+                    out[tid] = {"ok": v, "reason": "", "latex": ""}
+                elif isinstance(v, str):
+                    out[tid] = {"ok": True, "reason": "", "latex": v}
                 elif isinstance(v, dict):
-                    out[tid] = {"ok": bool(v.get("ok", False)), "reason": str(v.get("reason", ""))}
+                    out[tid] = {
+                        "ok": bool(v.get("ok", v.get("legible", False))),
+                        "reason": str(v.get("reason", "")),
+                        "latex": str(v.get("latex", "")),
+                    }
     # Ensure every 1..count key exists
     for idx in range(1, count + 1):
-        out.setdefault(idx, {"ok": False, "reason": "missing_verdict"})
+        out.setdefault(idx, {"ok": False, "reason": "missing_verdict", "latex": ""})
     return out
 
 
@@ -134,25 +185,37 @@ def call_openrouter_audit_grid(
     api_key: str,
     *,
     models: Sequence[str] = DEFAULT_FREE_MODELS,
+    mode: str = "blind",
     timeout_s: int = 60,
-    max_retries: int = 4,
+    max_retries: int = 5,
 ) -> tuple[dict[int, dict[str, Any]], str]:
-    """Send a numbered grid PNG + candidate LaTeX list to OpenRouter free vision models."""
+    """Send a numbered grid PNG to OpenRouter free vision models (`blind` transcription or `verify` mode)."""
     b64 = base64.b64encode(png_bytes).decode("ascii")
-    numbered_targets = "\n".join(f"#{i + 1}: {tex}" for i, tex in enumerate(target_latex_list))
-    prompt = (
-        "You are a strict math handwriting quality judge.\n"
-        "The attached image shows numbered handwritten math tiles (#1 to #"
-        f"{len(target_latex_list)}).\n"
-        "Below is the intended LaTeX for each tile:\n"
-        f"{numbered_targets}\n\n"
-        "For EACH tile, check whether the handwritten ink is clearly legible human handwriting "
-        "that faithfully matches the intended LaTeX (accept normal handwriting variants like "
-        "\\to vs \\rightarrow, \\le vs \\leq, slightly messy penmanship, or Pr vs \\Pr; REJECT "
-        "missing symbols, wrong digits/letters, illegible scribbles, giant stray slashes, or overlapping lines).\n"
-        'Return ONLY valid JSON mapping tile number string to {"ok": true/false, "reason": "short note"}, e.g.:\n'
-        '{"1": {"ok": true, "reason": "clear match"}, "2": {"ok": false, "reason": "missing exponent"}}'
-    )
+    n_tiles = len(target_latex_list)
+    if mode == "blind":
+        prompt = (
+            f"The attached image contains {n_tiles} numbered handwritten math tiles (#1 to #{n_tiles}).\n"
+            "For EACH tile, blindly transcribe the exact handwritten math you actually see into standard LaTeX "
+            "(do NOT guess or auto-correct broken characters; write exactly what is drawn) and mark "
+            '"legible": true if it is clean readable handwriting or false if garbled/overlapping/corrupted.\n'
+            "Use \\\\ for line breaks, \\begin{matrix}/\\begin{bmatrix}/\\begin{pmatrix} for matrices, "
+            "and \\begin{cases} for piecewise functions.\n"
+            'Return ONLY valid JSON (double-escape every LaTeX backslash like \\\\frac) mapping tile number '
+            'to {"latex": "...", "legible": true/false, "reason": "short note"}, e.g.:\n'
+            '{"1": {"latex": "x^2 + y^2 = 1", "legible": true, "reason": "clear"}}'
+        )
+    else:
+        numbered_targets = "\n".join(f"#{i + 1}: {tex}" for i, tex in enumerate(target_latex_list))
+        prompt = (
+            "You are a strict math handwriting quality judge.\n"
+            f"The attached image shows numbered handwritten math tiles (#1 to #{n_tiles}).\n"
+            "First read each tile independently character-by-character, then compare against the intended LaTeX:\n"
+            f"{numbered_targets}\n\n"
+            "REJECT any tile with a wrong digit/letter (e.g. 0 instead of r), missing symbol/operator, "
+            "garbled word (e.g. Siii instead of sin), giant stray slash, or overlapping lines.\n"
+            'Return ONLY valid JSON (double-escape backslashes) mapping tile number to '
+            '{"ok": true/false, "latex": "what you actually read", "reason": "short note"}.'
+        )
 
     last_err: Exception | None = None
     for attempt in range(max_retries):
@@ -160,7 +223,8 @@ def call_openrouter_audit_grid(
         payload = {
             "model": model_id,
             "temperature": 0.0,
-            "max_tokens": 900,
+            "max_tokens": 2200,
+            "reasoning": {"effort": "none"},
             "messages": [
                 {
                     "role": "user",
@@ -185,13 +249,29 @@ def call_openrouter_audit_grid(
         try:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
+            msg = data["choices"][0]["message"]
+            content = (msg.get("content") or "").strip() or (msg.get("reasoning") or "").strip()
             used_model = str(data.get("model", model_id))
-            verdicts = parse_vlm_verdict_json(content, len(target_latex_list))
+            verdicts = parse_vlm_verdict_json(content, n_tiles)
+            if mode == "blind":
+                for idx, target_tex in enumerate(target_latex_list, start=1):
+                    v = verdicts[idx]
+                    pred_tex = v.get("latex", "")
+                    legible = bool(v.get("ok", False))
+                    t_toks = _normalize_for_vlm_compare(target_tex)
+                    p_toks = _normalize_for_vlm_compare(pred_tex)
+                    exact = bool(t_toks) and (p_toks == t_toks)
+                    v["ok"] = legible and exact
+                    if not legible:
+                        v["reason"] = f"illegible: {v.get('reason', '')}".strip()
+                    elif not exact:
+                        v["reason"] = f"blind_mismatch: read `{pred_tex}`"
+                    else:
+                        v["reason"] = "blind_exact_match"
             return verdicts, used_model
         except urllib.error.HTTPError as e:
             last_err = e
-            wait_s = min(30.0, 2.5 * (2 ** attempt))
+            wait_s = min(20.0, 2.0 * (attempt + 1))
             if e.code in (429, 502, 503, 504):
                 time.sleep(wait_s)
                 continue
@@ -215,6 +295,7 @@ def audit_shard(
     api_key: str,
     *,
     models: Sequence[str] = DEFAULT_FREE_MODELS,
+    mode: str = "blind",
     tiles_per_call: int = 9,
     min_delay_s: float = 3.2,
     max_samples: int = 0,
@@ -256,13 +337,19 @@ def audit_shard(
             strokes_batch = [record_strokes_to_arrays(r) for r in batch]
             targets = [str(r.get("latexNormalized") or r.get("latex") or "") for r in batch]
             png_bytes = render_blind_audit_grid(strokes_batch, cols=3)
-            verdicts, used_model = call_openrouter_audit_grid(png_bytes, targets, api_key, models=models)
+            verdicts, used_model = call_openrouter_audit_grid(png_bytes, targets, api_key, models=models, mode=mode)
             stats["calls"] += 1
 
             for i, rec in enumerate(batch):
-                v = verdicts.get(i + 1, {"ok": False, "reason": "missing"})
+                v = verdicts.get(i + 1, {"ok": False, "reason": "missing", "latex": ""})
                 rec.setdefault("metadata", {})
-                rec["metadata"]["vlm_audit"] = {"model": used_model, "ok": v["ok"], "reason": v["reason"]}
+                rec["metadata"]["vlm_audit"] = {
+                    "model": used_model,
+                    "mode": mode,
+                    "ok": v["ok"],
+                    "reason": v["reason"],
+                    "vlm_latex": v.get("latex", ""),
+                }
                 if v["ok"]:
                     fv.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     stats["accepted"] += 1
@@ -293,6 +380,7 @@ def main() -> None:
     parser.add_argument("--out-verified", type=Path, required=True, help="Output verified JSONL")
     parser.add_argument("--out-rejected", type=Path, default=None, help="Output rejected JSONL")
     parser.add_argument("--models", nargs="+", default=DEFAULT_FREE_MODELS, help="OpenRouter model IDs to rotate")
+    parser.add_argument("--mode", choices=("blind", "verify"), default="blind", help="blind=zero-sycophancy transcribe+compare")
     parser.add_argument("--tiles-per-call", type=int, default=9, help="Equations packed per 3x3 grid API call")
     parser.add_argument("--min-delay", type=float, default=3.2, help="Min seconds between free-tier calls")
     parser.add_argument("--max-samples", type=int, default=0, help="Optional cap for quick sampling audit (0=all)")
@@ -312,6 +400,7 @@ def main() -> None:
         out_rej,
         api_key,
         models=args.models,
+        mode=args.mode,
         tiles_per_call=args.tiles_per_call,
         min_delay_s=args.min_delay,
         max_samples=args.max_samples,

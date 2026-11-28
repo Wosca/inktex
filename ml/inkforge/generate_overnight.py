@@ -38,15 +38,30 @@ from inkforge.composer import (  # noqa: E402
 )
 from inkforge.model import InkForgeConfig, InkForgeModel  # noqa: E402
 from inkforge.render import render_contact_sheet  # noqa: E402
-from inkforge.star_dpo import DEFAULT_INKTEX_V2_CKPT, judge_rollouts_with_inktex  # noqa: E402
+from inkforge.star_dpo import DEFAULT_INKTEX_V2_CKPT, _canonicalize_judge_latex, judge_rollouts_with_inktex  # noqa: E402
 from inkforge.tokenizer import InkForgeTokenizer, tokenize_inkforge  # noqa: E402
-from v2.eval_v2 import load_v2_checkpoint  # noqa: E402
+from tokenizer.latex_tokenizer import tokenize_latex  # noqa: E402
+from v2.eval_v2 import _safe_std_v2, load_v2_checkpoint  # noqa: E402
 
 
 def _is_dangling_prefix_cell(latex: str) -> bool:
-    """Short operator-terminated prefix cells like `f(x) =` or `1 +` are geometry-gated rather than exact-matched."""
+    """Short operator-terminated prefix cells like `f(x) =` or `1 +`."""
     s = latex.strip()
     return len(tokenize_inkforge(s)) <= 6 and s.endswith(("=", "+", "-"))
+
+
+def _prefix_tokens_match(target_latex: str, pred_latex: str) -> bool:
+    """Verify dangling prefixes like `r =` (catches `0 =` while allowing trailing-operator quirks)."""
+    t_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(target_latex)))
+    p_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(pred_latex)))
+    if not t_toks or not p_toks:
+        return False
+    if p_toks == t_toks:
+        return True
+    # Also accept if core tokens before trailing `=` / `+` / `-` match exactly
+    t_core = t_toks[:-1] if t_toks[-1] in ("=", "+", "-") else t_toks
+    p_core = p_toks[:-1] if p_toks[-1] in ("=", "+", "-") else p_toks
+    return bool(t_core) and p_core == t_core
 
 
 @torch.inference_mode()
@@ -59,51 +74,63 @@ def generate_verified_cells(
     device: torch.device,
     *,
     cfg_scale: float = 1.5,
-    max_chunk_seqs: int = 32,
+    max_chunk_seqs: int = 64,
     judge_model: torch.nn.Module | None = None,
     judge_tok: Any | None = None,
     judge_batch_size: int = 32,
     max_retries: int = 2,
 ) -> tuple[list[list[np.ndarray]], list[bool]]:
-    """Generate flattened cells in OOM-safe chunks with optional InkTeX v2 per-cell verification + selective retry!
+    """Generate flattened cells in length-bucketed OOM-safe chunks with InkTeX v2 verification + selective retry!
 
-    Failed cells are selectively regenerated using the EXACT SAME writer style `z` (preserving consistent
-    handwriting across every line/cell of a multi-line or big-fraction equation) up to `max_retries` times.
+    Length-sorting pending cells before chunking cuts KV-cache padding waste 3-5x on RTX 4070 Ti.
+    Failed cells are selectively regenerated using the EXACT SAME writer style `z`.
     """
     n = len(flat_cells)
     out_strokes: list[list[np.ndarray]] = [[] for _ in range(n)]
     cell_ok: list[bool] = [False] * n
     pending = list(range(n))
+    all_enc = [tokenizer.encode(c, max_len=model.cfg.max_text_len) for c in flat_cells]
 
     for attempt in range(max_retries + 1):
         if not pending:
             break
-        # Gently cool temperature slightly on retries for higher precision
+        # Sort pending cells by token length so short matrix numbers finish in ~25 steps instead of 450!
+        pending.sort(key=lambda idx: len(all_enc[idx]))
         temp_scale = 1.0 if attempt == 0 else max(0.75, 1.0 - 0.10 * attempt)
         cand_strokes: list[list[np.ndarray]] = []
         cand_meta: list[dict[str, Any]] = []
 
-        for s in range(0, len(pending), max_chunk_seqs):
-            sub_ids = pending[s : s + max_chunk_seqs]
-            enc = [tokenizer.encode(flat_cells[i], max_len=model.cfg.max_text_len) for i in sub_ids]
+        chunk_sz = max_chunk_seqs
+        pos_s = 0
+        while pos_s < len(pending):
+            sub_ids = pending[pos_s : pos_s + chunk_sz]
+            enc = [all_enc[i] for i in sub_ids]
             max_l = max(len(e) for e in enc)
             tok_t = torch.full((len(sub_ids), max_l), tokenizer.pad_id, dtype=torch.long, device=device)
             for j, e in enumerate(enc):
                 tok_t[j, : len(e)] = torch.tensor(e, dtype=torch.long, device=device)
             z_t = torch.from_numpy(cell_zs_np[sub_ids]).to(device)
             t_t = torch.from_numpy((cell_temps_np[sub_ids] * temp_scale).astype(np.float32)).to(device)
-            with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                st_c, meta_c = model.generate_batch(
-                    tok_t,
-                    style_z=z_t,
-                    temperature=t_t,
-                    pen_temperature=1.0,
-                    cfg_scale=cfg_scale,
-                    max_steps=512,
-                    return_meta=True,
-                )
-            cand_strokes.extend(st_c)
-            cand_meta.extend(meta_c)
+            try:
+                with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                    st_c, meta_c = model.generate_batch(
+                        tok_t,
+                        style_z=z_t,
+                        temperature=t_t,
+                        pen_temperature=1.0,
+                        cfg_scale=cfg_scale,
+                        max_steps=512,
+                        return_meta=True,
+                    )
+                cand_strokes.extend(st_c)
+                cand_meta.extend(meta_c)
+                pos_s += len(sub_ids)
+            except torch.cuda.OutOfMemoryError:
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                if chunk_sz <= 8:
+                    raise
+                chunk_sz = max(8, chunk_sz // 2)
 
         # Geometry gate on every atomic cell first
         geom_pass_pos: list[int] = []
@@ -112,13 +139,13 @@ def generate_verified_cells(
                 flat_cells[idx], cand_strokes[pos], is_atomic_cell=True
             )
             if ok_geom:
-                if judge_model is None or _is_dangling_prefix_cell(flat_cells[idx]):
+                if judge_model is None:
                     out_strokes[idx] = cand_strokes[pos]
                     cell_ok[idx] = True
                 else:
                     geom_pass_pos.append(pos)
 
-        # Run fast InkTeX v2 bimodal recognition strictly on non-dangling geometry-valid cells
+        # Run fast InkTeX v2 bimodal recognition on ALL geometry-valid cells (including dangling prefixes!)
         if judge_model is not None and judge_tok is not None and geom_pass_pos:
             judge_rows = [
                 {
@@ -131,9 +158,9 @@ def generate_verified_cells(
             verdicts = judge_rollouts_with_inktex(
                 judge_model, judge_tok, judge_rows, device, batch_size=judge_batch_size
             )
-            for pos, (v_ok, _pred, _reason) in zip(geom_pass_pos, verdicts):
-                if v_ok:
-                    idx = pending[pos]
+            for pos, (v_ok, pred_tex, _reason) in zip(geom_pass_pos, verdicts):
+                idx = pending[pos]
+                if v_ok or (_is_dangling_prefix_cell(flat_cells[idx]) and _prefix_tokens_match(flat_cells[idx], pred_tex)):
                     out_strokes[idx] = cand_strokes[pos]
                     cell_ok[idx] = True
 
@@ -288,7 +315,7 @@ def main() -> None:
                 cell_temps_np,
                 device,
                 cfg_scale=args.cfg_scale,
-                max_chunk_seqs=32,
+                max_chunk_seqs=64,
                 judge_model=judge_model,
                 judge_tok=judge_tok,
                 max_retries=args.max_cell_retries,
