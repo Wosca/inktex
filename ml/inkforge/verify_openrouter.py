@@ -51,6 +51,16 @@ DEFAULT_GEMINI_MODELS = [
 ]
 
 
+_OTHERWISE_RE = re.compile(
+    r"\\text\s*\{\s*otherwise\s*\}|(?<![A-Za-z0-9_\\])otherwise(?![A-Za-z0-9_])",
+    re.IGNORECASE | re.ASCII,
+)
+
+
+def _normalize_otherwise(latex: str) -> str:
+    return _OTHERWISE_RE.sub(lambda _match: r"\text{otherwise}", latex)
+
+
 def _normalize_for_vlm_compare(latex: str) -> list[str]:
     """Canonicalize LaTeX for blind VLM-vs-ground-truth comparison (folds harmless formatting/env aliases)."""
     s = _canonicalize_judge_latex(latex or "")
@@ -73,6 +83,8 @@ def _normalize_for_vlm_compare(latex: str) -> list[str]:
     s = s.replace("&", " ")
     s = re.sub(r"\\(?:qquad|quad|,|;|!|:)\b", " ", s)
     s = s.replace(r"\,", " ").replace(r"\;", " ").replace(r"\!", " ")
+    s = _normalize_otherwise(s)
+    s = re.sub(r"\\mid(?![A-Za-z])", "|", s)
     toks = tokenize_latex(_safe_std_v2(s))
     # Fold visually identical handwritten uppercase/lowercase single letters (c/C, p/P, s/S, v/V, w/W, x/X, y/Y, z/Z, k/K, o/O)
     ambig_upper = {"C": "c", "K": "k", "O": "o", "P": "p", "S": "s", "V": "v", "W": "w", "X": "x", "Y": "y", "Z": "z"}

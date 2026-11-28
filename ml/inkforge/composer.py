@@ -11,18 +11,18 @@ Solves the two biggest weaknesses of single-line HMER generators:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import islice
 import json
 import math
 from pathlib import Path
 import random
 import re
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 import torch
 
-from .model import InkForgeModel
-from .tokenizer import InkForgeTokenizer, tokenize_inkforge
+from .tokenizer import InkForgeTokenizer, detokenize_inkforge, tokenize_inkforge
 
 DEFAULT_UNIMER_JSONL = Path(r"E:\math-recogniser-datasets\external\unimer\examples.jsonl")
 
@@ -74,19 +74,29 @@ def synthesize_realistic_times(
 
     for st in strokes:
         n = len(st)
-        if prev_end is not None and n > 0:
+        if n == 0:
+            times.append(np.empty(0, dtype=np.float64))
+            continue
+        if prev_end is not None:
             air_dist = float(np.linalg.norm(st[0] - prev_end))
             cursor_ms += float(rng.uniform(75.0, 190.0)) + air_dist * float(rng.uniform(25.0, 65.0))
         t_arr = np.empty((n,), dtype=np.float64)
         t_arr[0] = cursor_ms
-        for i in range(1, n):
-            dist = float(np.linalg.norm(st[i] - st[i - 1]))
-            dt = max(4.0, dist * ms_per_unit * float(rng.uniform(0.85, 1.18)))
-            cursor_ms += dt
-            t_arr[i] = cursor_ms
+        if n > 1:
+            deltas = np.diff(st[:, :2], axis=0)
+            distances = np.linalg.norm(deltas, axis=1)
+            travel = np.cumsum(distances)
+            progress = (travel - 0.5 * distances) / max(float(travel[-1]), 1e-6)
+            # Ease in/out, slow on tight bends, and vary speed across the writer's strokes.
+            pace = 1.0 + rng.uniform(0.15, 0.50) * (2.0 * progress - 1.0) ** 2
+            pace *= 1.0 + 0.18 * np.sin(2.0 * math.pi * progress + rng.uniform(0, 2.0 * math.pi))
+            unit = deltas / np.maximum(distances[:, None], 1e-6)
+            pace[1:] += 0.25 * (1.0 - (unit[:-1] * unit[1:]).sum(axis=1))
+            intervals = distances * ms_per_unit * rng.uniform(0.72, 1.35) * pace
+            t_arr[1:] = cursor_ms + np.cumsum(np.maximum(3.0, intervals * rng.uniform(0.85, 1.15, n - 1)))
+            cursor_ms = float(t_arr[-1])
         times.append(t_arr)
-        if n > 0:
-            prev_end = st[-1]
+        prev_end = st[-1]
     return times
 
 
@@ -123,20 +133,36 @@ def passes_geometry_gate(
     if max(w, h) < 0.20 or max(w, h) > 95.0:
         return False
 
-    # Reject stray giant slash strokes / blown-up height on plain single-line atomic cells
-    if is_atomic_cell:
-        has_tall_op = any(k in latex for k in (r"\frac", r"\int", r"\sum", r"\prod", r"\begin", r"\sqrt"))
-        max_h_allowed = 8.5 if has_tall_op else 4.8
-        if h > max_h_allowed:
-            return False
-        stroke_hs = [float(s[:, 1].max() - s[:, 1].min()) for s in pts]
-        if max(stroke_hs) > (6.5 if has_tall_op else 3.8):
-            return False
-
-    # Strip environment names before estimating visible symbol count
     clean_tex = re.sub(r"\\(?:begin|end)\{[A-Za-z*]+\}", "", latex)
     toks = tokenize_inkforge(clean_tex)
     vis_est = max(1, sum(1 for t in toks if t not in ("{", "}", "^", "_", "<SPACE>", "&", r"\\")))
+
+    if is_atomic_cell:
+        has_tall_op = any(t in toks for t in (r"\frac", r"\int", r"\sum", r"\prod", r"\begin", r"\sqrt"))
+        # A couple of horizontal glyphs can set the rollout's scale, making its one letter tall.
+        single_scripted_glyph = toks[1:2] in (["_"], ["^"]) and not any(
+            tok in ("=", "+", "-", "/", "<", ">") for tok in toks[2:]
+        )
+        short_cell = vis_est <= 3 or (
+            vis_est <= 6 and (latex.rstrip().endswith("=") or single_scripted_glyph)
+        )
+        max_h = 8.5 if has_tall_op or short_cell else 4.8
+        if h > max_h or (short_cell and w > 15.0):
+            return False
+        heights = [float(np.ptp(st[:, 1])) for st in pts]
+        stroke_cap = 6.5 if has_tall_op else max_h if short_cell else 3.8
+        if max(heights) > stroke_cap:
+            return False
+        if short_cell and not has_tall_op and "/" not in toks:
+            for idx, (st, sh) in enumerate(zip(pts, heights)):
+                if sh <= 3.8 or float(np.ptp(st[:, 0])) <= 0.32 * sh:
+                    continue
+                chord = float(np.linalg.norm(st[-1] - st[0]))
+                length = float(np.linalg.norm(np.diff(st, axis=0), axis=1).sum())
+                has_peer = any(i != idx and height >= 0.68 * sh for i, height in enumerate(heights))
+                if chord >= 0.95 * length and not has_peer:
+                    return False
+
     n_strokes = len(pts)
     if vis_est >= 4 and n_strokes < max(2, int(vis_est * 0.25)):
         return False
@@ -148,6 +174,15 @@ def passes_geometry_gate(
 # ---------------------------------------------------------------------------
 # Hand-Drawn Organic Tall Delimiters (`[ ]`, `( )`, `| |`, `{`)
 # ---------------------------------------------------------------------------
+
+def _stroke_progress(n: int, rng: np.random.Generator) -> np.ndarray:
+    """Sample increasing offsets with both local jitter and a smooth density change."""
+    pace = rng.lognormal(0.0, 0.32, size=n - 1)
+    phase = rng.uniform(0.0, 2.0 * math.pi)
+    pace *= 1.0 + 0.27 * np.sin(np.linspace(phase, phase + math.pi, n - 1))
+    progress = np.concatenate(([0.0], np.cumsum(pace)))
+    return progress / progress[-1]
+
 
 def draw_human_delimiter(
     kind: str,
@@ -164,7 +199,7 @@ def draw_human_delimiter(
     y_b = y_bot + float(rng.uniform(0.08, 0.25))
     h = y_b - y_t
     n = max(14, min(42, int(round(h * 6.5))))
-    ts = np.linspace(0.0, 1.0, n)
+    ts = _stroke_progress(n, rng)
     ys = y_t + ts * h
 
     # Smooth low-frequency hand tremor
@@ -182,7 +217,6 @@ def draw_human_delimiter(
     if kind in ("(", ")"):
         sign = -1.0 if kind == "(" else 1.0
         bulge = min(0.55, max(0.24, 0.14 * h)) * float(rng.uniform(0.85, 1.18))
-        xs = x_center + sign * bulge * np.sin(ts * math.pi) * 0.0
         # Quadratic arc: curves outward at center, inward at top/bottom
         arc = sign * bulge * (1.0 - (2.0 * ts - 1.0) ** 2)
         xs = x_center + arc - sign * 0.5 * bulge + wobble + slant_shift
@@ -192,30 +226,32 @@ def draw_human_delimiter(
         sign = 1.0 if kind == "[" else -1.0
         hook = min(0.45, max(0.22, 0.12 * h)) * float(rng.uniform(0.85, 1.15))
         # Single continuous stroke: top hook -> vertical spine -> bottom hook (how humans draw [ and ])
-        top_x = np.linspace(x_center + sign * hook, x_center, 5)
-        top_y = np.full(5, y_t) + rng.normal(0, 0.015, size=5)
         mid_x = x_center + wobble + slant_shift
         mid_y = ys
-        bot_x = np.linspace(x_center, x_center + sign * hook, 5)
-        bot_y = np.full(5, y_b) + rng.normal(0, 0.015, size=5)
+        top_t, bot_t = _stroke_progress(5, rng), _stroke_progress(5, rng)
+        top_x = mid_x[0] + sign * hook * (1.0 - top_t)
+        bot_x = mid_x[-1] + sign * hook * bot_t
+        hook_tilt = rng.normal(0.18 * slant, 0.045)
+        top_y = y_t + (top_x - mid_x[0]) * hook_tilt
+        bot_y = y_b + (bot_x - mid_x[-1]) * hook_tilt
         xs = np.concatenate([top_x[:-1], mid_x, bot_x[1:]])
         ys_full = np.concatenate([top_y[:-1], mid_y, bot_y[1:]])
         return [np.stack([xs, ys_full], axis=-1)]
 
     if kind == "{":
-        # Classic 1- or 2-stroke curly brace
+        # Curly brace with independently shaped upper and lower hooks
         mid_y = 0.5 * (y_t + y_b) + float(rng.uniform(-0.08, 0.08))
         depth = min(0.50, max(0.25, 0.14 * h)) * float(rng.uniform(0.88, 1.15))
         half = n // 2
-        t_top = np.linspace(0.0, 1.0, half)
-        t_bot = np.linspace(0.0, 1.0, n - half)
+        t_top = _stroke_progress(half, rng)
+        t_bot = _stroke_progress(n - half, rng)
         y_u = y_t + t_top * (mid_y - y_t)
         y_l = mid_y + t_bot * (y_b - mid_y)
         # Top half curves from right hook -> spine -> left tip
         x_u = x_center + depth * (0.5 * (1.0 - t_top) ** 2 - 0.65 * (t_top ** 3))
         x_l = x_center + depth * (0.5 * (t_bot ** 2) - 0.65 * ((1.0 - t_bot) ** 3))
-        xs = np.concatenate([x_u, x_l[1:]]) + wobble[: len(x_u) + len(x_l) - 1] + slant_shift[: len(x_u) + len(x_l) - 1]
         ys_full = np.concatenate([y_u, y_l[1:]])
+        xs = np.concatenate([x_u, x_l[1:]]) + np.interp(ys_full, ys, wobble + slant_shift)
         return [np.stack([xs, ys_full], axis=-1)]
 
     return []
@@ -226,13 +262,15 @@ def draw_human_hline(
     x_right: float,
     y_bar: float,
     rng: np.random.Generator,
+    *,
+    slant: float = 0.0,
 ) -> list[np.ndarray]:
     """Generate a natural hand-drawn horizontal fraction bar (vinculum) with subtle tilt & hand wobble."""
     w = max(x_right - x_left, 0.6)
     n = max(10, min(64, int(round(w * 6.0))))
-    ts = np.linspace(0.0, 1.0, n)
+    ts = _stroke_progress(n, rng)
     xs = x_left + ts * w
-    slope = float(rng.normal(0.0, 0.015))
+    slope = float(rng.normal(0.22 * slant, 0.015))
     arch = float(rng.normal(0.0, 0.035)) * np.sin(ts * math.pi)
     phase = float(rng.uniform(0.0, 2.0 * math.pi))
     wobble = 0.016 * np.sin(ts * math.pi * float(rng.uniform(2.0, 4.0)) + phase)
@@ -246,10 +284,11 @@ def draw_human_sqrt(
     x_right: float,
     y_bot: float,
     rng: np.random.Generator,
+    *,
+    slant: float = 0.0,
 ) -> list[np.ndarray]:
     """Generate an organic hand-drawn radical check + overbar wrapping `(x_left..x_right, y_top..y_bot)`."""
     h = max(y_bot - y_top, 1.0)
-    w = max(x_right - x_left, 0.8)
     y_roof = y_top - float(rng.uniform(0.16, 0.30))
     y_valley = y_bot + float(rng.uniform(0.02, 0.14))
     y_hook = y_top + h * float(rng.uniform(0.45, 0.62))
@@ -261,29 +300,22 @@ def draw_human_sqrt(
     x_end = x_right + float(rng.uniform(0.05, 0.12))
 
     # 1. Small upward/downward hook -> 2. downstroke to valley -> 3. diagonal up to roof -> 4. overbar
-    seg1 = np.stack([
-        np.linspace(x_hook - 0.14, x_hook, 4),
-        np.linspace(y_hook + 0.10, y_hook, 4),
-    ], axis=-1)
-    seg2 = np.stack([
-        np.linspace(x_hook, x_valley, max(6, int(round(h * 3.0)))),
-        np.linspace(y_hook, y_valley, max(6, int(round(h * 3.0)))),
-    ], axis=-1)
-    seg3 = np.stack([
-        np.linspace(x_valley, x_peak, max(8, int(round(h * 4.5)))),
-        np.linspace(y_valley, y_roof, max(8, int(round(h * 4.5)))),
-    ], axis=-1)
-    n_roof = max(10, min(64, int(round((x_end - x_peak) * 5.5))))
-    ts = np.linspace(0.0, 1.0, n_roof)
+    check = np.array([(x_hook - 0.14, y_hook + 0.10), (x_hook, y_hook),
+                      (x_valley, y_valley), (x_peak, y_roof)])
+    segments = []
+    for start, end, n in zip(check, check[1:], (4, max(6, round(h * 3)), max(8, round(h * 4.5)))):
+        t = _stroke_progress(n, rng)
+        segment = start + t[:, None] * (end - start)
+        segment[:, 0] += rng.normal(0.0, 0.04) * np.sin(t * math.pi)
+        segments.append(segment[:-1])
+
+    n_roof = max(10, min(64, round((x_end - x_peak) * 5.5)))
+    ts = _stroke_progress(n_roof, rng)
     roof_x = x_peak + ts * (x_end - x_peak)
-    roof_y = y_roof + (ts - 0.5) * (x_end - x_peak) * float(rng.normal(0.0, 0.012)) + 0.018 * np.sin(
-        ts * math.pi * float(rng.uniform(1.5, 3.0)) + float(rng.uniform(0, 2 * math.pi))
-    )
-    seg4 = np.stack([roof_x, roof_y], axis=-1)
-    pts = np.concatenate([seg1[:-1], seg2[:-1], seg3[:-1], seg4], axis=0)
-    # Subtle micro-tremor along the check
-    pts[:, 0] += rng.normal(0.0, 0.008, size=len(pts))
-    pts[:, 1] += rng.normal(0.0, 0.008, size=len(pts))
+    roof_y = y_roof + (roof_x - x_peak) * rng.normal(0.22 * slant, 0.012)
+    roof_y += rng.normal(0.0, 0.025) * np.sin(ts * math.pi)
+    pts = np.concatenate([*segments, np.stack([roof_x, roof_y], axis=-1)])
+    pts[:, 0] += (y_roof - pts[:, 1]) * slant
     return [pts]
 
 
@@ -299,18 +331,21 @@ class StructuredPrompt:
     meta: dict[str, Any]
 
 
+_TEX_ATOM_RE = re.compile(r"\\(?:[A-Za-z]+|.)|[{}&=]", re.DOTALL)
+
+
 def _extract_balanced_brace(s: str, open_idx: int) -> tuple[str, int] | None:
     """Given `s[open_idx] == '{'`, return `(inner, close_idx)` or `None` if unbalanced."""
     if open_idx >= len(s) or s[open_idx] != "{":
         return None
     depth = 0
-    for i in range(open_idx, len(s)):
-        if s[i] == "{" and (i == 0 or s[i - 1] != "\\"):
+    for tok in _TEX_ATOM_RE.finditer(s, open_idx):
+        if tok[0] == "{":
             depth += 1
-        elif s[i] == "}" and (i == 0 or s[i - 1] != "\\"):
+        elif tok[0] == "}":
             depth -= 1
             if depth == 0:
-                return s[open_idx + 1 : i], i
+                return s[open_idx + 1 : tok.start()], tok.start()
     return None
 
 
@@ -380,8 +415,11 @@ def _decompose_big_frac_tree(
     has_sqrt = r"\sqrt" in s
     has_binom = r"\binom" in s
 
+    if toks and toks[0] in ("^", "_"):
+        return None
+
     if depth >= max_depth:
-        if 1 <= len(toks) <= 44 and not tokenizer.has_unk(s):
+        if _valid_unimer_cell(s, tokenizer, 44):
             idx = len(cells)
             cells.append(s)
             return {"op": "cell", "i": idx}
@@ -391,6 +429,7 @@ def _decompose_big_frac_tree(
     if len(toks) >= 18 and "=" in s:
         eq_split = _find_top_level_split(s, ("=",))
         if eq_split is not None:
+            checkpoint = len(cells)
             pos, _ = eq_split
             left_s = s[:pos].strip()
             right_s = s[pos + 1 :].strip()
@@ -405,6 +444,8 @@ def _decompose_big_frac_tree(
                 r_node = _decompose_big_frac_tree("= " + right_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
                 if l_node is not None and r_node is not None:
                     return {"op": "hcat", "items": [l_node, r_node]}
+
+            del cells[checkpoint:]
 
     # 2. Scan for top-level `\frac`, `\sqrt`, or `\binom` (brace depth == 0)
     if has_frac or has_sqrt or has_binom:
@@ -586,6 +627,7 @@ def _decompose_big_frac_tree(
     if len(toks) >= 20:
         pm_split = _find_top_level_split(s, ("+", "-"))
         if pm_split is not None:
+            checkpoint = len(cells)
             pos, op_ch = pm_split
             left_s = s[:pos].strip()
             right_s = s[pos + 1 :].strip()
@@ -593,12 +635,125 @@ def _decompose_big_frac_tree(
             r_node = _decompose_big_frac_tree(f"{op_ch} {right_s}", tokenizer, cells, depth=depth + 1, max_depth=max_depth)
             if l_node is not None and r_node is not None:
                 return {"op": "hcat", "items": [l_node, r_node]}
+            del cells[checkpoint:]
 
-    if 1 <= len(toks) <= 56 and not tokenizer.has_unk(s):
+    if _valid_unimer_cell(s, tokenizer, 56):
         idx = len(cells)
         cells.append(s)
         return {"op": "cell", "i": idx}
     return None
+
+
+_UNIMER_MATHRM_RE = re.compile(r"\\mathrm\s*(?=\{)")
+_UNIMER_TRAILING_OPERATOR_RE = re.compile(
+    r"(?:[=+_^\-]|\\(?:times|cdot|div|pm|mp|leq|geq|neq|in|to|rightarrow))$"
+)
+_ENV_ARRAY_RE = re.compile(r"\\begin\{array\}\{([clr]+)\}(.*?)\\end\{array\}", re.DOTALL)
+
+
+def _split_tex_fields(s: str, separator: str) -> list[str]:
+    """Split rows or columns at the outer brace level, respecting escaped separators."""
+    depth, start = 0, 0
+    fields = []
+    for tok in _TEX_ATOM_RE.finditer(s):
+        if tok[0] == "{":
+            depth += 1
+        elif tok[0] == "}":
+            depth -= 1
+        elif tok[0] == separator and depth == 0:
+            fields.append(s[start : tok.start()].strip())
+            start = tok.end()
+    fields.append(s[start:].strip())
+    return fields
+
+
+def _unwrap_tex_group(s: str) -> str:
+    group = _extract_balanced_brace(s, 0)
+    while group is not None and group[1] == len(s) - 1:
+        s = group[0].strip()
+        group = _extract_balanced_brace(s, 0)
+    return s
+
+
+def _normalize_unimer_array(s: str) -> str:
+    """Recover the layout of simple UniMER arrays, including one-row wrappers."""
+    match = _ENV_ARRAY_RE.search(s)
+    if match is None or r"\begin" in match[2]:
+        return s
+    prefix, suffix = s[:match.start()].rstrip(), s[match.end():].lstrip()
+    wrappers = ((r"\{", ".", "cases"), ("[", "]", "bmatrix"),
+                ("(", ")", "pmatrix"), ("|", "|", "vmatrix"))
+    env = ""
+    for left, right, kind in wrappers:
+        left_match = re.search(r"\\left\s*" + re.escape(left) + r"$", prefix)
+        right_match = re.match(r"\\right\s*" + re.escape(right), suffix)
+        if left_match and right_match:
+            env = kind
+            prefix, suffix = prefix[:left_match.start()].rstrip(), suffix[right_match.end():].lstrip()
+            break
+
+    rows = [[_unwrap_tex_group(c) for c in _split_tex_fields(row, "&")]
+            for row in _split_tex_fields(match[2], r"\\") if row]
+    if not rows:
+        return s
+    if not env and len(rows) == 1:
+        return " ".join((prefix, *rows[0], suffix)).strip()
+    if not env:
+        env = "matrix" if len(match[1]) > 1 and set(match[1]) == {"c"} else "aligned"
+    body = r" \\ ".join(" & ".join(row) for row in rows)
+    return f"{prefix} \\begin{{{env}}}{body}\\end{{{env}}} {suffix}".strip()
+
+
+def _clean_unimer_latex(latex: str) -> str | None:
+    if not isinstance(latex, str):
+        return None
+    s = latex.strip()
+    if not s or len(s) > 260 or re.search(r"\\mathfrak(?![A-Za-z])", s):
+        return None
+    depth = 0
+    for tok in _TEX_ATOM_RE.finditer(s):
+        depth += int(tok[0] == "{") - int(tok[0] == "}")
+        if depth < 0:
+            return None
+    if depth:
+        return None
+
+    rewritten = []
+    end = 0
+    for match in _UNIMER_MATHRM_RE.finditer(s):
+        if match.start() < end:
+            continue
+        body, close = _extract_balanced_brace(s, match.end())
+        if not body.strip() or "~" in body or body.lstrip().startswith(("^", "_")):
+            return None
+        if re.fullmatch(r"[A-Za-z]+", body.strip()):
+            letters = body.strip()
+            replacement = f" {letters} " if len(letters) == 1 else rf"\text{{{letters}}}"
+            rewritten.extend((s[end:match.start()], replacement))
+            end = close + 1
+    s = "".join((*rewritten, s[end:]))
+    s = _unwrap_tex_group(_normalize_unimer_array(s).strip())
+    # A terminal sentence mark can be removed without affecting decimal points or \right.
+    if s.endswith(("..", ",,")):
+        return None
+    if s.endswith((".", ",")) and not re.search(r"\\right\s*\.$", s):
+        s = _unwrap_tex_group(s[:-1].rstrip())
+    tokens = tokenize_inkforge(s)
+    if not tokens or tokens[0] in ("^", "_"):
+        return None
+    if _UNIMER_TRAILING_OPERATOR_RE.search(s):
+        return None
+    return s
+
+
+def _valid_unimer_cell(s: str, tokenizer: InkForgeTokenizer, max_tokens: int) -> bool:
+    tokens = tokenize_inkforge(s)
+    return (
+        1 <= len(tokens) <= max_tokens
+        and tokens[0] not in ("_", "^")
+        and not any(t in tokens for t in (r"\begin", r"\end", "&", r"\\"))
+        and not tokenizer.has_unk(s)
+    )
 
 
 _ENV_MATRIX_RE = re.compile(
@@ -632,23 +787,23 @@ def _parse_matrix_equation(s: str, tokenizer: InkForgeTokenizer) -> StructuredPr
     for m in matches:
         gap = s[pos : m.start()].strip()
         if gap:
-            if tokenizer.has_unk(gap) or len(tokenize_inkforge(gap)) > 24:
+            if not _valid_unimer_cell(gap, tokenizer, 24):
                 return None
             idx = len(cells)
             cells.append(gap)
             items.append({"op": "cell", "i": idx})
         env, body = m.group(1), m.group(2).strip()
-        rows_raw = [r.strip() for r in body.split(r"\\") if r.strip()]
+        rows_raw = [r for r in _split_tex_fields(body, r"\\") if r]
         if not (2 <= len(rows_raw) <= 4):
             return None
         grid_nodes: list[list[dict[str, Any]]] = []
         for r in rows_raw:
-            cols = [c.strip() for c in r.split("&")]
+            cols = _split_tex_fields(r, "&")
             if not (1 <= len(cols) <= 4):
                 return None
             row_n: list[dict[str, Any]] = []
             for c in cols:
-                if not c or tokenizer.has_unk(c) or len(tokenize_inkforge(c)) > 24:
+                if not _valid_unimer_cell(c, tokenizer, 24):
                     return None
                 idx = len(cells)
                 cells.append(c)
@@ -658,7 +813,7 @@ def _parse_matrix_equation(s: str, tokenizer: InkForgeTokenizer) -> StructuredPr
         pos = m.end()
     tail = s[pos:].strip()
     if tail:
-        if tokenizer.has_unk(tail) or len(tokenize_inkforge(tail)) > 24:
+        if not _valid_unimer_cell(tail, tokenizer, 24):
             return None
         idx = len(cells)
         cells.append(tail)
@@ -669,25 +824,25 @@ def _parse_matrix_equation(s: str, tokenizer: InkForgeTokenizer) -> StructuredPr
 
 def parse_unimer_prompt(latex: str, tokenizer: InkForgeTokenizer) -> StructuredPrompt | None:
     """Parse a clean UniMER formula into either a single-line or structured matrix/cases/multiline prompt."""
-    s = (latex or "").strip()
-    if not s or len(s) > 220:
+    s = _clean_unimer_latex(latex)
+    if s is None or len(s) > 220:
         return None
 
     # 1. Pure single Matrix environment
     m = _ENV_MATRIX_RE.match(s)
     if m and r"\end{" not in m.group(2):
         env, body = m.group(1), m.group(2).strip()
-        rows_raw = [r.strip() for r in body.split(r"\\") if r.strip()]
+        rows_raw = [r for r in _split_tex_fields(body, r"\\") if r]
         if not (2 <= len(rows_raw) <= 4):
             return None
         grid: list[list[str]] = []
         cells: list[str] = []
         for r in rows_raw:
-            cols = [c.strip() for c in r.split("&")]
+            cols = _split_tex_fields(r, "&")
             if not (1 <= len(cols) <= 4):
                 return None
             for c in cols:
-                if not c or tokenizer.has_unk(c) or len(tokenize_inkforge(c)) > 24:
+                if not _valid_unimer_cell(c, tokenizer, 24):
                     return None
                 cells.append(c)
             grid.append(cols)
@@ -706,25 +861,25 @@ def parse_unimer_prompt(latex: str, tokenizer: InkForgeTokenizer) -> StructuredP
         m_c = _ENV_CASES_RE.match(s[idx:])
         if m_c:
             body = m_c.group(1).strip()
-            rows_raw = [r.strip() for r in body.split(r"\\") if r.strip()]
+            rows_raw = [r for r in _split_tex_fields(body, r"\\") if r]
             if 2 <= len(rows_raw) <= 4:
                 cells = []
                 if prefix:
-                    if tokenizer.has_unk(prefix) or len(tokenize_inkforge(prefix)) > 24:
+                    if not _valid_unimer_cell(prefix, tokenizer, 24):
                         return None
                     cells.append(prefix)
                 row_pairs: list[tuple[int, int | None]] = []
                 ok = True
                 for r in rows_raw:
-                    parts = [p.strip() for p in r.split("&")]
-                    if not (1 <= len(parts) <= 2) or not parts[0] or tokenizer.has_unk(parts[0]):
+                    parts = _split_tex_fields(r, "&")
+                    if not (1 <= len(parts) <= 2) or not _valid_unimer_cell(parts[0], tokenizer, 44):
                         ok = False
                         break
                     v_idx = len(cells)
                     cells.append(parts[0])
                     c_idx = None
                     if len(parts) == 2 and parts[1]:
-                        if tokenizer.has_unk(parts[1]):
+                        if not _valid_unimer_cell(parts[1], tokenizer, 44):
                             ok = False
                             break
                         c_idx = len(cells)
@@ -740,16 +895,14 @@ def parse_unimer_prompt(latex: str, tokenizer: InkForgeTokenizer) -> StructuredP
 
     # 3. Aligned / Multi-line environment
     m_a = _ENV_ALIGN_RE.match(s)
-    if m_a:
-        env, body = m_a.group(1), m_a.group(2).strip()
-        lines = [ln.replace("&", "").strip() for ln in body.split(r"\\") if ln.strip()]
-        if 2 <= len(lines) <= 5 and all(not tokenizer.has_unk(ln) and len(tokenize_inkforge(ln)) <= 50 for ln in lines):
-            return StructuredPrompt(
-                kind="multiline",
-                latex=s,
-                cells=lines,
-                meta={"env": env},
-            )
+    env, body = (m_a[1], m_a[2]) if m_a else ("flat", s)
+    rows = _split_tex_fields(body, r"\\")
+    if 2 <= len(rows) <= 6:
+        if rows[-1] == "":
+            rows.pop()
+        lines = [" ".join(_split_tex_fields(row, "&")).strip() for row in rows]
+        if 2 <= len(lines) <= 5 and all(_valid_unimer_cell(line, tokenizer, 50) for line in lines):
+            return StructuredPrompt(kind="multiline", latex=s, cells=lines, meta={"env": env})
 
     # 3b. Multi-matrix equation (e.g. `A [..] [..] = [..]`)
     if _INLINE_MATRIX_RE.search(s) and r"\begin{cases}" not in s and r"\begin{aligned}" not in s:
@@ -779,321 +932,403 @@ def _tree_cell(cells: list[str], expr: str) -> dict[str, Any]:
     return {"op": "cell", "i": idx}
 
 
-def sample_big_fraction_or_multistep_prompt(rng: random.Random) -> StructuredPrompt:
-    """Synthesize big nested fractions, big radicals, tall delimited expressions, and multi-line fraction proofs."""
-    v = rng.choice(["x", "y", "t", "u", "z", "n"])
-    v2 = "y" if v != "y" else "x"
-    g = rng.choice([r"\alpha", r"\beta", r"\theta", r"\lambda", r"\omega"])
-    a = rng.randint(2, 8)
-    b = rng.randint(2, 7)
-    c = rng.randint(2, 9)
-    mode = rng.choice([
-        "big_frac_eq",
-        "nested_frac",
-        "big_sqrt_frac",
-        "tall_delim_frac",
-        "multiline_frac_proof",
-        "multiline_aligned_eq",
-    ])
+@dataclass(frozen=True)
+class _MathExpr:
+    latex: str
+    op: str = "cell"
+    children: tuple[_MathExpr, ...] = ()
+    delimiters: tuple[str, str] = ("(", ")")
+
+    def emit(self, cells: list[str]) -> dict[str, Any]:
+        if self.op == "cell":
+            return _tree_cell(cells, self.latex)
+        nodes = [child.emit(cells) for child in self.children]
+        if self.op == "hcat":
+            return {"op": "hcat", "items": nodes}
+        if self.op == "frac":
+            return {"op": "frac", "num": nodes[0], "den": nodes[1]}
+        if self.op == "sqrt":
+            return {"op": "sqrt", "body": nodes[0]}
+        if self.op == "binom":
+            return {"op": "delim", "left": "(", "right": ")",
+                    "body": {"op": "binom", "top": nodes[0], "bot": nodes[1]}}
+        left, right = self.delimiters
+        node = {"op": "delim", "left": left, "right": right, "body": nodes[0]}
+        if len(nodes) == 2:
+            node["sup"] = nodes[1]
+        return node
+
+
+def _math_join(*parts: _MathExpr | str) -> _MathExpr:
+    children = tuple(part if isinstance(part, _MathExpr) else _MathExpr(part) for part in parts)
+    latex = " ".join(child.latex for child in children)
+    # Keep linear expressions in one rollout so the recognizer can see their context.
+    if all(child.op == "cell" for child in children):
+        return _MathExpr(latex)
+    return _MathExpr(latex, "hcat", children)
+
+
+def _math_frac(num: _MathExpr, den: _MathExpr) -> _MathExpr:
+    return _MathExpr(rf"\frac{{{num.latex}}}{{{den.latex}}}", "frac", (num, den))
+
+
+def _math_sqrt(body: _MathExpr) -> _MathExpr:
+    return _MathExpr(rf"\sqrt{{{body.latex}}}", "sqrt", (body,))
+
+
+def _random_math_expr(rng: random.Random, variables: tuple[str, ...], depth: int) -> _MathExpr:
+    v = rng.choice(variables)
+    if depth <= 0:
+        return _MathExpr(rng.choice((v, f"{v}_{{{rng.randint(1, 9)}}}", str(rng.randint(1, 19)))))
+
+    op = rng.choice(("sum", "product", "power", "trig", "log", "absolute", "frac", "sqrt"))
+    if op == "sum":
+        a = _random_math_expr(rng, variables, depth - 1)
+        b = _random_math_expr(rng, variables, depth - 1)
+        return _math_join(a, rng.choice(("+", "-")), b)
+    if op == "product":
+        return _MathExpr(rf"{rng.randint(2, 19)} {v}^{{{rng.randint(2, 8)}}}")
+    if op == "power":
+        return _MathExpr(rf"({v} {rng.choice(('+', '-'))} {rng.randint(1, 12)})^{{{rng.randint(2, 8)}}}")
+    if op == "trig":
+        function = rng.choice((r"\sin", r"\cos", r"\tan", r"\sinh", r"\cosh"))
+        return _MathExpr(rf"{function}({rng.randint(1, 9)} {v})")
+    if op == "log":
+        function = rng.choice((r"\ln", r"\log", r"\exp"))
+        return _MathExpr(rf"{function}(1 + {v}^{{{2 * rng.randint(1, 3)}}})")
+    if op == "absolute":
+        return _MathExpr(rf"|{v} - {rng.randint(1, 13)}|")
+    if op == "frac":
+        num = _random_math_expr(rng, variables, depth - 1)
+        den = _math_join(_MathExpr(rf"{v}^{{{2 * rng.randint(1, 3)}}}"), "+", str(rng.randint(1, 12)))
+        return _math_frac(num, den)
+    return _math_sqrt(_MathExpr(rf"{v}^{{{2 * rng.randint(1, 3)}}} + {rng.randint(1, 12)}"))
+
+
+_DERIVATION_FAMILIES = (
+    "linear_isolation", "quadratic_expand", "power_rule", "chain_rule", "integral_eval",
+    "trig_identity", "log_power", "exponential_ode", "driven_ode", "heat_equation",
+    "wave_equation", "joint_probability", "complement", "geometric_series", "telescoping_product",
+    "exponential_limit", "absolute_inequality", "convexity",
+)
+
+
+def _sample_derivation(rng: random.Random, variables: tuple[str, ...]) -> StructuredPrompt:
+    mode = rng.choice(_DERIVATION_FAMILIES)
+    v, w, g = variables
+    a, b, c = rng.sample(range(2, 16), 3)
+    name = rng.choice(("f", "g", "h", "F", "P"))
+    f = f"{name}({v})"
+    t = rng.choice([time for time in ("t", "s", r"\tau") if time not in (v, w)])
+    k = rng.choice(("k", "j", "i", "m"))
+    n = rng.choice(("n", "N", "m"))
+    if n == k:
+        n = "N"
+
+    if mode == "linear_isolation":
+        op = rng.choice(("+", "-"))
+        rhs = a*c + b if op == "+" else a*c - b
+        lines = [rf"{a}{v} {op} {b} = {rhs}", rf"{a}{v} = {a*c}", rf"{v} = {c}"]
+    elif mode == "quadratic_expand":
+        op = rng.choice(("+", "-"))
+        lines = [rf"({v} {op} {a})^2 = {b}", rf"{v}^2 {op} {2*a}{v} + {a*a} = {b}"]
+    elif mode == "power_rule":
+        lines = [rf"{f} = {a}{v}^{{{b}}} {rng.choice(('+', '-'))} {c}",
+                 rf"{name}'({v}) = {a*b}{v}^{{{b-1}}}"]
+    elif mode == "chain_rule":
+        fn, derivative = rng.choice(((r"\sin", r"\cos"), (r"\cos", r"-\sin"), (r"\exp", r"\exp")))
+        argument = rf"{a}{v}^{{{b}}} + {c}"
+        lines = [rf"{f} = {fn}({argument})",
+                 rf"{name}'({v}) = {derivative}({argument}) \cdot {a*b}{v}^{{{b-1}}}"]
+    elif mode == "integral_eval":
+        lower, upper = sorted(rng.sample(range(0, 10), 2))
+        power = rng.randint(1, 4)
+        symbol = rng.choice(("I", "A", "S", r"\Phi"))
+        lines = [rf"{symbol} = \int_{{{lower}}}^{{{upper}}} {a}{v}^{{{power}}} d{v}",
+                 rf"{symbol} = \frac{{{a}}}{{{power+1}}}{v}^{{{power+1}}}|_{{{lower}}}^{{{upper}}}",
+                 rf"{symbol} = \frac{{{a*(upper**(power+1)-lower**(power+1))}}}{{{power+1}}}"]
+    elif mode == "trig_identity":
+        argument = rf"({a} {g} + {b})"
+        fn, other = rng.choice(((r"\sin", r"\cos"), (r"\cos", r"\sin")))
+        lines = [rf"{fn}^2{argument} + {other}^2{argument} = 1",
+                 rf"{a}{fn}^2{argument} = {a}(1 - {other}^2{argument})"]
+    elif mode == "log_power":
+        use_ln = rng.random() < 0.5
+        fn = r"\ln" if use_ln else rf"\log_{{{b}}}"
+        den = rf"1+{v}^2" if use_ln else rf"(1+{v}^2)\ln {b}"
+        lines = [rf"{f} = {fn}((1+{v}^2)^{{{a}}})",
+                 rf"{f} = {a}{fn}(1+{v}^2)", rf"{name}'({v}) = \frac{{{2*a}{v}}}{{{den}}}"]
+    elif mode == "exponential_ode":
+        lines = [rf"{w}'({t}) = {g} {w}({t})", rf"{w}(0) = {a}",
+                 rf"{w}({t}) = {a} e^{{{g} {t}}}"]
+    elif mode == "driven_ode":
+        trig, derivative = rng.choice(((r"\sin", r"\cos"), (r"\cos", r"-\sin")))
+        slope = rf"{a}" if derivative[0] != "-" else f"-{a}"
+        lines = [rf"{w}'({t}) = {slope} {derivative.lstrip('-')}({b}{t})",
+                 rf"{w}({t}) = \frac{{{a}}}{{{b}}}{trig}({b}{t}) + {c}"]
+    elif mode in ("heat_equation", "wave_equation"):
+        fn = rng.choice((r"\sin", r"\cos"))
+        space = rf"{fn}({b}{v})"
+        coefficient = rf"{a}" if rng.random() < 0.5 else g
+        if mode == "heat_equation":
+            lines = [rf"{w}({v},{t}) = {space} e^{{-{coefficient} {b*b}{t}}}",
+                     rf"\frac{{\partial {w}}}{{\partial {t}}} = {coefficient} \frac{{\partial^2 {w}}}{{\partial {v}^2}}"]
+        else:
+            lines = [rf"{w}({v},{t}) = {fn}({b}({v}-{coefficient} {t}))",
+                     rf"\frac{{\partial^2 {w}}}{{\partial {t}^2}} = {{{coefficient}}}^2 \frac{{\partial^2 {w}}}{{\partial {v}^2}}"]
+    elif mode in ("joint_probability", "complement"):
+        u, z = rng.sample(("A", "B", "C", "D", "E", "F", "G", "H"), 2)
+        probability = rng.choice((r"\Pr", "P"))
+        if mode == "joint_probability":
+            lines = [rf"{probability}({u}\cap {z}) = {probability}({u}|{z}){probability}({z})",
+                     rf"{probability}({u}|{z}) = \frac{{{probability}({u}\cap {z})}}{{{probability}({z})}}"]
+        else:
+            lines = [rf"{probability}({u}) = \frac{{{a}}}{{{a+b}}}",
+                     rf"{probability}({u}^c) = 1-{probability}({u}) = \frac{{{b}}}{{{a+b}}}"]
+    elif mode == "geometric_series":
+        ratio = rng.choice((w, g))
+        lines = [rf"S_{{{n}}} = \sum_{{{k}=0}}^{{{n}-1}} {ratio}^{{{k}}}",
+                 rf"(1-{ratio})S_{{{n}}} = 1-{ratio}^{{{n}}}",
+                 rf"S_{{{n}}} = \frac{{1-{ratio}^{{{n}}}}}{{1-{ratio}}}"]
+    elif mode == "telescoping_product":
+        lines = [rf"P_{{{n}}} = \prod_{{{k}={a}}}^{{{n}}} \frac{{{k}+1}}{{{k}}}",
+                 rf"P_{{{n}}} = \frac{{{a+1}}}{{{a}}}\frac{{{a+2}}}{{{a+1}}}\cdots\frac{{{n}+1}}{{{n}}}",
+                 rf"P_{{{n}}} = \frac{{{n}+1}}{{{a}}}"]
+    elif mode == "exponential_limit":
+        lines = [rf"S_{{{n}}} = (1+\frac{{{a}}}{{{n}}})^{{{b}{n}}}",
+                 rf"\lim_{{{n}\rightarrow\infty}} S_{{{n}}} = e^{{{a*b}}}"]
+    elif mode == "absolute_inequality":
+        lo, hi = rng.choice((("<", "<"), (r"\leq", r"\leq")))
+        lines = [rf"|{a}{v} - {b}| {hi} {c}",
+                 rf"{b-c} {lo} {a}{v} {hi} {b+c}",
+                 rf"\frac{{{b-c}}}{{{a}}} {lo} {v} {hi} \frac{{{b+c}}}{{{a}}}"]
+    else:
+        p = 2 * rng.randint(1, 4)
+        lines = [rf"{f} = {a}{v}^{{{p}}} + {b}{v} + {c}",
+                 rf"{name}''({v}) = {a*p*(p-1)}{v}^{{{p-2}}} \geq 0"]
+
+    layout = rng.choice(("aligned", "aligned_eq", "flat", "vstack"))
+    parts = [_split_tex_fields(line, "=") for line in lines]
+    if layout == "aligned_eq" and all(len(part) > 1 for part in parts):
+        cells: list[str] = []
+        rows = [[_tree_cell(cells, lhs + " ="), _tree_cell(cells, " = ".join(rhs))]
+                for lhs, *rhs in parts]
+        body = r" \\ ".join(lhs + " &= " + " = ".join(rhs) for lhs, *rhs in parts)
+        return StructuredPrompt("tree", rf"\begin{{aligned}}{body}\end{{aligned}}", cells,
+                                {"tree": {"op": "aligned_eq", "rows": rows}, "subkind": mode})
+    body = r" \\ ".join(lines)
+    if layout == "vstack":
+        cells = []
+        nodes = [_tree_cell(cells, line) for line in lines]
+        return StructuredPrompt("tree", body, cells, {"tree": {"op": "vstack", "lines": nodes}, "subkind": mode})
+    if layout == "aligned":
+        body = rf"\begin{{aligned}}{body}\end{{aligned}}"
+    return StructuredPrompt("multiline", body, lines, {"env": "aligned" if layout == "aligned" else "flat", "subkind": mode})
+
+
+def _sample_expression_tree(rng: random.Random, variables: tuple[str, ...]) -> StructuredPrompt:
+    mode = rng.choice(("big_frac", "nested_frac", "continued_frac", "big_sqrt", "tall_delim",
+                       "binomial_expansion", "definite_integral", "bounded_sum", "bounded_product", "function_limit"))
+    v, w, g = variables
+    a, b, c = rng.sample(range(2, 15), 3)
+    name = rng.choice(("F", "G", "L", "R", "S", r"\Phi", r"\Psi"))
+    expression = _random_math_expr(rng, variables, rng.randint(1, 3))
+    second = _random_math_expr(rng, variables, rng.randint(1, 2))
+    if mode == "big_frac":
+        expr = _math_frac(expression, _math_join(second, "+", f"{a}{v}^2"))
+    elif mode == "nested_frac":
+        expr = _math_frac(_math_join(f"{v}^2 +", _math_frac(expression, _MathExpr(str(a)))),
+                          _math_frac(_MathExpr(rf"{w}^2 + {b}"), second))
+    elif mode == "continued_frac":
+        expr = _MathExpr(str(c))
+        for _ in range(rng.randint(2, 3)):
+            expr = _math_join(str(rng.randint(1, 9)), "+",
+                              _math_frac(_MathExpr(rng.choice(("1", str(a), v))), expr))
+    elif mode == "big_sqrt":
+        expr = _math_sqrt(_math_join(f"{v}^2 +", _math_frac(expression, _MathExpr(rf"{w}^2 + {a}"))))
+    elif mode == "tall_delim":
+        left, right = rng.choice((("(", ")"), ("[", "]"), ("|", "|")))
+        inner = _math_frac(expression, second)
+        power = str(rng.randint(2, 6)) if left != "|" and rng.random() < 0.65 else ""
+        exponent = rf"^{{{power}}}" if power else ""
+        children = (inner, _MathExpr(power)) if power else (inner,)
+        expr = _MathExpr(rf"\left{left}{inner.latex}\right{right}{exponent}", "delim", children, (left, right))
+    elif mode == "binomial_expansion":
+        index = rng.choice(("i", "j", "k"))
+        upper = rng.choice(("n", "m", str(a)))
+        binom = _MathExpr(rf"\binom{{{upper}}}{{{index}}}", "binom", (_MathExpr(upper), _MathExpr(index)))
+        expr = _math_join(rf"({v}+{w})^{{{upper}}} = \sum_{{{index}=0}}^{{{upper}}}",
+                          binom, rf"{v}^{{{index}}}{w}^{{{upper}-{index}}}")
+    elif mode == "definite_integral":
+        lower = rng.choice(("0", str(-a), g))
+        upper = rng.choice((str(b), r"\pi", r"\infty"))
+        expr = _math_join(rf"\int_{{{lower}}}^{{{upper}}}",
+                          _math_frac(_MathExpr(rf"\cos({a}{v})"), _MathExpr(rf"{v}^2 + {c}")),
+                          rf"d{v}")
+    elif mode in ("bounded_sum", "bounded_product"):
+        name_op = r"\sum" if mode == "bounded_sum" else r"\prod"
+        index = rng.choice(("i", "j", "k"))
+        upper = rng.choice(("n", "m", str(b)))
+        expr = _math_join(rf"{name_op}_{{{index}={rng.randint(0, 3)}}}^{{{upper}}}",
+                          _math_frac(_MathExpr(rf"{index}^2 + {a}{v}"), _MathExpr(rf"{index}^2 + {c}")))
+    else:
+        upper = rng.choice(("0", str(a), r"\infty"))
+        expr = _math_join(rf"\lim_{{{v}\rightarrow {upper}}}",
+                          _math_frac(_MathExpr(rf"{v}^2 + {b}{v} + {a}"), _MathExpr(rf"{v}^2 + {c}")))
+    if mode != "binomial_expansion" and rng.random() < 0.78:
+        expr = _math_join(rng.choice((name, f"{name}({v})", w)) + " =", expr)
+    cells: list[str] = []
+    tree = expr.emit(cells)
+    return StructuredPrompt("tree", expr.latex, cells, {"tree": tree, "subkind": mode})
+
+
+def _sample_matrix_prompt(rng: random.Random, variables: tuple[str, ...]) -> StructuredPrompt:
+    mode = rng.choice(("matrix", "determinant", "matrix_vector", "matrix_product", "eigenvalues",
+                       "augmented", "block_matrix"))
+    env = rng.choice(("bmatrix", "pmatrix"))
+    size = rng.choice((2, 3))
+    a, b, c = rng.sample(("A", "B", "C", "D", "H", "M", "Q", "R", "S"), 3)
     cells: list[str] = []
 
-    if mode == "big_frac_eq":
-        lhs = rng.choice([f"f({v}) =", f"{v2} =", r"\Delta =", "I =", "S ="])
-        num = rng.choice([
-            f"{a}{v}^2 + {b}{v} - {c}",
-            f"\\int_0^{b} {v}^2 d{v} + {a}{v}",
-            f"\\sin^2 {g} + \\cos^2 {g} + {a}{v}",
-            f"\\sum_{{i=1}}^{v} i + {b}{v}^2",
-            f"({v} + {a})({v} - {b}) + {c}",
-        ])
-        den_kind = rng.randrange(4)
-        if den_kind == 0:
-            rad_inner = f"{v}^2 + {a}{v} + {c}"
-            den_tex = f"\\sqrt{{{rad_inner}}}"
-            den_node: dict[str, Any] = {"op": "sqrt", "body": _tree_cell(cells, rad_inner)}
-        elif den_kind == 1:
-            rad_inner = f"{a}^2 + {b}^2"
-            den_tex = f"\\sqrt{{{rad_inner}}} + {v}"
-            den_node = {
-                "op": "hcat",
-                "items": [{"op": "sqrt", "body": _tree_cell(cells, rad_inner)}, _tree_cell(cells, f"+ {v}")],
-            }
-        elif den_kind == 2:
-            den_tex = f"{b}{v}^2 - {a}{v} + {c}"
-            den_node = _tree_cell(cells, den_tex)
+    def entry() -> _MathExpr:
+        if mode in ("matrix_vector", "matrix_product") or rng.random() < 0.68:
+            return _MathExpr(rng.choice((str(rng.randint(-9, 14)), rng.choice(variables))))
+        return _random_math_expr(rng, variables, 1)
+
+    def matrix(grid: list[list[_MathExpr]], kind: str = env, divider: int | None = None):
+        body = r" \\ ".join(" & ".join(e.latex for e in row) for row in grid)
+        if divider is None:
+            latex = rf"\begin{{{kind}}}{body}\end{{{kind}}}"
         else:
-            den_tex = f"({v} + {a})^2 + {b}"
-            den_node = _tree_cell(cells, den_tex)
-        tail = rng.choice(["", f"+ {c}", "= 0", f"= {b}{v}"])
-        items = [_tree_cell(cells, lhs), {"op": "frac", "num": _tree_cell(cells, num), "den": den_node, "scale": 0.96}]
-        if tail:
-            items.append(_tree_cell(cells, tail))
-        latex = f"{lhs} \\frac{{{num}}}{{{den_tex}}}" + (f" {tail}" if tail else "")
-        return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": {"op": "hcat", "items": items}, "subkind": "big_frac"})
+            spec = "c" * divider + "|" + "c" * (len(grid[0]) - divider)
+            latex = rf"\left[\begin{{array}}{{{spec}}}{body}\end{{array}}\right]"
+        node = {"op": "matrix", "env": kind, "grid": [[e.emit(cells) for e in row] for row in grid]}
+        if divider is not None:
+            node["column_divider"] = divider
+        return latex, node
 
-    if mode == "nested_frac":
-        lhs = rng.choice([f"f({v}) =", "R =", "H =", ""])
-        n_left = rng.choice([f"{a}{v} +", "1 +", f"{v}^2 -"])
-        n_num, n_den = rng.choice([(f"{b}", f"{v} + {c}"), (f"{v}", f"{a}"), (f"{a}{v}", f"{v} - {b}")])
-        d_left = rng.choice([f"{v} -", "1 +", f"{b}{v} +"])
-        d_num, d_den = rng.choice([(f"{c}", f"{v} + {a}"), (f"{b}", f"{v}^2 + 1"), (f"{v}", f"{c}")])
-        num_node = {
-            "op": "hcat",
-            "items": [
-                _tree_cell(cells, n_left),
-                {"op": "frac", "num": _tree_cell(cells, n_num), "den": _tree_cell(cells, n_den), "scale": 0.82},
-            ],
-        }
-        den_node = {
-            "op": "hcat",
-            "items": [
-                _tree_cell(cells, d_left),
-                {"op": "frac", "num": _tree_cell(cells, d_num), "den": _tree_cell(cells, d_den), "scale": 0.82},
-            ],
-        }
-        frac_node = {"op": "frac", "num": num_node, "den": den_node, "scale": 0.94}
-        if lhs:
-            tree = {"op": "hcat", "items": [_tree_cell(cells, lhs), frac_node]}
-            latex = f"{lhs} \\frac{{{n_left} \\frac{{{n_num}}}{{{n_den}}}}}{{{d_left} \\frac{{{d_num}}}{{{d_den}}}}}"
+    cols = size if mode != "matrix" else rng.choice((2, 3))
+    grid = [[entry() for _ in range(cols)] for _ in range(size)]
+    items: list[tuple[str, dict[str, Any]]] = []
+
+    def add(text: str) -> None:
+        items.append((text, _tree_cell(cells, text)))
+
+    if mode == "matrix":
+        if rng.random() < 0.64:
+            add(f"{a} =")
+        items.append(matrix(grid))
+    elif mode == "determinant":
+        if rng.random() < 0.55:
+            add(rf"\det {a} =")
+        items.append(matrix(grid, "vmatrix"))
+    elif mode == "matrix_vector":
+        vector = [_MathExpr(x) for x in variables[:size]]
+        items.extend((matrix(grid), matrix([[x] for x in vector])))
+        add("=")
+        result = [[_MathExpr(" + ".join(rf"({e.latex}) {v.latex}" for e, v in zip(row, vector)))] for row in grid]
+        items.append(matrix(result))
+    elif mode == "matrix_product":
+        if rng.random() < 0.70:
+            add(f"{a}{b} =")
+        width = rng.choice((2, 3))
+        items.extend((matrix(grid), matrix([[entry() for _ in range(width)] for _ in range(size)])))
+    elif mode == "eigenvalues":
+        lam = rng.choice((r"\lambda", r"\mu", r"\theta"))
+        v = rng.choice(("v", "w", "u"))
+        if rng.random() < 0.50:
+            add(rf"({a} - {lam} I) {v} = 0")
+            add(rf"\Rightarrow \det({a}-{lam} I) = 0")
         else:
-            tree = frac_node
-            latex = f"\\frac{{{n_left} \\frac{{{n_num}}}{{{n_den}}}}}{{{d_left} \\frac{{{d_num}}}{{{d_den}}}}}"
-        return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": tree, "subkind": "nested_frac"})
+            grid = [[_math_join(e, "-", lam) if i == j else e for j, e in enumerate(row)]
+                    for i, row in enumerate(grid)]
+            items.append(matrix(grid, "vmatrix"))
+            add("= 0")
+    elif mode == "augmented":
+        add(f"{a} =")
+        items.append(matrix([row + [entry()] for row in grid], "bmatrix", divider=size))
+    else:
+        m, n = rng.sample(("m", "n", "p", "q", str(size), str(size + 1)), 2)
+        zero = _MathExpr(rng.choice(("0", rf"0_{{{m}\times {n}}}")))
+        block_a = _MathExpr(rng.choice((a, rf"{a}^T", rf"{a}_{{{m}}}")))
+        block_b = _MathExpr(rng.choice((b, rf"{b}^T", rf"{b}_{{{n}}}")))
+        identity = _MathExpr(rng.choice((rf"I_{{{m}}}", rf"I_{{{n}}}", r"\mathbb{I}")))
+        add(f"{c} =")
+        placement = rng.choice((
+            ((block_a, block_b), (zero, identity)),
+            ((block_a, zero), (zero, block_b)),
+            ((block_a, zero), (block_b, identity)),
+        ))
+        items.append(matrix([list(row) for row in placement]))
 
-    if mode == "big_sqrt_frac":
-        lhs = rng.choice([f"{v} =", "r =", "L =", ""])
-        num = rng.choice([f"{a}{v}^2 + {b}{v} + {c}", f"({v} + {a})^2 - {b}", f"{v}^3 + {c}{v}"])
-        den = rng.choice([f"{b}{v} + {c}", f"{a}{v}^2 + 1", f"{v}^2 + {b}^2"])
-        inner = {"op": "frac", "num": _tree_cell(cells, num), "den": _tree_cell(cells, den), "scale": 0.92}
-        sq_node = {"op": "sqrt", "body": inner}
-        if lhs:
-            tree = {"op": "hcat", "items": [_tree_cell(cells, lhs), sq_node]}
-            latex = f"{lhs} \\sqrt{{\\frac{{{num}}}{{{den}}}}}"
-        else:
-            tree = sq_node
-            latex = f"\\sqrt{{\\frac{{{num}}}{{{den}}}}}"
-        return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": tree, "subkind": "big_sqrt"})
+    label = " ".join(latex for latex, _ in items)
+    nodes = [node for _, node in items]
+    if len(nodes) == 1 and nodes[0]["op"] == "matrix":
+        tree = nodes[0]
+    else:
+        tree = {"op": "hcat", "items": nodes, "gap": 0.44}
+    return StructuredPrompt("tree", label, cells, {"tree": tree, "subkind": mode})
 
-    if mode == "tall_delim_frac":
-        l_d, r_d = rng.choice([("(", ")"), ("[", "]"), ("|", "|")])
-        exp_s = rng.choice(["2", "n", "-1", ""]) if l_d != "|" else ""
-        num = rng.choice([f"{a}{v} + {b}", f"{v}^2 - {c}", f"\\sin {g} + {a}"])
-        den = rng.choice([f"{c}{v} - {a}", f"{v} + {b}", f"\\cos {g} + {b}"])
-        frac_node = {"op": "frac", "num": _tree_cell(cells, num), "den": _tree_cell(cells, den), "scale": 0.94}
-        sup_node = _tree_cell(cells, exp_s) if exp_s else None
-        delim_node = {"op": "delim", "left": l_d, "right": r_d, "body": frac_node, "sup": sup_node}
-        rhs = f"= {a + b}"
-        tree = {"op": "hcat", "items": [delim_node, _tree_cell(cells, rhs)]}
-        latex = f"\\left{l_d} \\frac{{{num}}}{{{den}}} \\right{r_d}" + (f"^{{{exp_s}}}" if exp_s else "") + f" {rhs}"
-        return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": tree, "subkind": "tall_delim"})
 
-    if mode == "multiline_frac_proof":
-        # 3-line calculus/algebra derivation with big composed fractions on EVERY line (same writer!)
-        line1 = {
-            "op": "hcat",
-            "items": [
-                _tree_cell(cells, f"f({v}) ="),
-                {"op": "frac", "num": _tree_cell(cells, f"{a}{v}^2 + {b}"), "den": _tree_cell(cells, f"{v} + {c}"), "scale": 0.94},
-            ],
-        }
-        line2 = {
-            "op": "hcat",
-            "items": [
-                _tree_cell(cells, f"f'({v}) ="),
-                {
-                    "op": "frac",
-                    "num": _tree_cell(cells, f"{2*a}{v}({v} + {c}) - ({a}{v}^2 + {b})"),
-                    "den": _tree_cell(cells, f"({v} + {c})^2"),
-                    "scale": 0.94,
-                },
-            ],
-        }
-        line3 = {
-            "op": "hcat",
-            "items": [
-                _tree_cell(cells, f"f'({v}) ="),
-                {
-                    "op": "frac",
-                    "num": _tree_cell(cells, f"{a}{v}^2 + {2*a*c}{v} - {b}"),
-                    "den": _tree_cell(cells, f"({v} + {c})^2"),
-                    "scale": 0.94,
-                },
-            ],
-        }
-        l1 = f"f({v}) = \\frac{{{a}{v}^2 + {b}}}{{{v} + {c}}}"
-        l2 = f"f'({v}) = \\frac{{{2*a}{v}({v} + {c}) - ({a}{v}^2 + {b})}}{{({v} + {c})^2}}"
-        l3 = f"f'({v}) = \\frac{{{a}{v}^2 + {2*a*c}{v} - {b}}}{{({v} + {c})^2}}"
-        latex = r"\begin{aligned}" + r" \\ ".join([l1, l2, l3]) + r"\end{aligned}"
-        return StructuredPrompt(
-            kind="tree",
-            latex=latex,
-            cells=cells,
-            meta={"tree": {"op": "vstack", "lines": [line1, line2, line3]}, "subkind": "multiline_frac"},
-        )
+def _sample_cases_prompt(rng: random.Random, variables: tuple[str, ...]) -> StructuredPrompt:
+    v, _, g = variables
+    name = rng.choice(("f", "g", "h", "F", "p", "q"))
+    count = rng.randint(2, 4)
+    cut = rng.randint(-12, 12)
+    upper = cut + rng.randint(1, 12)
+    word = r"\text{otherwise}"
+    membership = rng.choice((rf"{v} \in [{cut},{upper}]", rf"{v} \in ({cut},{upper})"))
+    if count == 2:
+        conditions = rng.choice((
+            (rf"{v} < {cut}", rf"{v} \geq {cut}"),
+            (rf"{v} \leq {cut}", rf"{v} > {cut}"),
+            (rf"{v} = {cut}", rf"{v} \neq {cut}"),
+            (membership, word),
+            (rf"{v} > {g}", word),
+        ))
+        if rng.random() < 0.30:
+            conditions = (conditions[0], word)
+    elif count == 3:
+        conditions = rng.choice((
+            (rf"{v} < {cut}", rf"{v} = {cut}", rf"{v} > {cut}"),
+            (rf"{v} \leq {cut}", rf"{v} \geq {upper}", word),
+            (rf"{v} < {cut}", rf"{v} \in [{cut},{upper}]", rf"{v} > {upper}"),
+        ))
+    else:
+        conditions = (rf"{v} < {cut}", rf"{v} = {cut}", rf"{cut} < {v} \leq {upper}", word)
+    conditions = [condition if condition == word or rng.random() < 0.45 else rf"\text{{if }} {condition}"
+                  for condition in conditions]
+    expressions = [_random_math_expr(rng, variables, rng.choice((1, 1, 2))).latex for _ in conditions]
+    rows = list(zip(expressions, conditions))
+    prefix = rf"{name}({v}) ="
+    body = r" \\ ".join(f"{value} & {condition}" for value, condition in rows)
+    cells = [prefix, *(item for row in rows for item in row)]
+    pairs = [(1 + 2*i, 2 + 2*i) for i in range(len(rows))]
+    return StructuredPrompt("cases", rf"{prefix} \begin{{cases}}{body}\end{{cases}}", cells,
+                            {"has_prefix": True, "row_pairs": pairs, "subkind": f"cases_{count}"})
 
-    # multiline_aligned_eq: true `=`-column aligned multi-step equation solving!
-    rhs_val = a * c + b
-    d = rng.randint(2, 8)
-    rows_tex = [
-        (f"{a}{v} + {b} + {d}", f"= {rhs_val} + {d}"),
-        (f"{a}{v} + {b}", f"= {rhs_val}"),
-        (f"{a}{v}", f"= {rhs_val - b}"),
-        (f"{v}", f"= {c}"),
-    ]
-    n_lines = rng.choice([3, 4])
-    chosen = rows_tex[1:] if n_lines == 3 else rows_tex
-    eq_rows = [(_tree_cell(cells, lhs_s), _tree_cell(cells, rhs_s)) for lhs_s, rhs_s in chosen]
-    latex = r"\begin{aligned}" + r" \\ ".join(f"{l_s} & {r_s}" for l_s, r_s in chosen) + r"\end{aligned}"
-    return StructuredPrompt(
-        kind="tree",
-        latex=latex,
-        cells=cells,
-        meta={"tree": {"op": "aligned_eq", "rows": eq_rows}, "subkind": "aligned_eq"},
-    )
+
+def _sample_variables(rng: random.Random) -> tuple[str, str, str]:
+    v, w = rng.sample(("x", "y", "t", "u", "z", "r", "s", "p", "q"), 2)
+    g = rng.choice((r"\alpha", r"\beta", r"\gamma", r"\theta", r"\lambda", r"\mu", r"\phi", r"\omega"))
+    return v, w, g
+
+
+def sample_big_fraction_or_multistep_prompt(rng: random.Random) -> StructuredPrompt:
+    """Sample a laid-out expression tree or multiline derivation."""
+    variables = _sample_variables(rng)
+    if rng.random() < 0.25:
+        return _sample_derivation(rng, variables)
+    return _sample_expression_tree(rng, variables)
 
 
 def sample_programmatic_structured_prompt(rng: random.Random) -> StructuredPrompt:
-    """Synthesize diverse multi-line derivations, big/nested fractions, radicals, matrices, and piecewise functions."""
-    choice = rng.random()
-
-    # 0. Big / nested fractions, big radicals, tall delimiters & multi-line fraction derivations (30%)
-    if choice < 0.30:
-        return sample_big_fraction_or_multistep_prompt(rng)
-
-    # A. Multi-line algebra / calculus derivation (28%)
-    if choice < 0.58:
-        v = rng.choice(["x", "y", "t", "u", "z", "n"])
-        a = rng.randint(2, 9)
-        b = rng.randint(2, 9)
-        c = rng.randint(2, 12)
-        template = rng.choice(["linear_solve", "quadratic_expand", "deriv_chain", "integral_eval", "system2"])
-        if template == "linear_solve":
-            rhs = a * c + b
-            lines = [
-                f"{a}{v} + {b} = {rhs}",
-                f"{a}{v} = {rhs - b}",
-                f"{v} = {c}",
-            ]
-        elif template == "quadratic_expand":
-            lines = [
-                f"({v} + {b})^2 = {c}",
-                f"{v}^2 + {2*b}{v} + {b*b} = {c}",
-                f"{v}^2 + {2*b}{v} + {b*b - c} = 0" if b * b >= c else f"{v}^2 + {2*b}{v} = {c - b*b}",
-            ]
-        elif template == "deriv_chain":
-            g, dg = rng.choice([(r"\sin", r"\cos"), (r"\cos", r"-\sin"), (r"\exp", r"\exp")])
-            lines = [
-                f"f({v}) = {g}({a}{v}^{b})",
-                f"f'({v}) = {a*b}{v}^{b-1} \\cdot {dg}({a}{v}^{b})" if b > 1 else f"f'({v}) = {a} {dg}({a}{v})",
-            ]
-        elif template == "integral_eval":
-            lines = [
-                f"I = \\int_0^{b} {a}{v} d{v}",
-                f"I = \\frac{{{a}}}{{2}} {v}^2 \\mid_0^{b}",
-                f"I = \\frac{{{a * b * b}}}{{2}}",
-            ]
-        else:
-            v2 = "y" if v != "y" else "z"
-            lines = [
-                f"{a}{v} + {b}{v2} = {c}",
-                f"{b}{v} - {v2} = {a}",
-            ]
-        use_aligned = rng.random() < 0.55
-        if use_aligned:
-            latex = r"\begin{aligned}" + r" \\ ".join(lines) + r"\end{aligned}"
-        else:
-            latex = r" \\ ".join(lines)
-        return StructuredPrompt(kind="multiline", latex=latex, cells=lines, meta={"env": "aligned" if use_aligned else "flat"})
-
-    # B. Matrix (2x2, 2x3, 3x3) or Matrix Multiplication `A * x = b` (always delimited!)
-    if choice < 0.75:
-        if rng.random() < 0.25:
-            # 2x2 Matrix-vector multiplication equation!
-            env = rng.choice(["bmatrix", "pmatrix"])
-            a1, a2, a3, a4 = [rng.choice(["a", "b", "c", "d", "1", "2", "3", "-1", "x", r"\lambda"]) for _ in range(4)]
-            v1, v2 = rng.choice([("x", "y"), ("u", "v"), ("1", "2")])
-            r1 = f"{a1}{v1} + {a2}{v2}" if a1 not in ("1", "-1") else f"{v1} + {a2}{v2}"
-            r2 = f"{a3}{v1} + {a4}{v2}" if a3 not in ("1", "-1") else f"{v1} + {a4}{v2}"
-            latex = (
-                f"\\begin{{{env}}} {a1} & {a2} \\\\ {a3} & {a4} \\end{{{env}}} "
-                f"\\begin{{{env}}} {v1} \\\\ {v2} \\end{{{env}}} = "
-                f"\\begin{{{env}}} {r1} \\\\ {r2} \\end{{{env}}}"
-            )
-            cells = [a1, a2, a3, a4, v1, v2, "=", r1, r2]
-            tree = {
-                "op": "hcat",
-                "gap": 0.40,
-                "items": [
-                    {"op": "matrix", "env": env, "grid": [[{"op": "cell", "i": 0}, {"op": "cell", "i": 1}], [{"op": "cell", "i": 2}, {"op": "cell", "i": 3}]]},
-                    {"op": "matrix", "env": env, "grid": [[{"op": "cell", "i": 4}], [{"op": "cell", "i": 5}]]},
-                    {"op": "cell", "i": 6},
-                    {"op": "matrix", "env": env, "grid": [[{"op": "cell", "i": 7}], [{"op": "cell", "i": 8}]]},
-                ],
-            }
-            return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": tree, "subkind": "matrix_eq"})
-        env = rng.choice(["bmatrix", "pmatrix", "vmatrix"])
-        rows = rng.choice([2, 2, 3])
-        cols = rng.choice([2, 2, 3])
-        if env == "vmatrix":
-            cols = rows
-        pool = [
-            "0", "1", "-1", "2", "3", "-2", "4", "5", "a", "b", "c", "d",
-            "x", "y", "z", r"\alpha", r"\beta", r"\lambda", r"\cos\theta", r"\sin\theta",
-            r"-\sin\theta", "1-x", r"\frac{1}{2}", "2x", "x^2",
-        ]
-        grid = [[rng.choice(pool) for _ in range(cols)] for _ in range(rows)]
-        body = r" \\ ".join(" & ".join(r) for r in grid)
-        prefix = ""
-        if rng.random() < 0.45:
-            mat_name = rng.choice(["A", "B", "M", "R", "T", r"\Sigma"])
-            prefix = f"{mat_name} = "
-        latex = prefix + r"\begin{" + env + "}" + body + r"\end{" + env + "}"
-        cells = ([prefix.strip()] if prefix else []) + [c for r in grid for c in r]
-        return StructuredPrompt(
-            kind="matrix",
-            latex=latex,
-            cells=cells,
-            meta={
-                "env": env,
-                "rows": rows,
-                "cols": cols,
-                "row_lens": [cols] * rows,
-                "has_prefix": bool(prefix),
-            },
-        )
-
-    # C. Piecewise function `\begin{cases}` with `\text{if ...}` / `\text{otherwise}` (25%)
-    v = rng.choice(["x", "t", "n"])
-    fname = rng.choice(["f", "g", "h", "p"])
-    a = rng.randint(2, 6)
-    b = rng.randint(2, 5)
-    case_rows = [
-        (f"{v}^2 + {a}", rf"\text{{if }} {v} \geq 0"),
-        (f"-{b}{v}", rf"\text{{if }} {v} < 0"),
-    ]
-    if rng.random() < 0.45:
-        case_rows = [
-            (f"{a}{v}", rf"\text{{if }} {v} > {b}"),
-            ("0", rf"\text{{if }} {v} = {b}"),
-            (f"-{v}", r"\text{otherwise}"),
-        ]
-    prefix = f"{fname}({v}) ="
-    body = r" \\ ".join(f"{val} & {cond}" for val, cond in case_rows)
-    latex = f"{prefix} \\begin{{cases}}{body}\\end{{cases}}"
-    cells = [prefix]
-    row_pairs: list[tuple[int, int | None]] = []
-    for val, cond in case_rows:
-        vi = len(cells)
-        cells.append(val)
-        ci = len(cells)
-        cells.append(cond)
-        row_pairs.append((vi, ci))
-    return StructuredPrompt(
-        kind="cases",
-        latex=latex,
-        cells=cells,
-        meta={"has_prefix": True, "row_pairs": row_pairs},
-    )
+    """Compose a fresh STEM expression from randomized symbols, operators, and layouts."""
+    sampler = rng.choices(
+        (_sample_derivation, _sample_expression_tree, _sample_matrix_prompt, _sample_cases_prompt),
+        weights=(33, 23, 27, 17),
+    )[0]
+    return sampler(rng, _sample_variables(rng))
 
 
 # ---------------------------------------------------------------------------
@@ -1160,7 +1395,7 @@ def _assemble_ink_node(
         num_st, (nx0, ny0, nx1, ny1), _ = _assemble_ink_node(node["num"], cell_strokes, rng, writer_slant)
         den_st, (dx0, dy0, dx1, dy1), _ = _assemble_ink_node(node["den"], cell_strokes, rng, writer_slant)
         nw, nh = (nx1 - nx0) * scale, (ny1 - ny0) * scale
-        dw, dh = (dx1 - dx0) * scale, (dy1 - dy0) * scale
+        dw = (dx1 - dx0) * scale
         bar_pad = float(rng.uniform(0.24, 0.46))
         bar_w = max(nw, dw, 0.9) + 2.0 * bar_pad
         v_gap_top = float(rng.uniform(0.28, 0.46))
@@ -1170,15 +1405,15 @@ def _assemble_ink_node(
         v_gap_bot = float(rng.uniform(0.44, 0.64) if den_has_sqrt else rng.uniform(0.28, 0.46))
         y_bar = nh + v_gap_top
 
-        out: list[np.ndarray] = []
-        # Numerator centered above bar (natural order: numerator -> bar -> denominator)
+        # Center the numerator and denominator before choosing the stroke order.
         num_dx = 0.5 * (bar_w - nw) - nx0 * scale + float(rng.normal(0.0, 0.08))
         num_dy = -ny0 * scale
-        out.extend(_shift_scale_strokes(num_st, dx=num_dx, dy=num_dy, scale=scale))
-        out.extend(draw_human_hline(0.0, bar_w, y_bar, rng))
+        num_ink = _shift_scale_strokes(num_st, dx=num_dx, dy=num_dy, scale=scale)
+        bar_ink = draw_human_hline(0.0, bar_w, y_bar, rng, slant=writer_slant)
         den_dx = 0.5 * (bar_w - dw) - dx0 * scale + float(rng.normal(0.0, 0.08))
         den_dy = (y_bar + v_gap_bot) - dy0 * scale
-        out.extend(_shift_scale_strokes(den_st, dx=den_dx, dy=den_dy, scale=scale))
+        den_ink = _shift_scale_strokes(den_st, dx=den_dx, dy=den_dy, scale=scale)
+        out = num_ink + (den_ink + bar_ink if rng.random() < 0.30 else bar_ink + den_ink)
 
         bx0, by0, bx1, by1 = strokes_bbox(out)
         out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
@@ -1190,7 +1425,7 @@ def _assemble_ink_node(
         top_st, (tx0, ty0, tx1, ty1), _ = _assemble_ink_node(node["top"], cell_strokes, rng, writer_slant)
         bot_st, (bx0_i, by0_i, bx1_i, by1_i), _ = _assemble_ink_node(node["bot"], cell_strokes, rng, writer_slant)
         tw, th = (tx1 - tx0) * scale, (ty1 - ty0) * scale
-        bw_i, bh_i = (bx1_i - bx0_i) * scale, (by1_i - by0_i) * scale
+        bw_i = (bx1_i - bx0_i) * scale
         col_w = max(tw, bw_i, 0.7)
         v_gap = float(rng.uniform(0.32, 0.52))
         out = []
@@ -1242,8 +1477,17 @@ def _assemble_ink_node(
                 dx = x_start + col_xs[c] + 0.5 * (col_w[c] - cw) - x0 + float(rng.normal(0.0, 0.06))
                 dy = row_ys[r] + 0.5 * (row_h[r] - ch) - y0 + float(rng.normal(0.0, 0.05))
                 out.extend(_shift_scale_strokes(st, dx=dx, dy=dy))
+        if divider := node.get("column_divider"):
+            x_divider = x_start + col_xs[divider] - 0.5 * col_gap
+            out.extend(draw_human_delimiter("|", x_divider, 0.0, mat_h, rng, slant=writer_slant))
         if right_d:
-            out.extend(draw_human_delimiter(right_d, x_start + mat_w + float(rng.uniform(0.42, 0.65)), 0.0, mat_h, rng, slant=writer_slant))
+            closing = draw_human_delimiter(
+                right_d, x_start + mat_w + float(rng.uniform(0.42, 0.65)), 0.0, mat_h, rng, slant=writer_slant
+            )
+            if rng.random() < 0.22:
+                out[1:1] = closing
+            else:
+                out.extend(closing)
         bx0, by0, bx1, by1 = strokes_bbox(out)
         out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
         return out, (0.0, 0.0, bx1 - bx0, by1 - by0), 0.5 * (by1 - by0)
@@ -1252,8 +1496,8 @@ def _assemble_ink_node(
         body_st, (x0, y0, x1, y1), y_ax = _assemble_ink_node(node["body"], cell_strokes, rng, writer_slant)
         if not body_st:
             return [], (0.0, 0.0, 0.5, 1.0), 0.5
-        rad_st = draw_human_sqrt(x0, y0, x1, y1, rng)
-        out = rad_st + body_st
+        rad_st = draw_human_sqrt(x0, y0, x1, y1, rng, slant=writer_slant)
+        out = body_st + rad_st if rng.random() < 0.22 else rad_st + body_st
         bx0, by0, bx1, by1 = strokes_bbox(out)
         out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
         return out, (0.0, 0.0, bx1 - bx0, by1 - by0), y_ax - by0
@@ -1269,7 +1513,7 @@ def _assemble_ink_node(
         body_shifted = _shift_scale_strokes(body_st, dx=pad_l - x0)
         right_x = pad_l + bw + pad_r
         right_d = draw_human_delimiter(str(node["right"]), right_x, y0, y1, rng, slant=writer_slant)
-        out = left_d + body_shifted + right_d
+        out = left_d + (right_d + body_shifted if rng.random() < 0.22 else body_shifted + right_d)
         if node.get("sup") is not None:
             sup_st, (sx0, sy0, sx1, sy1), _ = _assemble_ink_node(node["sup"], cell_strokes, rng, writer_slant)
             if sup_st:
@@ -1341,6 +1585,39 @@ def _assemble_ink_node(
     return [], (0.0, 0.0, 0.5, 1.0), 0.5
 
 
+def _estimate_cell_x_height(latex: str, strokes: Sequence[np.ndarray]) -> float | None:
+    """Measure typical upright ink, filtering short marks and horizontal operators."""
+    tokens = tokenize_inkforge(latex)
+    spans = [(float(np.ptp(st[:, 0])), float(np.ptp(st[:, 1]))) for st in strokes if len(st) > 1]
+    heights = [h for w, h in spans if h >= 0.10 and h > 0.55 * w]
+    if heights:
+        if len(heights) >= 3:
+            low, high = np.percentile(heights, [20, 80])
+            # Keep the main body when there is a stray tall delimiter or a small script.
+            heights = [h for h in heights if 0.75 * low <= h <= 1.20 * high]
+        return float(np.median(heights))
+    if tokens in (["="], ["-"], [r"\leq"], [r"\geq"], [r"\approx"]):
+        widths = [w for w, _ in spans if w >= 0.10]
+        if widths:
+            return float(np.median(widths)) / 0.85
+    return None
+
+
+def _scale_sibling_cells(
+    labels: Sequence[str], cell_strokes: list[list[np.ndarray]],
+) -> list[list[np.ndarray]]:
+    """Restore a shared glyph scale before any subtree applies its own layout scaling."""
+    heights = [_estimate_cell_x_height(label, st) for label, st in zip(labels, cell_strokes)]
+    upright_heights = [h for label, h in zip(labels, heights)
+                       if h is not None and re.search(r"[a-zA-Z0-9]", label)]
+    target = float(np.clip(np.median(upright_heights), 0.75, 1.10)) if upright_heights else 0.90
+    return [
+        _shift_scale_strokes(st, scale=float(np.clip(target / heights[i], 0.13, 3.5)))
+        if i < len(heights) and heights[i] is not None else st
+        for i, st in enumerate(cell_strokes)
+    ]
+
+
 def assemble_structured_strokes(
     prompt: StructuredPrompt,
     cell_strokes: list[list[np.ndarray]],
@@ -1350,6 +1627,7 @@ def assemble_structured_strokes(
     if prompt.kind == "single":
         return cell_strokes[0] if cell_strokes else []
 
+    cell_strokes = _scale_sibling_cells(prompt.cells, cell_strokes)
     writer_slant = float(rng.uniform(-0.08, 0.08))
 
     if prompt.kind == "tree":
@@ -1468,7 +1746,12 @@ def assemble_structured_strokes(
 
         if right_delim:
             x_right = x_cells_start + mat_w + float(rng.uniform(0.45, 0.72))
-            out.extend(draw_human_delimiter(right_delim, x_right, 0.0, mat_h, rng, slant=writer_slant))
+            closing = draw_human_delimiter(right_delim, x_right, 0.0, mat_h, rng, slant=writer_slant)
+            if rng.random() < 0.22:
+                first_cell_ink = len(cell_strokes[0]) + 1 if has_prefix else 1
+                out[first_cell_ink:first_cell_ink] = closing
+            else:
+                out.extend(closing)
 
         return out
 
@@ -1543,6 +1826,25 @@ def assemble_structured_strokes(
 # Prompt Stream Loader
 # ---------------------------------------------------------------------------
 
+UNIMER_STRATA = ("single", "long_tree", "multiline", "matrix", "cases")
+
+
+def _iter_unimer_prompts(tokenizer: InkForgeTokenizer, path: Path) -> Iterator[StructuredPrompt]:
+    if not path.is_file():
+        return
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except (UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(row, dict) or row.get("split", "train") != "train":
+                continue
+            prompt = parse_unimer_prompt(row.get("normalized_latex") or row.get("latex") or "", tokenizer)
+            if prompt is not None:
+                yield prompt
+
+
 def load_unimer_prompt_pool(
     tokenizer: InkForgeTokenizer,
     unimer_path: Path = DEFAULT_UNIMER_JSONL,
@@ -1550,24 +1852,49 @@ def load_unimer_prompt_pool(
     max_prompts: int = 120000,
     seed: int = 2026,
 ) -> list[StructuredPrompt]:
-    """Load real-world STEM formulas (single-line, matrices, cases, aligned) from UniMER."""
-    prompts: list[StructuredPrompt] = []
-    if not unimer_path.is_file():
-        return prompts
-    with unimer_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if len(prompts) >= max_prompts:
-                break
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            if r.get("split", "train") != "train":
-                continue
-            tex = r.get("normalized_latex") or r.get("latex") or ""
-            sp = parse_unimer_prompt(tex, tokenizer)
-            if sp is not None:
-                prompts.append(sp)
-    rng = random.Random(seed)
-    rng.shuffle(prompts)
+    """Load and shuffle the first valid training prompts, preserving the flat API."""
+    prompts = list(islice(_iter_unimer_prompts(tokenizer, unimer_path), max(0, max_prompts)))
+    random.Random(seed).shuffle(prompts)
     return prompts
+
+
+def load_stratified_unimer_pools(
+    tokenizer: InkForgeTokenizer,
+    unimer_path: Path = DEFAULT_UNIMER_JSONL,
+    *,
+    max_prompts: int = 120000,
+    seed: int = 2026,
+) -> dict[str, list[StructuredPrompt]]:
+    """Reserve slots for every structure across the full file, returning at most max_prompts."""
+    pools: dict[str, list[StructuredPrompt]] = {kind: [] for kind in UNIMER_STRATA}
+    if max_prompts <= 0:
+        return pools
+    # Reserve slots for rare layouts even when the first pages are entirely single-line.
+    quota = max(1, max_prompts // len(pools))
+    spare: list[tuple[str, StructuredPrompt]] = []
+    seen: set[str] = set()
+    count = 0
+    for prompt in _iter_unimer_prompts(tokenizer, unimer_path):
+        kind = prompt.kind
+        if kind == "tree":
+            kind = "matrix" if prompt.meta.get("subkind") == "matrix_eq" else "long_tree"
+        key = detokenize_inkforge(tokenize_inkforge(prompt.latex))
+        if key in seen:
+            continue
+        if len(pools[kind]) < quota:
+            pools[kind].append(prompt)
+            seen.add(key)
+            count += 1
+            if count >= max_prompts:
+                break
+        elif len(spare) < max_prompts:
+            spare.append((kind, prompt))
+            seen.add(key)
+
+    rng = random.Random(seed)
+    rng.shuffle(spare)
+    for kind, prompt in spare[:max_prompts - count]:
+        pools[kind].append(prompt)
+    for prompts in pools.values():
+        rng.shuffle(prompts)
+    return pools

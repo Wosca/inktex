@@ -858,6 +858,7 @@ class InkForgeModel(nn.Module):
         *,
         temperature: float | Tensor = 0.40,
         pen_temperature: float = 1.0,
+        jump_temp_scale: float = 1.0,
         cfg_scale: float = 1.0,
         max_steps: int = 512,
         min_steps: int = 1,
@@ -881,6 +882,9 @@ class InkForgeModel(nn.Module):
             temp = torch.full((b,), float(temperature), device=device, dtype=torch.float32)
         else:
             temp = temperature.to(device=device, dtype=torch.float32).view(b)
+
+        if not math.isfinite(jump_temp_scale) or jump_temp_scale <= 0:
+            raise ValueError("jump_temp_scale must be finite and positive")
 
         use_cfg = abs(float(cfg_scale) - 1.0) > 1e-4
         if use_cfg:
@@ -964,14 +968,15 @@ class InkForgeModel(nn.Module):
             pen = torch.where(finished, torch.full_like(pen, 2), pen)
 
             # Sample mixture component (temperature-sharpened pi + scaled std — Graves 2013 bias trick)
-            pi_probs = torch.softmax(pi_logits / temp.clamp(min=0.05).unsqueeze(-1), dim=-1)
+            coord_temp = temp if jump_temp_scale == 1.0 else torch.where(can_eos, temp * jump_temp_scale, temp)
+            pi_probs = torch.softmax(pi_logits / coord_temp.clamp(min=0.05).unsqueeze(-1), dim=-1)
             comp = torch.multinomial(pi_probs, num_samples=1).squeeze(-1)  # [B]
             ar = torch.arange(b, device=device)
 
             mx = mu_x[ar, comp]
             my = mu_y[ar, comp]
-            sig_x = sx[ar, comp] * temp.sqrt()
-            sig_y = sy[ar, comp] * temp.sqrt()
+            sig_x = sx[ar, comp] * coord_temp.sqrt()
+            sig_y = sy[ar, comp] * coord_temp.sqrt()
             r = rho[ar, comp]
 
             eps1 = torch.randn((b,), device=device)

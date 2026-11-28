@@ -57,6 +57,7 @@ DEFAULT_MATHWRITING_SYMBOLS = Path(r"E:\mathwriting-2024\symbols")
 DEFAULT_MATHWRITING_SYNTHETIC = Path(r"E:\mathwriting-2024\synthetic")
 DEFAULT_CACHE_DIR = Path(r"E:\math-recogniser-training\inkforge_data")
 DEFAULT_V2_CACHE_DIR = Path(r"E:\math-recogniser-training\inkforge_data_v2")
+DEFAULT_V3_CACHE_DIR = Path(r"E:\math-recogniser-training\inkforge_data_v3")
 
 SOURCE_NAMES = (
     "mathwriting",
@@ -69,6 +70,43 @@ SOURCE_NAMES = (
     "composed",
 )
 SOURCE_TO_ID = {name: i for i, name in enumerate(SOURCE_NAMES)}
+V3_ALIAS_SOURCE_ID = 9
+V3_COMPOSED_SOURCE_ID = 10
+V3_SOURCE_NAMES = {V3_ALIAS_SOURCE_ID: "real_alias", V3_COMPOSED_SOURCE_ID: "composed_v3"}
+
+# LaTeX commands that are complete math atoms when used as a single-token script.
+_SCRIPT_ATOM_COMMANDS = frozenset(r"""
+\alpha \beta \gamma \delta \epsilon \varepsilon \zeta \eta \theta \vartheta
+\iota \kappa \lambda \mu \nu \xi \pi \rho \sigma \tau \upsilon \phi \varphi
+\chi \psi \omega \Gamma \Delta \Theta \Lambda \Xi \Pi \Sigma \Upsilon \Phi \Psi
+\Omega \infty \partial \nabla \ell \prime \ast \circ \times \pm \mp \hbar
+""".split())
+
+
+def _can_brace_script(token: str) -> bool:
+    return token in _SCRIPT_ATOM_COMMANDS or (len(token) == 1 and token.isascii() and (token.isalnum() or token in "+-*=!.,"))
+
+
+def expand_single_token_braces(tokens: Sequence[int], tokenizer: InkForgeTokenizer, max_len: int) -> list[int]:
+    """Expand bare script atoms while retaining the complete sequence and EOS."""
+    ids = tokenizer.token_to_id
+    room = max_len - len(tokens)
+    if room < 2 or not {"^", "_", "{", "}"}.issubset(ids):
+        return list(tokens)
+    markers = (ids["^"], ids["_"])
+    expanded: list[int] = []
+    i = 0
+    while i < len(tokens):
+        tok = int(tokens[i])
+        expanded.append(tok)
+        if room >= 2 and tok in markers and i + 1 < len(tokens):
+            atom = int(tokens[i + 1])
+            if _can_brace_script(tokenizer.tokens[atom]):
+                expanded.extend((ids["{"], atom, ids["}"]))
+                room -= 2
+                i += 1
+        i += 1
+    return expanded
 
 
 # ---------------------------------------------------------------------------
@@ -1219,11 +1257,22 @@ class InkForgeDataset(Dataset):
         augment: bool = True,
         input_noise_std: float = 0.010,
         source_weights: dict[str, float] | None = None,
+        brace_aug_prob: float = 0.0,
+        stroke_order_aug_prob: float = 0.0,
+        stroke_jitter_std: float = 0.0,
     ):
         self.split_dir = Path(cache_dir) / split
         self.cfg = cfg or InkForgeConfig()
         self.augment = augment
         self.input_noise_std = input_noise_std
+        if not (0.0 <= brace_aug_prob <= 1.0 and 0.0 <= stroke_order_aug_prob <= 1.0):
+            raise ValueError("Augmentation probabilities must be in [0, 1]")
+        if not math.isfinite(stroke_jitter_std) or stroke_jitter_std < 0.0:
+            raise ValueError("stroke_jitter_std must be finite and nonnegative")
+        self.brace_aug_prob = brace_aug_prob
+        self.stroke_order_aug_prob = stroke_order_aug_prob
+        self.stroke_jitter_std = stroke_jitter_std
+        self.brace_tokenizer = InkForgeTokenizer.load(Path(cache_dir) / "tokenizer.json") if augment and brace_aug_prob else None
 
         self.points_xy = np.load(self.split_dir / "points_xy.npy", mmap_mode="r")
         self.points_pen = np.load(self.split_dir / "points_pen.npy", mmap_mode="r")
@@ -1237,8 +1286,8 @@ class InkForgeDataset(Dataset):
 
         # Index samples per writer_id for cross-sample same-writer style conditioning!
         writer_buckets: dict[int, list[int]] = defaultdict(list)
-        for idx, wid in enumerate(self.writer_ids.tolist()):
-            if wid > 0:
+        for idx, (wid, sid) in enumerate(zip(self.writer_ids.tolist(), self.source_ids.tolist())):
+            if wid > 0 and sid != V3_ALIAS_SOURCE_ID:
                 writer_buckets[wid].append(idx)
         self.writer_peers: dict[int, np.ndarray] = {
             wid: np.asarray(idxs, dtype=np.int64)
@@ -1257,9 +1306,16 @@ class InkForgeDataset(Dataset):
                 "mw_symbols": 0.25,
                 "mw_synthetic": 0.45,
                 "composed": 0.85,
+                "real_alias": 1.0,
+                "composed_v3": 0.70,
             }
-        w_table = np.array([source_weights.get(name, 1.0) for name in SOURCE_NAMES], dtype=np.float64)
-        self.sample_weights = w_table[self.source_ids]
+        source_names = dict(enumerate(SOURCE_NAMES)) | V3_SOURCE_NAMES
+        w_table = np.ones(max(source_names) + 1, dtype=np.float64)
+        for sid, name in source_names.items():
+            w_table[sid] = source_weights.get(name, 1.0)
+        self.sample_weights = np.ones(self.n_samples, dtype=np.float64)
+        mapped = (self.source_ids >= 0) & (self.source_ids < len(w_table))
+        self.sample_weights[mapped] = w_table[self.source_ids[mapped]]
 
     def __len__(self) -> int:
         return self.n_samples
@@ -1274,6 +1330,8 @@ class InkForgeDataset(Dataset):
         rng = np.random.default_rng() if self.augment else np.random.default_rng(int(idx) + 1000003)
         t0, t1 = int(self.tok_offsets[idx]), int(self.tok_offsets[idx + 1])
         tok_ids = np.array(self.tokens[t0:t1], dtype=np.int64)
+        if self.augment and self.brace_tokenizer is not None and rng.random() < self.brace_aug_prob:
+            tok_ids = np.asarray(expand_single_token_braces(tok_ids, self.brace_tokenizer, self.cfg.max_text_len), dtype=np.int64)
 
         p0, p1 = int(self.pt_offsets[idx]), int(self.pt_offsets[idx + 1])
         xy = np.array(self.points_xy[p0:p1], dtype=np.float32)
@@ -1290,6 +1348,27 @@ class InkForgeDataset(Dataset):
             x1 = x0 + sh * y0
             xy = np.stack([x1 * ca - y0 * sa, x1 * sa + y0 * ca], axis=-1).astype(np.float32)
             xy -= xy[0:1]
+            if self.stroke_order_aug_prob or self.stroke_jitter_std:
+                bounds = np.flatnonzero(pen[:-1] == 1) + 1
+                if len(bounds):
+                    strokes = np.split(xy, bounds)
+                    if self.stroke_order_aug_prob and rng.random() < self.stroke_order_aug_prob:
+                        # Swap nearby consecutive strokes, retaining point order within each stroke.
+                        pairs = [
+                            j for j, (left, right) in enumerate(zip(strokes, strokes[1:]))
+                            if (j > 0 or len(right) > 1)
+                            and np.linalg.norm(left.mean(axis=0) - right.mean(axis=0)) < 1.0
+                        ]
+                        if pairs:
+                            j = int(rng.choice(pairs))
+                            strokes[j], strokes[j + 1] = strokes[j + 1], strokes[j]
+                            pen.fill(0)
+                            pen[np.cumsum([len(stroke) for stroke in strokes]) - 1] = 1
+                    if self.stroke_jitter_std:
+                        shifts = rng.normal(0.0, self.stroke_jitter_std, size=(len(strokes), 2)).astype(np.float32)
+                        strokes = [stroke + shift for stroke, shift in zip(strokes, shifts)]
+                    xy = np.concatenate(strokes)
+                    xy -= xy[0:1]
 
         # Build autoregressive training inputs & targets (length T = N, where step N-1 predicts EOS!)
         # Points: P[0], P[1], ..., P[N-1] with P[0]=(0,0).
@@ -1345,15 +1424,22 @@ class InkForgeDataset(Dataset):
         # Writerless / single-sample rows get empty style_strokes (style_mask = all True -> exact z = 0)
         # so the Style Encoder can NEVER leak the target equation's own strokes!
         wid = int(self.writer_ids[idx])
-        style_strokes: list[np.ndarray]
-        if wid in self.writer_peers:
-            peers = self.writer_peers[wid]
-            peer_idx = int(peers[int(rng.integers(0, len(peers)))])
-            if peer_idx == idx and len(peers) > 1:
-                peer_idx = int(peers[(int(np.searchsorted(peers, idx)) + 1) % len(peers)])
-            style_strokes = self._get_raw_strokes(peer_idx)
-        else:
-            style_strokes = []
+        style_strokes: list[np.ndarray] = []
+        peers = self.writer_peers.get(wid)
+        is_alias = self.source_ids[idx] == V3_ALIAS_SOURCE_ID
+        if peers is not None:
+            start = int(rng.integers(0, len(peers)))
+            for offset in range(len(peers)):
+                peer_idx = int(peers[(start + offset) % len(peers)])
+                if peer_idx == idx:
+                    continue
+                if is_alias:
+                    q0, q1 = self.pt_offsets[peer_idx:peer_idx + 2]
+                    if (p1 - p0 == q1 - q0 and np.array_equal(self.points_xy[p0:p1], self.points_xy[q0:q1])
+                            and np.array_equal(self.points_pen[p0:p1], self.points_pen[q0:q1])):
+                        continue
+                style_strokes = self._get_raw_strokes(peer_idx)
+                break
 
         if self.augment and style_strokes:
             style_strokes = warp_raw_strokes(

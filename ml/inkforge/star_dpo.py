@@ -44,6 +44,7 @@ from inkforge.composer import (  # noqa: E402
 )
 from inkforge.dataset import (  # noqa: E402
     DEFAULT_V2_CACHE_DIR,
+    DEFAULT_V3_CACHE_DIR,
     InkForgeDataset,
     collate_inkforge_batch,
     normalize_and_resample_for_inkforge,
@@ -295,6 +296,18 @@ def _canonicalize_judge_latex(latex: str) -> str:
     return s
 
 
+def _encode_rollout_prompt(latex: str, tokenizer: InkForgeTokenizer, max_len: int, *, v3: bool) -> list[int]:
+    if not v3:
+        return tokenizer.encode(normalize_cell_for_inkforge(latex), max_len=max_len)
+    # Prevent the legacy tokenizer from collapsing explicitly braced scripts.
+    marker = "\ue000"
+    marked = re.sub(r"([_^])(\s*\{)", rf"\1{marker}\2", latex)
+    marked = re.sub(r"(\\text\s*\{[^{}]*\s)(\})", rf"\1{marker}\2", marked)
+    tokens = [token for token in tokenize_inkforge(marked) if token != marker]
+    ids = [tokenizer.token_to_id.get(token, tokenizer.unk_id) for token in tokens[: max_len - 2]]
+    return [tokenizer.bos_id, *ids, tokenizer.eos_id]
+
+
 def strokes_to_inkforge_item(
     strokes: Sequence[np.ndarray],
     token_ids: Sequence[int],
@@ -378,11 +391,15 @@ def judge_rollouts_with_inktex(
     device: torch.device,
     *,
     batch_size: int = 32,
+    min_token_prob: float = 0.0,
 ) -> list[tuple[bool, str, str]]:
     """Run InkTeX v2 bimodal greedy recognition on rollouts and return `(exact_ok, pred_latex, reason)`.
 
-    Reasons: `"ok"`, `"hit_cap"`, `"geom_fail"`, `"raster_fail"`, `"decode_cap"`, `"wrong_latex"`.
+    Low-confidence exact matches return `"low_conf"`. Confidence includes EOS and
+    excludes padding after EOS. A threshold of zero uses the original decode path.
     """
+    if not 0.0 <= min_token_prob <= 1.0:
+        raise ValueError("min_token_prob must be in [0, 1]")
     judge_model.eval()
     n = len(rollout_rows)
     out: list[tuple[bool, str, str]] = [(False, "", "unknown")] * n
@@ -438,23 +455,50 @@ def judge_rollouts_with_inktex(
                     chunk_mask=ck,
                     modality_mode="auto",
                 )
-                pred_ids_list = judge_model.decoder.decode_greedy_cached(
-                    mem,
-                    mem_mask,
-                    bos_id=judge_tok.bos_l2r_id,
-                    eos_id=judge_tok.eos_id,
-                    pad_id=judge_tok.pad_id,
-                    max_tokens=max_dec_tokens,
-                ).cpu().tolist()
-            for idx, pred_ids in zip(sub_idxs, pred_ids_list):
+                decoder = judge_model.decoder
+                step_logits: list[Tensor] = []
+                hook = None
+                if min_token_prob:
+                    # The cached decoder already computes these logits for its argmax.
+                    def capture_logits(_module: torch.nn.Module, _inputs: tuple[Tensor, ...], logits: Tensor) -> None:
+                        step_logits.append(logits[:, 0])
+
+                    hook = decoder.output.register_forward_hook(capture_logits)
+                try:
+                    pred_ids = decoder.decode_greedy_cached(
+                        mem,
+                        mem_mask,
+                        bos_id=judge_tok.bos_l2r_id,
+                        eos_id=judge_tok.eos_id,
+                        pad_id=judge_tok.pad_id,
+                        max_tokens=max_dec_tokens,
+                    )
+                finally:
+                    if hook is not None:
+                        hook.remove()
+                if min_token_prob and pred_ids.shape[1]:
+                    if len(step_logits) != pred_ids.shape[1]:
+                        raise RuntimeError("InkTeX decoder did not emit one logit vector per decoded token")
+                    logits = torch.stack(step_logits, dim=1)
+                    probs = logits.softmax(-1, dtype=torch.float32).gather(-1, pred_ids.unsqueeze(-1)).squeeze(-1)
+                    eos = pred_ids.eq(judge_tok.eos_id).long()
+                    after_eos = eos.cumsum(dim=1) - eos > 0
+                    confidence = ((probs >= min_token_prob) | after_eos).all(dim=1, keepdim=True)
+                    decoded = torch.cat((confidence, pred_ids), dim=1).cpu().tolist()
+                    confident = [bool(row[0]) for row in decoded]
+                    pred_ids_list = [row[1:] for row in decoded]
+                else:
+                    confident = [True] * len(sub_idxs)
+                    pred_ids_list = pred_ids.cpu().tolist()
+            for idx, pred_ids, high_confidence in zip(sub_idxs, pred_ids_list, confident):
                 pred_tex = judge_tok.decode(pred_ids)
-                if len(pred_ids) >= max_dec_tokens and judge_tok.eos_id not in pred_ids:
+                if len(pred_ids) >= max_dec_tokens - 1 and judge_tok.eos_id not in pred_ids:
                     out[idx] = (False, pred_tex, "decode_cap")
                     continue
                 t_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(rollout_rows[idx]["latex"])))
                 p_toks = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(pred_tex)))
                 if bool(t_toks) and p_toks == t_toks:
-                    out[idx] = (True, pred_tex, "ok")
+                    out[idx] = (high_confidence, pred_tex, "ok" if high_confidence else "low_conf")
                 else:
                     out[idx] = (False, pred_tex, "wrong_latex")
     return out
@@ -494,7 +538,7 @@ def _generate_rollouts_chunked(
                     temperature=temperature,
                     pen_temperature=1.0,
                     cfg_scale=cfg_scale,
-                    max_steps=512,
+                    max_steps=ema_model.cfg.max_stroke_points,
                     return_meta=True,
                     return_actions=True,
                 )
@@ -524,12 +568,14 @@ def _evaluate_fixed_prompts(
     temperature: float,
     cfg_scale: float,
     judge_batch_size: int,
+    min_token_prob: float = 0.0,
+    v3: bool = False,
     seed: int = 202601,
 ) -> tuple[float, dict[str, int]]:
     """Deterministic post-update evaluation on a fixed prompt + style subset."""
     ema_model.to(device)
     ema_model.eval()
-    eval_enc = [tokenizer.encode(normalize_cell_for_inkforge(p), max_len=ema_model.cfg.max_text_len) for p in eval_prompts]
+    eval_enc = [_encode_rollout_prompt(p, tokenizer, ema_model.cfg.max_text_len, v3=v3) for p in eval_prompts]
     devices = [device] if device.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(seed)
@@ -554,7 +600,9 @@ def _evaluate_fixed_prompts(
         for i in range(len(eval_prompts))
     ]
     judge_model.to(device)
-    verdicts = judge_rollouts_with_inktex(judge_model, judge_tok, rows, device, batch_size=judge_batch_size)
+    verdicts = judge_rollouts_with_inktex(
+        judge_model, judge_tok, rows, device, batch_size=judge_batch_size, min_token_prob=min_token_prob,
+    )
     judge_model.to("cpu")
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -572,6 +620,54 @@ def _move_optimizer_state(optimizer: torch.optim.Optimizer, target_device: torch
                 state[k] = v.to(target_device, non_blocking=False)
 
 
+def _load_policy(path: Path, *, grad_checkpoint: bool) -> tuple[InkForgeModel, InkForgeTokenizer, bool]:
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    v3 = ckpt.get("arch") == "inkforge_v3" or ckpt.get("format") == "inkforge-checkpoint-v3"
+    if v3:
+        try:
+            from inkforge.v3 import load_inkforge_checkpoint
+        except ModuleNotFoundError as exc:
+            if exc.name != "inkforge.v3":
+                raise
+            raise RuntimeError("Loading an InkForge v3 checkpoint requires the inkforge.v3 package") from exc
+        del ckpt
+        model, tokenizer, _ = load_inkforge_checkpoint(
+            path, torch.device("cpu"), grad_checkpoint=grad_checkpoint, prefer_ema=True,
+        )
+        return model, tokenizer, True
+
+    cfg = InkForgeConfig.from_dict(ckpt["config"])
+    tokenizer = InkForgeTokenizer.from_dict(ckpt["tokenizer"])
+    model = InkForgeModel(cfg, grad_checkpoint=grad_checkpoint)
+    state_key = "ema_state_dict" if "ema_state_dict" in ckpt else "model_state_dict"
+    model.load_state_dict(ckpt[state_key])
+    return model, tokenizer, False
+
+
+def _save_policy(
+    path: Path, *, v3: bool, step: int, cfg: InkForgeConfig, tokenizer: InkForgeTokenizer,
+    model: InkForgeModel, ema_model: InkForgeModel, optimizer: torch.optim.Optimizer, best_val: float,
+) -> None:
+    if not v3:
+        save_checkpoint(path, step=step, cfg=cfg, tokenizer=tokenizer, model=model,
+                        ema_model=ema_model, optimizer=optimizer, best_val=best_val)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".pt.tmp")
+    torch.save({
+        "format": "inkforge-checkpoint-v3",
+        "arch": "inkforge_v3",
+        "step": step,
+        "config": cfg.to_dict(),
+        "tokenizer": tokenizer.to_dict(),
+        "model_state_dict": model.state_dict(),
+        "ema_state_dict": ema_model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_val_mdn": best_val,
+    }, tmp)
+    tmp.replace(path)
+
+
 def run_star_dpo(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -583,12 +679,11 @@ def run_star_dpo(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Load InkForge checkpoint
-    ckpt = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
-    cfg = InkForgeConfig.from_dict(ckpt["config"])
-    tokenizer = InkForgeTokenizer.from_dict(ckpt["tokenizer"])
-    model = InkForgeModel(cfg, grad_checkpoint=args.grad_checkpoint)
-    state_key = "ema_state_dict" if "ema_state_dict" in ckpt else "model_state_dict"
-    model.load_state_dict(ckpt[state_key])
+    model, tokenizer, v3 = _load_policy(args.init_ckpt, grad_checkpoint=args.grad_checkpoint)
+    cfg = model.cfg
+    min_judge_prob = getattr(args, "min_judge_prob", 0.60)
+    if not 0.0 <= min_judge_prob <= 1.0:
+        raise ValueError("--min-judge-prob must be in [0, 1]")
 
     ema_model = copy.deepcopy(model)
     ema_model.grad_checkpoint = False
@@ -615,8 +710,13 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         if fallback_bank.is_file():
             style_bank_path = fallback_bank
     if style_bank_path.is_file():
-        z_bank = np.load(style_bank_path)["mu_bank"].astype(np.float32)
-        print(f"[star-dpo] Loaded {len(z_bank)} writer styles from {style_bank_path}", flush=True)
+        with np.load(style_bank_path) as bank:
+            z_bank = bank["mu_bank"].astype(np.float32)
+        if z_bank.ndim == 2 and z_bank.shape[1] == cfg.style_dim:
+            print(f"[star-dpo] Loaded {len(z_bank)} writer styles from {style_bank_path}", flush=True)
+        else:
+            print(f"[star-dpo] Writer style bank does not match style_dim={cfg.style_dim}: {style_bank_path}", flush=True)
+            z_bank = np.zeros((1, cfg.style_dim), dtype=np.float32)
     else:
         z_bank = np.zeros((1, cfg.style_dim), dtype=np.float32)
 
@@ -630,10 +730,16 @@ def run_star_dpo(args: argparse.Namespace) -> None:
     print(f"[star-dpo] Loaded frozen InkTeX v2 judge from {args.judge_ckpt}", flush=True)
 
     # 3. Replay dataset: STRICTLY real human samples (source_ids <= 5) with Stage-1 source weights!
-    full_train_ds = InkForgeDataset(args.cache_dir, split="train", cfg=cfg, augment=True, input_noise_std=0.010)
+    cache_dir = args.cache_dir or (DEFAULT_V3_CACHE_DIR if v3 else DEFAULT_V2_CACHE_DIR)
+    full_train_ds = InkForgeDataset(
+        cache_dir, split="train", cfg=cfg, augment=True, input_noise_std=0.010,
+        brace_aug_prob=0.25 if v3 else 0.0,
+        stroke_order_aug_prob=0.10 if v3 else 0.0,
+        stroke_jitter_std=0.01 if v3 else 0.0,
+    )
     real_indices = np.where(full_train_ds.source_ids <= 5)[0]
     if len(real_indices) == 0:
-        real_indices = np.arange(len(full_train_ds))
+        raise ValueError(f"No real-human replay rows in {cache_dir}")
     real_weights = torch.from_numpy(full_train_ds.sample_weights[real_indices].astype(np.float64))
     replay_subset = Subset(full_train_ds, real_indices.tolist())
     replay_sampler = WeightedRandomSampler(
@@ -722,6 +828,8 @@ def run_star_dpo(args: argparse.Namespace) -> None:
             temperature=args.rollout_temp,
             cfg_scale=args.cfg_scale,
             judge_batch_size=args.judge_batch_size,
+            min_token_prob=min_judge_prob,
+            v3=v3,
         )
         print(
             f"[star-dpo baseline eval] fixed_pass={base_pass*100:.1f}% | reasons={json.dumps(base_reasons)}",
@@ -738,7 +846,7 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         ema_model.to(device)
         ema_model.eval()
         rollout_rows: list[dict[str, Any]] = []
-        encoded_prompts = [tokenizer.encode(normalize_cell_for_inkforge(p), max_len=cfg.max_text_len) for p in rd_prompts]
+        encoded_prompts = [_encode_rollout_prompt(p, tokenizer, cfg.max_text_len, v3=v3) for p in rd_prompts]
         k_roll = args.rollouts_per_prompt
 
         for start in range(0, len(rd_prompts), args.gen_batch_size):
@@ -784,7 +892,8 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         # ---- Phase 2: InkTeX v2 Automated Reward Judging ----
         judge_model.to(device)
         verdicts = judge_rollouts_with_inktex(
-            judge_model, judge_tok, rollout_rows, device, batch_size=args.judge_batch_size
+            judge_model, judge_tok, rollout_rows, device,
+            batch_size=args.judge_batch_size, min_token_prob=min_judge_prob,
         )
         judge_model.to("cpu")
         if device.type == "cuda":
@@ -799,7 +908,7 @@ def run_star_dpo(args: argparse.Namespace) -> None:
             if ok:
                 w_list.append(row)
             elif reason == "wrong_latex":
-                # Strictly exclude hit_cap, geom_fail, raster_fail, and decode_cap from DPO losers!
+                # Only definite recognition mismatches form DPO losers.
                 l_list.append(row)
 
         star_winners: list[dict[str, Any]] = []
@@ -967,6 +1076,8 @@ def run_star_dpo(args: argparse.Namespace) -> None:
             temperature=args.rollout_temp,
             cfg_scale=args.cfg_scale,
             judge_batch_size=args.judge_batch_size,
+            min_token_prob=min_judge_prob,
+            v3=v3,
         )
 
         # Render previews from updated EMA on GPU, then save checkpoints
@@ -978,8 +1089,9 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-        save_checkpoint(
+        _save_policy(
             out_dir / f"round_{rd:02d}.pt",
+            v3=v3,
             step=global_step,
             cfg=cfg,
             tokenizer=tokenizer,
@@ -991,8 +1103,9 @@ def run_star_dpo(args: argparse.Namespace) -> None:
         improved = (not wrote_best) or (eval_pass > best_eval_pass)
         if improved:
             best_eval_pass = eval_pass
-            save_checkpoint(
+            _save_policy(
                 out_dir / "best.pt",
+                v3=v3,
                 step=global_step,
                 cfg=cfg,
                 tokenizer=tokenizer,
@@ -1002,8 +1115,9 @@ def run_star_dpo(args: argparse.Namespace) -> None:
                 best_val=-best_eval_pass,
             )
             wrote_best = True
-        save_checkpoint(
+        _save_policy(
             out_dir / "latest.pt",
+            v3=v3,
             step=global_step,
             cfg=cfg,
             tokenizer=tokenizer,
@@ -1062,13 +1176,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="InkTeX-guided STaR + DPO post-training for InkForge")
     parser.add_argument("--init-ckpt", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--cache-dir", type=Path, default=DEFAULT_V2_CACHE_DIR)
+    parser.add_argument("--cache-dir", type=Path, help="Replay cache (defaults to the checkpoint's version)")
     parser.add_argument("--judge-ckpt", type=Path, default=DEFAULT_INKTEX_V2_CKPT)
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--prompts-per-round", type=int, default=1200)
     parser.add_argument("--rollouts-per-prompt", type=int, default=6)
     parser.add_argument("--gen-batch-size", type=int, default=12)
     parser.add_argument("--judge-batch-size", type=int, default=32)
+    parser.add_argument("--min-judge-prob", type=float, default=0.60, help="Minimum decoded token probability for an exact match")
     parser.add_argument("--train-batch-size", type=int, default=12)
     parser.add_argument("--max-updates-per-round", type=int, default=200)
     parser.add_argument("--rollout-temp", type=float, default=0.45)

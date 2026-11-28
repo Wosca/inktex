@@ -1,24 +1,21 @@
 """Resumable overnight synthetic human-like math handwriting generator for RTX 4070 Ti.
 
-Generates a balanced real-world STEM mix:
-  - ~55% complex single-line STEM formulas mined from UniMER (300k real formulas, long expressions, rare symbols)
-  - ~20% multi-line derivations (`\\` and `\\begin{aligned}`) with consistent single-writer style across lines
-  - ~15% 2x2..3x3 matrices (`bmatrix`, `pmatrix`, `vmatrix`, `matrix`) with hand-drawn brackets
-  - ~10% piecewise functions (`\\begin{cases}`) with real handwritten `\\text{if ...}` / `\\text{otherwise}`
-
-Writes resumable `stroke-latex-v1` JSONL shards to `E:\\math-recogniser-training\\inkforge_synth\\`
-plus crisp PNG contact sheets every 1,000 samples so you can visually inspect quality!
+Combines stratified real UniMER labels with procedurally composed STEM formulas. Each
+equation shares a writer style across its cells and keeps geometry- and recognition-verified
+cells while retrying failures. Writes resumable stroke-latex-v1 JSONL shards and contact sheets.
 """
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import inspect
 import json
 from pathlib import Path
 import random
 import re
 import sys
 import time
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -31,7 +28,7 @@ from inkforge.composer import (  # noqa: E402
     DEFAULT_UNIMER_JSONL,
     StructuredPrompt,
     assemble_structured_strokes,
-    load_unimer_prompt_pool,
+    load_stratified_unimer_pools,
     passes_geometry_gate,
     sample_programmatic_structured_prompt,
     smooth_strokes_catmull_rom,
@@ -42,12 +39,18 @@ from inkforge.render import render_contact_sheet  # noqa: E402
 from inkforge.star_dpo import (  # noqa: E402
     DEFAULT_INKTEX_V2_CKPT,
     _canonicalize_judge_latex,
-    judge_rollouts_with_inktex,
     normalize_cell_for_inkforge,
 )
 from inkforge.tokenizer import InkForgeTokenizer, tokenize_inkforge  # noqa: E402
+from inkforge.verify_openrouter import _normalize_otherwise  # noqa: E402
 from tokenizer.latex_tokenizer import tokenize_latex  # noqa: E402
-from v2.eval_v2 import _safe_std_v2, load_v2_checkpoint  # noqa: E402
+from v2.eval_v2 import (  # noqa: E402
+    _featurize_eval_batch,
+    _prepare_row_vision,
+    _safe_std_v2,
+    load_v2_checkpoint,
+)
+from v2.vision_raster import WIDTH_BUCKETS_V2, select_width_bucket  # noqa: E402
 
 
 _SINGLE_CHAR_AMBIG_MAP = {
@@ -96,6 +99,99 @@ def _single_token_case_match(target_latex: str, pred_latex: str) -> bool:
     return _SINGLE_CHAR_AMBIG_MAP.get(t_toks[0], t_toks[0]) == _SINGLE_CHAR_AMBIG_MAP.get(p_toks[0], p_toks[0])
 
 
+def _otherwise_match(target_latex: str, pred_latex: str) -> bool:
+    word = r"\text{otherwise}"
+    return _normalize_otherwise(target_latex.strip()) == word == _normalize_otherwise(pred_latex.strip())
+
+
+def _decode_with_token_confidence(
+    decoder: torch.nn.Module, memory: torch.Tensor, mask: torch.Tensor | None, tokenizer: Any,
+) -> tuple[list[list[int]], list[float]]:
+    # Capture the cached decoder's actual greedy distributions without a second decode.
+    chosen_probabilities: list[torch.Tensor] = []
+
+    def capture_probability(_module: Any, _args: Any, output: torch.Tensor) -> None:
+        logits = output[:, -1].float()
+        max_logit = logits.amax(dim=-1)
+        chosen_probabilities.append((max_logit - logits.logsumexp(dim=-1)).exp())
+
+    hook = decoder.output.register_forward_hook(capture_probability)
+    try:
+        ids = decoder.decode_greedy_cached(
+            memory, mask, bos_id=tokenizer.bos_l2r_id, eos_id=tokenizer.eos_id,
+            pad_id=tokenizer.pad_id, max_tokens=96,
+        )
+    finally:
+        hook.remove()
+    if not chosen_probabilities:
+        return ids.cpu().tolist(), [0.0] * ids.shape[0]
+    probs = torch.stack(chosen_probabilities, dim=1)
+    content = torch.ones_like(ids, dtype=torch.bool)
+    for special in (tokenizer.pad_id, tokenizer.bos_l2r_id, tokenizer.bos_r2l_id,
+                    tokenizer.eos_id, tokenizer.unk_id):
+        content &= ids.ne(special)
+    minimums = probs.masked_fill(~content, 1.0).amin(dim=1)
+    minimums = minimums.masked_fill(~content.any(dim=1), 0.0)
+    return ids.cpu().tolist(), minimums.cpu().tolist()
+
+
+@torch.inference_mode()
+def judge_rollouts_with_confidence(
+    judge_model: torch.nn.Module,
+    judge_tok: Any,
+    rollout_rows: Sequence[dict[str, Any]],
+    device: torch.device,
+    *,
+    batch_size: int = 32,
+) -> list[tuple[bool, str, str, float]]:
+    """Run the local InkTeX v2 judge and return match, prediction, reason, and minimum token probability."""
+    judge_model.eval()
+    verdicts = [(False, "", "raster_fail", 0.0)] * len(rollout_rows)
+    buckets: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+    rng = np.random.default_rng(12345)
+    for idx, row in enumerate(rollout_rows):
+        if not row["finished"]:
+            verdicts[idx] = (False, "", "hit_cap", 0.0)
+            continue
+        if not passes_geometry_gate(row["latex"], row["strokes"], is_atomic_cell=True):
+            verdicts[idx] = (False, "", "geom_fail", 0.0)
+            continue
+        strokes = smooth_strokes_catmull_rom(row["strokes"], subdivisions=2)
+        features = {"id": f"r{idx}", "strokes": strokes,
+                    "times": synthesize_realistic_times(strokes, rng), "target": row["latex"]}
+        try:
+            img, width = _prepare_row_vision(features)
+        except (ValueError, RuntimeError, OSError):
+            continue
+        features["_cached_image"], features["_cached_width"] = img, width
+        bucket = select_width_bucket(width, WIDTH_BUCKETS_V2)
+        buckets.setdefault(bucket, []).append((idx, features))
+
+    for bucket in sorted(buckets):
+        rows = buckets[bucket]
+        for start in range(0, len(rows), batch_size):
+            batch_rows = rows[start : start + batch_size]
+            batch = _featurize_eval_batch(
+                [row for _, row in batch_rows], use_vision=True, use_strokes=True, pad_id=judge_tok.pad_id,
+            )
+            inputs = {key: batch[key].to(device, non_blocking=True) for key in (
+                "images", "image_widths", "chunk_points", "chunk_point_mask", "chunk_meta", "chunk_mask",
+            )}
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                mem, mem_mask, _ = judge_model.encode(**inputs, modality_mode="auto")
+                predictions, confidences = _decode_with_token_confidence(judge_model.decoder, mem, mem_mask, judge_tok)
+            for (idx, row), ids, min_prob in zip(batch_rows, predictions, confidences):
+                pred = judge_tok.decode(ids)
+                if judge_tok.eos_id not in ids:
+                    verdicts[idx] = (False, pred, "decode_cap", min_prob)
+                    continue
+                target_tokens = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(row["target"])))
+                pred_tokens = tokenize_latex(_safe_std_v2(_canonicalize_judge_latex(pred)))
+                matches = bool(target_tokens) and pred_tokens == target_tokens
+                verdicts[idx] = (matches, pred, "ok" if matches else "wrong_latex", min_prob)
+    return verdicts
+
+
 @torch.inference_mode()
 def generate_verified_cells(
     model: InkForgeModel,
@@ -110,7 +206,9 @@ def generate_verified_cells(
     judge_model: torch.nn.Module | None = None,
     judge_tok: Any | None = None,
     judge_batch_size: int = 32,
-    max_retries: int = 2,
+    max_retries: int = 3,
+    cell_owner: Sequence[int] | None = None,
+    min_judge_prob: float = 0.60,
 ) -> tuple[list[list[np.ndarray]], list[bool]]:
     """Generate flattened cells in length-bucketed OOM-safe chunks with InkTeX v2 verification + selective retry!
 
@@ -123,7 +221,20 @@ def generate_verified_cells(
     pending = list(range(n))
     all_enc = [tokenizer.encode(normalize_cell_for_inkforge(c), max_len=model.cfg.max_text_len) for c in flat_cells]
 
-    for attempt in range(max_retries + 1):
+    if cell_owner is not None and len(cell_owner) != n:
+        raise ValueError("cell_owner must contain one equation index per cell")
+    owner_counts = Counter(cell_owner) if cell_owner is not None else Counter()
+    sampler_options = {"pen_temperature": 1.0}
+    if "jump_temp_scale" in inspect.signature(model.generate_batch).parameters:
+        sampler_options = {"pen_temperature": 0.80, "jump_temp_scale": 0.55}
+
+    for attempt in range(max_retries + 2):
+        if attempt > max_retries:
+            if cell_owner is None:
+                break
+            failed_by_owner = Counter(cell_owner[idx] for idx in pending)
+            pending = [idx for idx in pending
+                       if owner_counts[cell_owner[idx]] >= 3 and failed_by_owner[cell_owner[idx]] == 1]
         if not pending:
             break
         # Sort pending cells by token length so short matrix numbers finish in ~25 steps instead of 450!
@@ -149,10 +260,10 @@ def generate_verified_cells(
                         tok_t,
                         style_z=z_t,
                         temperature=t_t,
-                        pen_temperature=1.0,
                         cfg_scale=cfg_scale,
-                        max_steps=512,
+                        max_steps=min(512, max(96, 18 * max_l + 48)),
                         return_meta=True,
+                        **sampler_options,
                     )
                 cand_strokes.extend(st_c)
                 cand_meta.extend(meta_c)
@@ -187,15 +298,18 @@ def generate_verified_cells(
                 }
                 for pos in geom_pass_pos
             ]
-            verdicts = judge_rollouts_with_inktex(
+            verdicts = judge_rollouts_with_confidence(
                 judge_model, judge_tok, judge_rows, device, batch_size=judge_batch_size
             )
-            for pos, (v_ok, pred_tex, _reason) in zip(geom_pass_pos, verdicts):
+            for pos, (v_ok, pred_tex, reason, min_prob) in zip(geom_pass_pos, verdicts):
+                if reason not in ("ok", "wrong_latex") or not min_prob >= min_judge_prob:
+                    continue
                 idx = pending[pos]
+                target = flat_cells[idx]
                 if (
-                    v_ok
-                    or (_is_dangling_prefix_cell(flat_cells[idx]) and _prefix_tokens_match(flat_cells[idx], pred_tex))
-                    or _single_token_case_match(flat_cells[idx], pred_tex)
+                    v_ok or _otherwise_match(target, pred_tex)
+                    or (_is_dangling_prefix_cell(target) and _prefix_tokens_match(target, pred_tex))
+                    or _single_token_case_match(target, pred_tex)
                 ):
                     out_strokes[idx] = cand_strokes[pos]
                     cell_ok[idx] = True
@@ -235,6 +349,28 @@ def strokes_to_v1_schema(strokes: list[np.ndarray], times: list[np.ndarray]) -> 
     return out
 
 
+def _load_generator_checkpoint(
+    path: Path, device: torch.device,
+) -> tuple[InkForgeModel, InkForgeTokenizer, dict[str, Any]]:
+    try:
+        from inkforge.v3 import load_inkforge_checkpoint
+    except ModuleNotFoundError as exc:
+        if exc.name != "inkforge.v3":
+            raise
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        if checkpoint.get("format") == "inkforge-checkpoint-v3":
+            raise RuntimeError("Loading an InkForge v3 checkpoint requires the inkforge.v3 package") from exc
+        cfg = InkForgeConfig.from_dict(checkpoint["config"])
+        tokenizer = InkForgeTokenizer.from_dict(checkpoint["tokenizer"])
+        model = InkForgeModel(cfg)
+        model.load_state_dict(checkpoint.get("ema_state_dict") or checkpoint["model_state_dict"])
+        return model.to(device).eval(), tokenizer, checkpoint
+    return load_inkforge_checkpoint(path, device, grad_checkpoint=False, prefer_ema=True)
+
+
+_REAL_STRATA_WEIGHTS = {"single": 35, "long_tree": 35, "multiline": 12, "matrix": 10, "cases": 8}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Overnight InkForge synthetic human math handwriting generator")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to trained InkForge best.pt / latest.pt")
@@ -244,35 +380,40 @@ def main() -> None:
     parser.add_argument("--target-count", type=int, default=200000, help="Total valid samples to generate")
     parser.add_argument("--shard-size", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=96, help="GPU cell batch size (96-128 fits RTX 4070 Ti easily)")
-    parser.add_argument("--structured-prob", type=float, default=0.45, help="Fraction of multi-line/matrix/cases prompts")
+    parser.add_argument("--structured-prob", type=float, default=0.45, help="Fraction of prompts composed procedurally instead of sampled from UniMER")
     parser.add_argument("--temp-min", type=float, default=0.28)
     parser.add_argument("--temp-max", type=float, default=0.52)
     parser.add_argument("--cfg-scale", type=float, default=1.5, help="Text CFG scale (1.5 for InkForge v2)")
     parser.add_argument("--judge-ckpt", type=Path, default=DEFAULT_INKTEX_V2_CKPT, help="InkTeX v2 judge for cell verification")
     parser.add_argument("--no-verify-cells", action="store_true", help="Disable InkTeX v2 atomic-cell verification")
-    parser.add_argument("--max-cell-retries", type=int, default=2, help="Selective retries per failed atomic cell (same writer z)")
+    parser.add_argument("--max-cell-retries", type=int, default=3, help="Selective retries per failed cell with the same writer style")
+    parser.add_argument("--min-judge-prob", type=float, default=0.60, help="Minimum InkTeX v2 greedy token probability (0 disables the confidence gate)")
     parser.add_argument("--preview-every", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
+    if not 0.0 <= args.min_judge_prob <= 1.0:
+        parser.error("--min-judge-prob must be between 0 and 1")
+    if args.max_cell_retries < 0:
+        parser.error("--max-cell-retries must be nonnegative")
+    if not args.no_verify_cells and not args.judge_ckpt.is_file():
+        parser.error(f"InkTeX v2 judge checkpoint is missing at {args.judge_ckpt}. Set --judge-ckpt or --no-verify-cells.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = InkForgeConfig.from_dict(ckpt["config"])
-    tokenizer = InkForgeTokenizer.from_dict(ckpt["tokenizer"])
-    model = InkForgeModel(cfg).to(device)
-    state = ckpt.get("ema_state_dict") or ckpt["model_state_dict"]
-    model.load_state_dict(state)
-    model.eval()
-    print(f"[gen] Loaded InkForge ({model.parameter_count()/1e6:.2f}M params, step={ckpt.get('step')}) on {device}")
+    model, tokenizer, checkpoint = _load_generator_checkpoint(args.checkpoint, device)
+    cfg = model.cfg
+    step = checkpoint.get("step")
+    del checkpoint
+    print(f"[gen] Loaded InkForge ({model.parameter_count()/1e6:.2f}M params, step={step}) on {device}")
 
     judge_model = None
     judge_tok = None
-    if not args.no_verify_cells and args.judge_ckpt.is_file():
+    if not args.no_verify_cells:
         judge_model, judge_tok, _ = load_v2_checkpoint(args.judge_ckpt, None, device, use_ema=True)
         judge_model.eval()
         for p in judge_model.parameters():
             p.requires_grad_(False)
-        print(f"[gen] Loaded InkTeX v2 atomic-cell verifier (retries={args.max_cell_retries}) from {args.judge_ckpt}")
+        print(f"[gen] Loaded InkTeX v2 verifier (retries={args.max_cell_retries}, "
+              f"min_prob={args.min_judge_prob:.2f}) from {args.judge_ckpt}")
 
     style_bank = None
     bank_path = args.style_bank or (args.checkpoint.parent / "writer_styles.npz")
@@ -284,8 +425,11 @@ def main() -> None:
         style_bank = np.load(bank_path)["mu_bank"]
         print(f"[gen] Loaded {len(style_bank):,} real human writer styles from {bank_path}")
 
-    unimer_prompts = load_unimer_prompt_pool(tokenizer, args.unimer_jsonl, max_prompts=120000, seed=args.seed)
-    print(f"[gen] Loaded {len(unimer_prompts):,} UniMER STEM prompts")
+    unimer_pools = load_stratified_unimer_pools(tokenizer, args.unimer_jsonl, max_prompts=120000, seed=args.seed)
+    real_kinds = [kind for kind, pool in unimer_pools.items() if pool]
+    real_weights = [_REAL_STRATA_WEIGHTS[kind] for kind in real_kinds]
+    counts = ", ".join(f"{kind}={len(pool):,}" for kind, pool in unimer_pools.items())
+    print(f"[gen] Loaded UniMER STEM prompts ({counts})")
 
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -304,7 +448,7 @@ def main() -> None:
 
     py_rng = random.Random(args.seed + generated)
     np_rng = np.random.default_rng(args.seed + generated)
-    unimer_cursor = generated % max(1, len(unimer_prompts))
+    unimer_cursors = {kind: generated % len(unimer_pools[kind]) for kind in real_kinds}
 
     t0 = time.perf_counter()
     start_generated = generated
@@ -323,9 +467,12 @@ def main() -> None:
             flat_cells: list[str] = []
             cell_owner: list[int] = []
             while len(flat_cells) < args.batch_size:
-                if unimer_prompts and py_rng.random() >= args.structured_prob:
-                    pr = unimer_prompts[unimer_cursor % len(unimer_prompts)]
-                    unimer_cursor += 1
+                if real_kinds and py_rng.random() >= args.structured_prob:
+                    kind = py_rng.choices(real_kinds, weights=real_weights)[0]
+                    pool = unimer_pools[kind]
+                    cursor = unimer_cursors[kind]
+                    pr = pool[cursor]
+                    unimer_cursors[kind] = (cursor + 1) % len(pool)
                 else:
                     pr = sample_programmatic_structured_prompt(py_rng)
                 p_idx = len(prompts_batch)
@@ -355,6 +502,8 @@ def main() -> None:
                 judge_model=judge_model,
                 judge_tok=judge_tok,
                 max_retries=args.max_cell_retries,
+                cell_owner=cell_owner,
+                min_judge_prob=args.min_judge_prob,
             )
 
             # Group generated cells back per prompt (every atomic cell must pass!)
