@@ -206,16 +206,181 @@ def draw_human_delimiter(
     return []
 
 
+def draw_human_hline(
+    x_left: float,
+    x_right: float,
+    y_bar: float,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Generate a natural hand-drawn horizontal fraction bar (vinculum) with subtle tilt & hand wobble."""
+    w = max(x_right - x_left, 0.6)
+    n = max(10, min(64, int(round(w * 6.0))))
+    ts = np.linspace(0.0, 1.0, n)
+    xs = x_left + ts * w
+    slope = float(rng.normal(0.0, 0.015))
+    arch = float(rng.normal(0.0, 0.035)) * np.sin(ts * math.pi)
+    phase = float(rng.uniform(0.0, 2.0 * math.pi))
+    wobble = 0.016 * np.sin(ts * math.pi * float(rng.uniform(2.0, 4.0)) + phase)
+    ys = y_bar + (ts - 0.5) * w * slope + arch + wobble
+    return [np.stack([xs, ys], axis=-1)]
+
+
+def draw_human_sqrt(
+    x_left: float,
+    y_top: float,
+    x_right: float,
+    y_bot: float,
+    rng: np.random.Generator,
+) -> list[np.ndarray]:
+    """Generate an organic hand-drawn radical check + overbar wrapping `(x_left..x_right, y_top..y_bot)`."""
+    h = max(y_bot - y_top, 1.0)
+    w = max(x_right - x_left, 0.8)
+    y_roof = y_top - float(rng.uniform(0.16, 0.30))
+    y_valley = y_bot + float(rng.uniform(0.02, 0.14))
+    y_hook = y_top + h * float(rng.uniform(0.45, 0.62))
+
+    check_w = min(1.15, max(0.55, 0.32 * h))
+    x_valley = x_left - float(rng.uniform(0.24, 0.42))
+    x_hook = x_valley - check_w * float(rng.uniform(0.45, 0.65))
+    x_peak = x_left - float(rng.uniform(0.02, 0.12))
+    x_end = x_right + float(rng.uniform(0.14, 0.32))
+
+    # 1. Small upward/downward hook -> 2. downstroke to valley -> 3. diagonal up to roof -> 4. overbar
+    seg1 = np.stack([
+        np.linspace(x_hook - 0.14, x_hook, 4),
+        np.linspace(y_hook + 0.10, y_hook, 4),
+    ], axis=-1)
+    seg2 = np.stack([
+        np.linspace(x_hook, x_valley, max(6, int(round(h * 3.0)))),
+        np.linspace(y_hook, y_valley, max(6, int(round(h * 3.0)))),
+    ], axis=-1)
+    seg3 = np.stack([
+        np.linspace(x_valley, x_peak, max(8, int(round(h * 4.5)))),
+        np.linspace(y_valley, y_roof, max(8, int(round(h * 4.5)))),
+    ], axis=-1)
+    n_roof = max(10, min(64, int(round((x_end - x_peak) * 5.5))))
+    ts = np.linspace(0.0, 1.0, n_roof)
+    roof_x = x_peak + ts * (x_end - x_peak)
+    roof_y = y_roof + (ts - 0.5) * (x_end - x_peak) * float(rng.normal(0.0, 0.012)) + 0.018 * np.sin(
+        ts * math.pi * float(rng.uniform(1.5, 3.0)) + float(rng.uniform(0, 2 * math.pi))
+    )
+    seg4 = np.stack([roof_x, roof_y], axis=-1)
+    pts = np.concatenate([seg1[:-1], seg2[:-1], seg3[:-1], seg4], axis=0)
+    # Subtle micro-tremor along the check
+    pts[:, 0] += rng.normal(0.0, 0.008, size=len(pts))
+    pts[:, 1] += rng.normal(0.0, 0.008, size=len(pts))
+    return [pts]
+
+
 # ---------------------------------------------------------------------------
 # Structured LaTeX Prompt Bank (UniMER + Multi-Line + Matrices + Cases)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class StructuredPrompt:
-    kind: str  # "single", "multiline", "matrix", "cases"
+    kind: str  # "single", "multiline", "matrix", "cases", "tree"
     latex: str
     cells: list[str]  # Atomic single-line sub-expressions to generate with InkForge
     meta: dict[str, Any]
+
+
+def _extract_balanced_brace(s: str, open_idx: int) -> tuple[str, int] | None:
+    """Given `s[open_idx] == '{'`, return `(inner, close_idx)` or `None` if unbalanced."""
+    if open_idx >= len(s) or s[open_idx] != "{":
+        return None
+    depth = 0
+    for i in range(open_idx, len(s)):
+        if s[i] == "{" and (i == 0 or s[i - 1] != "\\"):
+            depth += 1
+        elif s[i] == "}" and (i == 0 or s[i - 1] != "\\"):
+            depth -= 1
+            if depth == 0:
+                return s[open_idx + 1 : i], i
+    return None
+
+
+def _decompose_big_frac_tree(
+    latex: str,
+    tokenizer: InkForgeTokenizer,
+    cells: list[str],
+    *,
+    depth: int = 0,
+    max_depth: int = 2,
+) -> dict[str, Any] | None:
+    """Recursively decompose large top-level `\\frac{NUM}{DEN}` expressions into an `InkNode` tree.
+
+    Only splits when the expression is long or contains nested big operators so small fractions
+    like `\\frac{1}{2}` stay native single InkForge cells.
+    """
+    s = latex.strip()
+    if not s:
+        return None
+    toks = tokenize_inkforge(s)
+    if depth >= max_depth or r"\frac" not in s or len(toks) < 16:
+        if 1 <= len(toks) <= 44 and not tokenizer.has_unk(s):
+            idx = len(cells)
+            cells.append(s)
+            return {"op": "cell", "i": idx}
+        return None
+
+    # Find first top-level `\frac{...}{...}` (brace depth == 0)
+    bdepth = 0
+    i = 0
+    found: tuple[int, str, str, int] | None = None
+    while i < len(s):
+        ch = s[i]
+        if ch == "{" and (i == 0 or s[i - 1] != "\\"):
+            bdepth += 1
+        elif ch == "}" and (i == 0 or s[i - 1] != "\\"):
+            bdepth -= 1
+        elif bdepth == 0 and s.startswith(r"\frac", i) and (i + 5 < len(s) and s[i + 5] in ("{", " ")):
+            j = i + 5
+            while j < len(s) and s[j] == " ":
+                j += 1
+            num_res = _extract_balanced_brace(s, j)
+            if num_res is not None:
+                num_s, num_end = num_res
+                k = num_end + 1
+                while k < len(s) and s[k] == " ":
+                    k += 1
+                den_res = _extract_balanced_brace(s, k)
+                if den_res is not None:
+                    den_s, den_end = den_res
+                    num_t = tokenize_inkforge(num_s)
+                    den_t = tokenize_inkforge(den_s)
+                    # Decompose if either side is substantial or itself has nested \frac / \sum / \int / \sqrt
+                    if max(len(num_t), len(den_t)) >= 6 or r"\frac" in num_s or r"\frac" in den_s:
+                        found = (i, num_s.strip(), den_s.strip(), den_end + 1)
+                        break
+        i += 1
+
+    if found is None:
+        if 1 <= len(toks) <= 56 and not tokenizer.has_unk(s):
+            idx = len(cells)
+            cells.append(s)
+            return {"op": "cell", "i": idx}
+        return None
+
+    f_start, num_s, den_s, f_end = found
+    prefix = s[:f_start].strip()
+    suffix = s[f_end:].strip()
+    items: list[dict[str, Any]] = []
+    if prefix:
+        p_node = _decompose_big_frac_tree(prefix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+        if p_node is None:
+            return None
+        items.append(p_node)
+    num_node = _decompose_big_frac_tree(num_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+    den_node = _decompose_big_frac_tree(den_s, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+    if num_node is None or den_node is None:
+        return None
+    items.append({"op": "frac", "num": num_node, "den": den_node, "scale": 0.94 if depth == 0 else 0.84})
+    if suffix:
+        s_node = _decompose_big_frac_tree(suffix, tokenizer, cells, depth=depth + 1, max_depth=max_depth)
+        if s_node is None:
+            return None
+        items.append(s_node)
+    return items[0] if len(items) == 1 else {"op": "hcat", "items": items}
 
 
 _ENV_MATRIX_RE = re.compile(
@@ -316,21 +481,199 @@ def parse_unimer_prompt(latex: str, tokenizer: InkForgeTokenizer) -> StructuredP
                 meta={"env": env},
             )
 
-    # 4. Standard single-line formula (reject unparsed \begin/\end environments)
+    # 4. Standard single-line formula (or auto-decomposed big/nested fraction!)
     if r"\begin" in s or r"\end" in s or "&" in s or r"\\" in s:
         return None
     toks = tokenize_inkforge(s)
-    if not (2 <= len(toks) <= 80) or tokenizer.has_unk(s):
+    if not (2 <= len(toks) <= 110) or tokenizer.has_unk(s):
+        return None
+    if r"\frac" in s and len(toks) >= 20:
+        cells: list[str] = []
+        tree = _decompose_big_frac_tree(s, tokenizer, cells, depth=0, max_depth=2)
+        if tree is not None and len(cells) >= 2:
+            return StructuredPrompt(kind="tree", latex=s, cells=cells, meta={"tree": tree, "subkind": "big_frac"})
+    if len(toks) > 80:
         return None
     return StructuredPrompt(kind="single", latex=s, cells=[s], meta={})
 
 
+def _tree_cell(cells: list[str], expr: str) -> dict[str, Any]:
+    idx = len(cells)
+    cells.append(expr)
+    return {"op": "cell", "i": idx}
+
+
+def sample_big_fraction_or_multistep_prompt(rng: random.Random) -> StructuredPrompt:
+    """Synthesize big nested fractions, big radicals, tall delimited expressions, and multi-line fraction proofs."""
+    v = rng.choice(["x", "y", "t", "u", "z", "n"])
+    v2 = "y" if v != "y" else "x"
+    g = rng.choice([r"\alpha", r"\beta", r"\theta", r"\lambda", r"\omega"])
+    a = rng.randint(2, 8)
+    b = rng.randint(2, 7)
+    c = rng.randint(2, 9)
+    mode = rng.choice([
+        "big_frac_eq",
+        "nested_frac",
+        "big_sqrt_frac",
+        "tall_delim_frac",
+        "multiline_frac_proof",
+        "multiline_aligned_eq",
+    ])
+    cells: list[str] = []
+
+    if mode == "big_frac_eq":
+        lhs = rng.choice([f"f({v}) =", f"{v2} =", r"\Delta =", "I =", "S ="])
+        num = rng.choice([
+            f"{a}{v}^2 + {b}{v} - {c}",
+            f"\\int_0^{b} {v}^2 d{v} + {a}{v}",
+            f"\\sin^2 {g} + \\cos^2 {g} + {a}{v}",
+            f"\\sum_{{i=1}}^{v} i + {b}{v}^2",
+            f"({v} + {a})({v} - {b}) + {c}",
+        ])
+        den = rng.choice([
+            f"\\sqrt{{{v}^2 + {a}{v} + {c}}}",
+            f"{b}{v}^2 - {a}{v} + {c}",
+            f"({v} + {a})^2 + {b}",
+            f"\\sqrt{{{a}^2 + {b}^2}} + {v}",
+        ])
+        tail = rng.choice(["", f"+ {c}", "= 0", f"= {b}{v}"])
+        items = [_tree_cell(cells, lhs), {"op": "frac", "num": _tree_cell(cells, num), "den": _tree_cell(cells, den), "scale": 0.96}]
+        if tail:
+            items.append(_tree_cell(cells, tail))
+        latex = f"{lhs} \\frac{{{num}}}{{{den}}}" + (f" {tail}" if tail else "")
+        return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": {"op": "hcat", "items": items}, "subkind": "big_frac"})
+
+    if mode == "nested_frac":
+        lhs = rng.choice([f"f({v}) =", "R =", "H =", ""])
+        n_left = rng.choice([f"{a}{v} +", "1 +", f"{v}^2 -"])
+        n_num, n_den = rng.choice([(f"{b}", f"{v} + {c}"), (f"{v}", f"{a}"), (f"{a}{v}", f"{v} - {b}")])
+        d_left = rng.choice([f"{v} -", "1 +", f"{b}{v} +"])
+        d_num, d_den = rng.choice([(f"{c}", f"{v} + {a}"), (f"{b}", f"{v}^2 + 1"), (f"{v}", f"{c}")])
+        num_node = {
+            "op": "hcat",
+            "items": [
+                _tree_cell(cells, n_left),
+                {"op": "frac", "num": _tree_cell(cells, n_num), "den": _tree_cell(cells, n_den), "scale": 0.82},
+            ],
+        }
+        den_node = {
+            "op": "hcat",
+            "items": [
+                _tree_cell(cells, d_left),
+                {"op": "frac", "num": _tree_cell(cells, d_num), "den": _tree_cell(cells, d_den), "scale": 0.82},
+            ],
+        }
+        frac_node = {"op": "frac", "num": num_node, "den": den_node, "scale": 0.94}
+        if lhs:
+            tree = {"op": "hcat", "items": [_tree_cell(cells, lhs), frac_node]}
+            latex = f"{lhs} \\frac{{{n_left} \\frac{{{n_num}}}{{{n_den}}}}}{{{d_left} \\frac{{{d_num}}}{{{d_den}}}}}"
+        else:
+            tree = frac_node
+            latex = f"\\frac{{{n_left} \\frac{{{n_num}}}{{{n_den}}}}}{{{d_left} \\frac{{{d_num}}}{{{d_den}}}}}"
+        return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": tree, "subkind": "nested_frac"})
+
+    if mode == "big_sqrt_frac":
+        lhs = rng.choice([f"{v} =", "r =", "L =", ""])
+        num = rng.choice([f"{a}{v}^2 + {b}{v} + {c}", f"({v} + {a})^2 - {b}", f"{v}^3 + {c}{v}"])
+        den = rng.choice([f"{b}{v} + {c}", f"{a}{v}^2 + 1", f"{v}^2 + {b}^2"])
+        inner = {"op": "frac", "num": _tree_cell(cells, num), "den": _tree_cell(cells, den), "scale": 0.92}
+        sq_node = {"op": "sqrt", "body": inner}
+        if lhs:
+            tree = {"op": "hcat", "items": [_tree_cell(cells, lhs), sq_node]}
+            latex = f"{lhs} \\sqrt{{\\frac{{{num}}}{{{den}}}}}"
+        else:
+            tree = sq_node
+            latex = f"\\sqrt{{\\frac{{{num}}}{{{den}}}}}"
+        return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": tree, "subkind": "big_sqrt"})
+
+    if mode == "tall_delim_frac":
+        l_d, r_d = rng.choice([("(", ")"), ("[", "]"), ("|", "|")])
+        exp_s = rng.choice(["2", "n", "-1", ""]) if l_d != "|" else ""
+        num = rng.choice([f"{a}{v} + {b}", f"{v}^2 - {c}", f"\\sin {g} + {a}"])
+        den = rng.choice([f"{c}{v} - {a}", f"{v} + {b}", f"\\cos {g} + {b}"])
+        frac_node = {"op": "frac", "num": _tree_cell(cells, num), "den": _tree_cell(cells, den), "scale": 0.94}
+        sup_node = _tree_cell(cells, exp_s) if exp_s else None
+        delim_node = {"op": "delim", "left": l_d, "right": r_d, "body": frac_node, "sup": sup_node}
+        rhs = f"= {a + b}"
+        tree = {"op": "hcat", "items": [delim_node, _tree_cell(cells, rhs)]}
+        latex = f"\\left{l_d} \\frac{{{num}}}{{{den}}} \\right{r_d}" + (f"^{{{exp_s}}}" if exp_s else "") + f" {rhs}"
+        return StructuredPrompt(kind="tree", latex=latex, cells=cells, meta={"tree": tree, "subkind": "tall_delim"})
+
+    if mode == "multiline_frac_proof":
+        # 3-line calculus/algebra derivation with big composed fractions on EVERY line (same writer!)
+        line1 = {
+            "op": "hcat",
+            "items": [
+                _tree_cell(cells, f"f({v}) ="),
+                {"op": "frac", "num": _tree_cell(cells, f"{a}{v}^2 + {b}"), "den": _tree_cell(cells, f"{v} + {c}"), "scale": 0.94},
+            ],
+        }
+        line2 = {
+            "op": "hcat",
+            "items": [
+                _tree_cell(cells, f"f'({v}) ="),
+                {
+                    "op": "frac",
+                    "num": _tree_cell(cells, f"{2*a}{v}({v} + {c}) - ({a}{v}^2 + {b})"),
+                    "den": _tree_cell(cells, f"({v} + {c})^2"),
+                    "scale": 0.94,
+                },
+            ],
+        }
+        line3 = {
+            "op": "hcat",
+            "items": [
+                _tree_cell(cells, f"f'({v}) ="),
+                {
+                    "op": "frac",
+                    "num": _tree_cell(cells, f"{a}{v}^2 + {2*a*c}{v} - {b}"),
+                    "den": _tree_cell(cells, f"({v} + {c})^2"),
+                    "scale": 0.94,
+                },
+            ],
+        }
+        l1 = f"f({v}) = \\frac{{{a}{v}^2 + {b}}}{{{v} + {c}}}"
+        l2 = f"f'({v}) = \\frac{{{2*a}{v}({v} + {c}) - ({a}{v}^2 + {b})}}{{({v} + {c})^2}}"
+        l3 = f"f'({v}) = \\frac{{{a}{v}^2 + {2*a*c}{v} - {b}}}{{({v} + {c})^2}}"
+        latex = r"\begin{aligned}" + r" \\ ".join([l1, l2, l3]) + r"\end{aligned}"
+        return StructuredPrompt(
+            kind="tree",
+            latex=latex,
+            cells=cells,
+            meta={"tree": {"op": "vstack", "lines": [line1, line2, line3]}, "subkind": "multiline_frac"},
+        )
+
+    # multiline_aligned_eq: true `=`-column aligned multi-step equation solving!
+    rhs_val = a * c + b
+    d = rng.randint(2, 8)
+    rows_tex = [
+        (f"{a}{v} + {b} + {d}", f"= {rhs_val} + {d}"),
+        (f"{a}{v} + {b}", f"= {rhs_val}"),
+        (f"{a}{v}", f"= {rhs_val - b}"),
+        (f"{v}", f"= {c}"),
+    ]
+    n_lines = rng.choice([3, 4])
+    chosen = rows_tex[1:] if n_lines == 3 else rows_tex
+    eq_rows = [(_tree_cell(cells, lhs_s), _tree_cell(cells, rhs_s)) for lhs_s, rhs_s in chosen]
+    latex = r"\begin{aligned}" + r" \\ ".join(f"{l_s} & {r_s}" for l_s, r_s in chosen) + r"\end{aligned}"
+    return StructuredPrompt(
+        kind="tree",
+        latex=latex,
+        cells=cells,
+        meta={"tree": {"op": "aligned_eq", "rows": eq_rows}, "subkind": "aligned_eq"},
+    )
+
+
 def sample_programmatic_structured_prompt(rng: random.Random) -> StructuredPrompt:
-    """Synthesize diverse multi-line derivations, matrices, systems, and piecewise functions."""
+    """Synthesize diverse multi-line derivations, big/nested fractions, radicals, matrices, and piecewise functions."""
     choice = rng.random()
 
-    # A. Multi-line algebra / calculus derivation (40%)
-    if choice < 0.42:
+    # 0. Big / nested fractions, big radicals, tall delimiters & multi-line fraction derivations (30%)
+    if choice < 0.30:
+        return sample_big_fraction_or_multistep_prompt(rng)
+
+    # A. Multi-line algebra / calculus derivation (28%)
+    if choice < 0.58:
         v = rng.choice(["x", "y", "t", "u", "z", "n"])
         a = rng.randint(2, 9)
         b = rng.randint(1, 9)
@@ -445,16 +788,194 @@ def sample_programmatic_structured_prompt(rng: random.Random) -> StructuredPromp
 # 2D Spatial Assembly with Human Layout Physics
 # ---------------------------------------------------------------------------
 
+def _shift_scale_strokes(
+    strokes: Sequence[np.ndarray],
+    *,
+    dx: float = 0.0,
+    dy: float = 0.0,
+    scale: float = 1.0,
+) -> list[np.ndarray]:
+    out: list[np.ndarray] = []
+    for s in strokes:
+        arr = s[:, :2].astype(np.float64, copy=True)
+        if scale != 1.0:
+            arr *= scale
+        arr[:, 0] += dx
+        arr[:, 1] += dy
+        out.append(arr)
+    return out
+
+
+def _assemble_ink_node(
+    node: dict[str, Any],
+    cell_strokes: list[list[np.ndarray]],
+    rng: np.random.Generator,
+    writer_slant: float,
+) -> tuple[list[np.ndarray], tuple[float, float, float, float], float]:
+    """Recursively assemble an `InkNode` tree into `(strokes, bbox, y_math_axis)`."""
+    op = node["op"]
+
+    if op == "cell":
+        st = cell_strokes[int(node["i"])] if int(node["i"]) < len(cell_strokes) else []
+        if not st:
+            return [], (0.0, 0.0, 0.5, 1.0), 0.5
+        x0, y0, x1, y1 = strokes_bbox(st)
+        # Anchor top-left at (0, 0); math axis at vertical midpoint of ink
+        shifted = _shift_scale_strokes(st, dx=-x0, dy=-y0)
+        w, h = max(x1 - x0, 0.25), max(y1 - y0, 0.4)
+        return shifted, (0.0, 0.0, w, h), 0.5 * h
+
+    if op == "hcat":
+        parts = [_assemble_ink_node(ch, cell_strokes, rng, writer_slant) for ch in node["items"]]
+        parts = [p for p in parts if p[0]]
+        if not parts:
+            return [], (0.0, 0.0, 0.5, 1.0), 0.5
+        gap_base = float(node.get("gap", 0.52))
+        out: list[np.ndarray] = []
+        x_cur = 0.0
+        for st, (x0, _y0, x1, _y1), y_ax in parts:
+            dx = x_cur - x0
+            dy = -y_ax + float(rng.normal(0.0, 0.03))
+            out.extend(_shift_scale_strokes(st, dx=dx, dy=dy))
+            x_cur += (x1 - x0) + gap_base * float(rng.uniform(0.80, 1.25))
+        bx0, by0, bx1, by1 = strokes_bbox(out)
+        # Re-anchor top-left at (0, 0), preserving exact y_math_axis = -by0
+        out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
+        return out, (0.0, 0.0, bx1 - bx0, by1 - by0), -by0
+
+    if op == "frac":
+        scale = float(node.get("scale", 0.94))
+        num_st, (nx0, ny0, nx1, ny1), _ = _assemble_ink_node(node["num"], cell_strokes, rng, writer_slant)
+        den_st, (dx0, dy0, dx1, dy1), _ = _assemble_ink_node(node["den"], cell_strokes, rng, writer_slant)
+        nw, nh = (nx1 - nx0) * scale, (ny1 - ny0) * scale
+        dw, dh = (dx1 - dx0) * scale, (dy1 - dy0) * scale
+        bar_pad = float(rng.uniform(0.24, 0.46))
+        bar_w = max(nw, dw, 0.9) + 2.0 * bar_pad
+        v_gap_top = float(rng.uniform(0.28, 0.46))
+        v_gap_bot = float(rng.uniform(0.28, 0.46))
+        y_bar = nh + v_gap_top
+
+        out: list[np.ndarray] = []
+        # Numerator centered above bar (natural order: numerator -> bar -> denominator)
+        num_dx = 0.5 * (bar_w - nw) - nx0 * scale + float(rng.normal(0.0, 0.08))
+        num_dy = -ny0 * scale
+        out.extend(_shift_scale_strokes(num_st, dx=num_dx, dy=num_dy, scale=scale))
+        out.extend(draw_human_hline(0.0, bar_w, y_bar, rng))
+        den_dx = 0.5 * (bar_w - dw) - dx0 * scale + float(rng.normal(0.0, 0.08))
+        den_dy = (y_bar + v_gap_bot) - dy0 * scale
+        out.extend(_shift_scale_strokes(den_st, dx=den_dx, dy=den_dy, scale=scale))
+
+        bx0, by0, bx1, by1 = strokes_bbox(out)
+        out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
+        return out, (0.0, 0.0, bx1 - bx0, by1 - by0), y_bar - by0
+
+    if op == "sqrt":
+        body_st, (x0, y0, x1, y1), y_ax = _assemble_ink_node(node["body"], cell_strokes, rng, writer_slant)
+        if not body_st:
+            return [], (0.0, 0.0, 0.5, 1.0), 0.5
+        rad_st = draw_human_sqrt(x0, y0, x1, y1, rng)
+        out = rad_st + body_st
+        bx0, by0, bx1, by1 = strokes_bbox(out)
+        out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
+        return out, (0.0, 0.0, bx1 - bx0, by1 - by0), y_ax - by0
+
+    if op == "delim":
+        body_st, (x0, y0, x1, y1), y_ax = _assemble_ink_node(node["body"], cell_strokes, rng, writer_slant)
+        if not body_st:
+            return [], (0.0, 0.0, 0.5, 1.0), 0.5
+        bw = x1 - x0
+        pad_l = float(rng.uniform(0.36, 0.56))
+        pad_r = float(rng.uniform(0.36, 0.56))
+        left_d = draw_human_delimiter(str(node["left"]), 0.0, y0, y1, rng, slant=writer_slant)
+        body_shifted = _shift_scale_strokes(body_st, dx=pad_l - x0)
+        right_x = pad_l + bw + pad_r
+        right_d = draw_human_delimiter(str(node["right"]), right_x, y0, y1, rng, slant=writer_slant)
+        out = left_d + body_shifted + right_d
+        if node.get("sup") is not None:
+            sup_st, (sx0, sy0, sx1, sy1), _ = _assemble_ink_node(node["sup"], cell_strokes, rng, writer_slant)
+            if sup_st:
+                sup_scale = 0.72
+                sup_dx = right_x + float(rng.uniform(0.24, 0.42)) - sx0 * sup_scale
+                sup_dy = y0 - (sy1 - sy0) * sup_scale * 0.45 - sy0 * sup_scale
+                out.extend(_shift_scale_strokes(sup_st, dx=sup_dx, dy=sup_dy, scale=sup_scale))
+        bx0, by0, bx1, by1 = strokes_bbox(out)
+        out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
+        return out, (0.0, 0.0, bx1 - bx0, by1 - by0), y_ax - by0
+
+    if op == "vstack":
+        lines = [_assemble_ink_node(ln, cell_strokes, rng, writer_slant) for ln in node["lines"]]
+        lines = [ln for ln in lines if ln[0]]
+        if not lines:
+            return [], (0.0, 0.0, 0.5, 1.0), 0.5
+        out = []
+        y_cur = 0.0
+        for st, (x0, y0, x1, y1), _ in lines:
+            lh = max(y1 - y0, 1.0)
+            x_shift = -x0 + float(rng.normal(0.0, 0.24))
+            y_shift = y_cur - y0
+            tilt = math.radians(float(rng.normal(0.0, 1.0)))
+            ct, st_sin = math.cos(tilt), math.sin(tilt)
+            for s in st:
+                sh = s[:, :2].copy()
+                sh[:, 0] += x_shift
+                sh[:, 1] += y_shift
+                rx = sh[:, 0] * ct - (sh[:, 1] - y_cur) * st_sin
+                ry = sh[:, 0] * st_sin + (sh[:, 1] - y_cur) * ct + y_cur
+                out.append(np.stack([rx, ry], axis=-1))
+            y_cur += lh + float(rng.uniform(0.65, 1.25))
+        bx0, by0, bx1, by1 = strokes_bbox(out)
+        out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
+        return out, (0.0, 0.0, bx1 - bx0, by1 - by0), 0.5 * (by1 - by0)
+
+    if op == "aligned_eq":
+        # Align `=` column vertically across all lines (LHS right-aligned, RHS left-aligned!)
+        parsed_rows = []
+        max_lhs_w = 0.5
+        for lhs_n, rhs_n in node["rows"]:
+            l_st, l_box, l_ax = _assemble_ink_node(lhs_n, cell_strokes, rng, writer_slant)
+            r_st, r_box, r_ax = _assemble_ink_node(rhs_n, cell_strokes, rng, writer_slant)
+            lw = l_box[2] - l_box[0]
+            max_lhs_w = max(max_lhs_w, lw)
+            parsed_rows.append((l_st, l_box, l_ax, r_st, r_box, r_ax))
+        out = []
+        y_cur = 0.0
+        eq_gap = float(rng.uniform(0.45, 0.72))
+        for l_st, (lx0, ly0, lx1, ly1), l_ax, r_st, (rx0, ry0, rx1, ry1), r_ax in parsed_rows:
+            lw = lx1 - lx0
+            row_ax = max(l_ax, r_ax)
+            row_bot = max((ly1 - ly0) - l_ax, (ry1 - ry0) - r_ax)
+            row_h = max(row_ax + row_bot, 1.0)
+            y_axis_here = y_cur + row_ax
+            if l_st:
+                dx_l = (max_lhs_w - lw) - lx0 + float(rng.normal(0.0, 0.08))
+                dy_l = y_axis_here - l_ax
+                out.extend(_shift_scale_strokes(l_st, dx=dx_l, dy=dy_l))
+            if r_st:
+                dx_r = (max_lhs_w + eq_gap) - rx0 + float(rng.normal(0.0, 0.08))
+                dy_r = y_axis_here - r_ax
+                out.extend(_shift_scale_strokes(r_st, dx=dx_r, dy=dy_r))
+            y_cur += row_h + float(rng.uniform(0.60, 1.10))
+        bx0, by0, bx1, by1 = strokes_bbox(out)
+        out = _shift_scale_strokes(out, dx=-bx0, dy=-by0)
+        return out, (0.0, 0.0, bx1 - bx0, by1 - by0), 0.5 * (by1 - by0)
+
+    return [], (0.0, 0.0, 0.5, 1.0), 0.5
+
+
 def assemble_structured_strokes(
     prompt: StructuredPrompt,
     cell_strokes: list[list[np.ndarray]],
     rng: np.random.Generator,
 ) -> list[np.ndarray]:
-    """Assemble individually generated InkForge cells into a cohesive 2D multi-line / matrix / cases canvas."""
+    """Assemble individually generated InkForge cells into a cohesive 2D multi-line / fraction / matrix / cases canvas."""
     if prompt.kind == "single":
         return cell_strokes[0] if cell_strokes else []
 
     writer_slant = float(rng.uniform(-0.08, 0.08))
+
+    if prompt.kind == "tree":
+        strokes, _, _ = _assemble_ink_node(prompt.meta["tree"], cell_strokes, rng, writer_slant)
+        return strokes
 
     if prompt.kind == "multiline":
         out: list[np.ndarray] = []

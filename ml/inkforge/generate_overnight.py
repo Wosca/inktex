@@ -83,6 +83,7 @@ def main() -> None:
     parser.add_argument("--structured-prob", type=float, default=0.45, help="Fraction of multi-line/matrix/cases prompts")
     parser.add_argument("--temp-min", type=float, default=0.28)
     parser.add_argument("--temp-max", type=float, default=0.62)
+    parser.add_argument("--cfg-scale", type=float, default=1.5, help="Text CFG scale (1.5 for InkForge v2)")
     parser.add_argument("--preview-every", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=2026)
     args = parser.parse_args()
@@ -99,6 +100,10 @@ def main() -> None:
 
     style_bank = None
     bank_path = args.style_bank or (args.checkpoint.parent / "writer_styles.npz")
+    if not bank_path.is_file():
+        fallback_bank = Path(r"E:\math-recogniser-training\inkforge_v2_model\writer_styles.npz")
+        if fallback_bank.is_file():
+            bank_path = fallback_bank
     if bank_path.is_file():
         style_bank = np.load(bank_path)["mu_bank"]
         print(f"[gen] Loaded {len(style_bank):,} real human writer styles from {bank_path}")
@@ -176,16 +181,17 @@ def main() -> None:
                     style_z=cell_zs,
                     temperature=cell_temps,
                     pen_temperature=1.0,
+                    cfg_scale=args.cfg_scale,
                     max_steps=512,
                     return_meta=True,
                 )
 
-            # Group generated cells back per prompt and assemble 2D layout
+            # Group generated cells back per prompt and validate EVERY atomic cell before 2D assembly
             grouped: list[list[list[np.ndarray]]] = [[] for _ in range(n_prompts)]
             grouped_ok: list[bool] = [True] * n_prompts
-            for c_st, c_meta, owner in zip(cell_strokes_flat, cell_meta_flat, cell_owner):
+            for c_tex, c_st, c_meta, owner in zip(flat_cells, cell_strokes_flat, cell_meta_flat, cell_owner):
                 grouped[owner].append(c_st)
-                if not c_meta["finished"]:
+                if not c_meta["finished"] or not passes_geometry_gate(c_tex, c_st):
                     grouped_ok[owner] = False
 
             for p_idx, pr in enumerate(prompts_batch):

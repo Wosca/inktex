@@ -16,6 +16,7 @@ from inkforge.composer import (  # noqa: E402
     assemble_structured_strokes,
     parse_unimer_prompt,
     passes_geometry_gate,
+    sample_big_fraction_or_multistep_prompt,
     sample_programmatic_structured_prompt,
     smooth_strokes_catmull_rom,
     synthesize_realistic_times,
@@ -219,8 +220,12 @@ def test_structured_prompt_parsing_and_2d_assembly():
 
     py_rng = random.Random(7)
     np_rng = np.random.default_rng(7)
-    for _ in range(12):
-        pr = sample_programmatic_structured_prompt(py_rng)
+    # Test automatic big/nested fraction UniMER decomposition
+    big_f = parse_unimer_prompt(r"f(x) = \frac{x^2 + 3x - 1 + \frac{a}{b}}{\sqrt{b^2 - 4ac} + 2xy}", tok)
+    assert big_f is not None and big_f.kind == "tree" and len(big_f.cells) >= 3
+
+    for _ in range(24):
+        pr = sample_programmatic_structured_prompt(py_rng) if _ < 12 else sample_big_fraction_or_multistep_prompt(py_rng)
         dummy_cells = [
             [
                 np.array([[k * 0.5, 0.0], [k * 0.5 + 0.25, 0.3], [k * 0.5 + 0.4, 0.8]])
